@@ -1610,7 +1610,9 @@ mergeInto(LibraryManager.library, {
               JSON.stringify(fallbackState)
             );
           } else {
-            console.error("[FIREBASE-SYNC] ❌ unityInstance is not defined in fallback");
+            console.error(
+              "[FIREBASE-SYNC] ❌ unityInstance is not defined in fallback"
+            );
           }
         }
       };

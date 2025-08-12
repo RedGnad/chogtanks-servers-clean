@@ -30,6 +30,11 @@ public class SFXManager : MonoBehaviourPun
     [Range(0f, 1f)]
     public float killFeedVolume = 0.8f; // Volume réglable pour les sons de killfeed
     
+    [Header("Countdown Sounds")]
+    public AudioClip countdownBeepSound; // Son pour le décompte 5-4-3-2-1
+    [Range(0f, 1f)]
+    public float countdownVolume = 0.9f; // Volume pour le son de décompte
+    
     private static SFXManager instance;
     private Dictionary<string, SFXClip> sfxDictionary;
     
@@ -151,30 +156,35 @@ public class SFXManager : MonoBehaviourPun
             return;
         }
         
-        Debug.Log($"[SFX] 🎶 {killFeedSounds.Length} sons de killfeed disponibles");
-        
-        // Choisir un son aléatoire dans le tableau
         int randomIndex = Random.Range(0, killFeedSounds.Length);
         AudioClip randomClip = killFeedSounds[randomIndex];
         
-        Debug.Log($"[SFX] 🎲 Son sélectionné: index {randomIndex}, clip: {(randomClip != null ? randomClip.name : "null")}");
-        
         if (randomClip != null && audioSource != null)
         {
-            float finalVolume = killFeedVolume * masterVolume;
-            Debug.Log($"[SFX] 🔊 Lecture du son '{randomClip.name}' - Volume: {finalVolume} (killFeedVolume: {killFeedVolume}, masterVolume: {masterVolume})");
-            
-            // Jouer le son localement seulement
-            audioSource.PlayOneShot(randomClip, finalVolume);
-            
-            Debug.Log("[SFX] ✅ Son de killfeed joué avec succès !");
+            audioSource.PlayOneShot(randomClip, killFeedVolume * masterVolume);
+            Debug.Log($"[SFX] ✅ Son de killfeed joué avec succès ! Clip: {randomClip.name}, Index: {randomIndex}");
         }
         else
         {
-            if (randomClip == null)
-                Debug.LogError("[SFX] ❌ Le clip audio sélectionné est null !");
-            if (audioSource == null)
-                Debug.LogError("[SFX] ❌ AudioSource est null !");
+            Debug.LogError("[SFX] ❌ Le clip audio ou AudioSource est null !");
+        }
+    }
+    
+    /// <summary>
+    /// Joue le son de décompte localement (5-4-3-2-1)
+    /// </summary>
+    public void PlayCountdownBeep()
+    {
+        Debug.Log("[SFX] ⏰ PlayCountdownBeep() appelé");
+        
+        if (countdownBeepSound != null && audioSource != null)
+        {
+            audioSource.PlayOneShot(countdownBeepSound, countdownVolume * masterVolume);
+            Debug.Log("[SFX] ✅ Son de décompte joué avec succès !");
+        }
+        else
+        {
+            Debug.LogWarning("[SFX] ⚠️ Son de décompte ou AudioSource manquant !");
         }
     }
     

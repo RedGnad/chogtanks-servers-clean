@@ -11,6 +11,7 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
 {
     private const float ROOM_LIFETIME = 180f; 
     private const float RESPAWN_TIME = 5f;
+    private const float COIN_SPAWN_INTERVAL = 20f; // Spawn un coin toutes les 20 secondes
     
     private const byte SCORE_UPDATE_EVENT = 1;
     private const byte MATCH_END_EVENT = 2;
@@ -26,6 +27,11 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
     private Dictionary<string, string> playerWallets = new Dictionary<string, string>();
     private float matchStartTime;
     private bool matchEnded = false;
+    
+    [Header("Coin System")]
+    public GameObject coinPrefab; // Prefab du coin à assigner dans l'inspecteur
+    public Transform[] coinSpawnPoints; // Points de spawn pour les coins
+    private float nextCoinSpawnTime;
     
     public static ScoreManager Instance { get; private set; }
     
@@ -85,6 +91,7 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
         if (PhotonNetwork.IsMasterClient)
         {
             matchStartTime = Time.time;
+            nextCoinSpawnTime = Time.time + COIN_SPAWN_INTERVAL; // Premier coin dans 20s
             matchEnded = false;
             
             playerScores.Clear();
@@ -111,6 +118,7 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
     {
         float timeLeft = ROOM_LIFETIME;
         bool waitingForSync = !PhotonNetwork.IsMasterClient;
+        int lastCountdownSecond = -1; // Pour éviter de jouer le son plusieurs fois par seconde
         
         if (LobbyUI.Instance != null)
         {
@@ -127,10 +135,38 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
         while (timeLeft > 0 && !matchEnded)
         {
             timeLeft = ROOM_LIFETIME - (Time.time - matchStartTime);
+            int currentSecond = Mathf.Max(0, (int)timeLeft);
             
             if (LobbyUI.Instance != null)
             {
-                LobbyUI.Instance.UpdateTimer(Mathf.Max(0, (int)timeLeft));
+                LobbyUI.Instance.UpdateTimer(currentSecond);
+            }
+            
+            // Jouer le son de décompte pour les 5 dernières secondes
+            if (currentSecond <= 5 && currentSecond >= 1 && currentSecond != lastCountdownSecond)
+            {
+                if (SFXManager.Instance != null)
+                {
+                    SFXManager.Instance.PlayCountdownBeep();
+                    Debug.Log($"[SCOREMANAGER] ⏰ Son de décompte joué pour {currentSecond} seconde(s) restante(s)");
+                }
+                lastCountdownSecond = currentSecond;
+            }
+            
+            // Spawn des coins (Master Client seulement) - avec protection contre les erreurs
+            if (PhotonNetwork.IsMasterClient && Time.time >= nextCoinSpawnTime && !matchEnded)
+            {
+                try
+                {
+                    SpawnCoin();
+                    nextCoinSpawnTime = Time.time + COIN_SPAWN_INTERVAL;
+                }
+                catch (System.Exception e)
+                {
+                    Debug.LogError($"[COIN] ❌ Erreur lors du spawn de coin: {e.Message}");
+                    // Réessayer dans 20 secondes même en cas d'erreur
+                    nextCoinSpawnTime = Time.time + COIN_SPAWN_INTERVAL;
+                }
             }
             
             if (PhotonNetwork.IsMasterClient && Time.time > nextSyncTime)
@@ -150,21 +186,31 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
     
     public void AddKill(int killerActorNumber)
     {
+        AddScore(killerActorNumber, 1);
+    }
+    
+    /// <summary>
+    /// Ajoute des points au score d'un joueur (générique pour kills, coins, etc.)
+    /// </summary>
+    public void AddScore(int playerActorNumber, int points)
+    {
         if (matchEnded) return;
 
-        int scoreBefore = playerScores.ContainsKey(killerActorNumber) ? playerScores[killerActorNumber] : 0;
-        if (playerScores.ContainsKey(killerActorNumber))
+        int scoreBefore = playerScores.ContainsKey(playerActorNumber) ? playerScores[playerActorNumber] : 0;
+        if (playerScores.ContainsKey(playerActorNumber))
         {
-            playerScores[killerActorNumber]++;
+            playerScores[playerActorNumber] += points;
         }
         else
         {
-            playerScores[killerActorNumber] = 1;
+            playerScores[playerActorNumber] = points;
         }
-        int scoreAfter = playerScores[killerActorNumber];
+        int scoreAfter = playerScores[playerActorNumber];
+        
+        Debug.Log($"[SCOREMANAGER] ✅ {points} points ajoutés à ActorNumber {playerActorNumber} (Score: {scoreBefore} → {scoreAfter})");
         
         RaiseEventOptions options = new RaiseEventOptions { Receivers = ReceiverGroup.All };
-        object[] content = new object[] { killerActorNumber, playerScores[killerActorNumber] };
+        object[] content = new object[] { playerActorNumber, playerScores[playerActorNumber] };
         PhotonNetwork.RaiseEvent(SCORE_UPDATE_EVENT, content, options, SendOptions.SendReliable);
 
         if (PhotonNetwork.IsMasterClient)
@@ -264,6 +310,71 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
         else
         {
             Debug.LogError("[KILLFEED] ❌ SFXManager.Instance est null sur ce client !");
+        }
+    }
+    
+    /// <summary>
+    /// Spawn un coin à une position aléatoire (Master Client seulement)
+    /// </summary>
+    private void SpawnCoin()
+    {
+        if (!PhotonNetwork.IsMasterClient) 
+        {
+            Debug.LogWarning("[COIN] ⚠️ SpawnCoin appelé mais ce client n'est pas Master Client");
+            return;
+        }
+        
+        if (coinPrefab == null)
+        {
+            Debug.LogWarning("[COIN] ⚠️ Coin prefab non assigné dans l'inspecteur - spawn ignoré");
+            return;
+        }
+        
+        if (!PhotonNetwork.IsConnected || !PhotonNetwork.InRoom)
+        {
+            Debug.LogWarning("[COIN] ⚠️ Pas connecté à Photon ou pas dans une room - spawn ignoré");
+            return;
+        }
+        
+        Vector3 spawnPosition;
+        
+        // Utiliser les points de spawn définis ou une position aléatoire
+        if (coinSpawnPoints != null && coinSpawnPoints.Length > 0)
+        {
+            // Choisir un point de spawn aléatoire
+            int randomIndex = Random.Range(0, coinSpawnPoints.Length);
+            Transform spawnPoint = coinSpawnPoints[randomIndex];
+            spawnPosition = spawnPoint.position;
+            
+            Debug.Log($"[COIN] 🪙 Spawn coin au point {randomIndex}:");
+            Debug.Log($"[COIN]   - Transform name: {spawnPoint.name}");
+            Debug.Log($"[COIN]   - Position: {spawnPosition}");
+            Debug.Log($"[COIN]   - Local position: {spawnPoint.localPosition}");
+        }
+        else
+        {
+            // Position aléatoire dans une zone définie (fallback)
+            // ⚠️ Modifie ces valeurs selon la taille de ta map
+            spawnPosition = new Vector3(
+                Random.Range(-8f, 8f),  // X aléatoire (ajuste selon ta map)
+                Random.Range(-4f, 4f),  // Y aléatoire (ajuste selon ta map)
+                0f                      // Z fixe pour 2D
+            );
+            Debug.Log($"[COIN] 🪙 Spawn coin à position aléatoire: {spawnPosition}");
+        }
+        
+        // Spawner le coin via Photon pour synchronisation réseau
+        try
+        {
+            GameObject coin = PhotonNetwork.Instantiate(coinPrefab.name, spawnPosition, Quaternion.identity);
+            if (coin != null)
+            {
+                Debug.Log($"[COIN] ✅ Coin spawné avec succès ! NetworkID: {coin.GetComponent<PhotonView>()?.ViewID}");
+            }
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogError($"[COIN] ❌ Erreur lors de PhotonNetwork.Instantiate: {e.Message}");
         }
     }
     
