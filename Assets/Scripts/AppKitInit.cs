@@ -191,7 +191,7 @@ namespace Sample
                 new BlockExplorer("Monad Explorer","https://explorer.testnet.monad.xyz"),
                 "https://testnet-rpc.monad.xyz/",
                 true,
-                "https://monad.xyz/logo.svg"
+                "https://docs.monad.xyz/img/monad_logo.png"
             );
 
             var cfg = new AppKitConfig
@@ -200,11 +200,11 @@ namespace Sample
                 metadata = new Metadata(
                     "CHOGTANKS",
                     "CHOGTANKS Unity WebGL",
-                    "https://redgnad.github.io/CHOGTANKS-testbuild-2/",
-                    "https://raw.githubusercontent.com/reown-com/reown-dotnet/main/media/appkit-icon.png",
+                    "https://redgnad.github.io/CHOGTANKS/",
+                    "https://raw.githubusercontent.com/RedGnad/CHOGTANKS/refs/heads/main/CHOG/chog.png",
                     new RedirectData {
                         Native = "appkit-sample-unity://",
-                        Universal = "https://redgnad.github.io/CHOGTANKS-testbuild-2/"
+                        Universal = "https://redgnad.github.io/CHOGTANKS/"
                     }
                 ),
                 customWallets = GetCustomWallets(),

@@ -178,16 +178,39 @@ MonoBehaviour:
   tankLayerMask:
     serializedVersion: 2
     m_Bits: 64
+  ricochetLayerMask:
+    serializedVersion: 2
+    m_Bits: 256
+  maxRicochets: 9
+  explosiveRadius: 15
+  explosiveDamage: 75
+  explosiveVFXPrefab: {fileID: 9193524732314840149, guid: 294f89f7b250d4cf583b23c41e0bc10f, type: 3}
+  aoeIndicatorPrefab: {fileID: 6437103288966294658, guid: a6a48c7c8a71f410493457ba0c385961, type: 3}
   particleOnlyExplosionPrefab: {fileID: 9193524732314840149, guid: ad560631223004304b75d451065a5220, type: 3}
   normalSprite: {fileID: 1137255479, guid: b5cb1cf9ebcebb6438035e1999ed0d12, type: 3}
   precisionSprite: {fileID: 21300000, guid: ddb1c1f50d6b24b22a0f6e4ab92520d8, type: 3}
-  trailRenderer: {fileID: 0}
+  ricochetSprite: {fileID: 21300000, guid: a3329fd496e8b47ab8169a21d25d9911, type: 3}
+  explosiveSprite: {fileID: 21300000, guid: ddb1c1f50d6b24b22a0f6e4ab92520d8, type: 3}
+  normalShellScale: 1
+  precisionShellScale: 2.1
+  ricochetShellScale: 2
+  explosiveShellScale: 8
+  autoScaleCollider: 1
+  normalShellColor: {r: 1, g: 1, b: 1, a: 1}
+  precisionShellColor: {r: 1, g: 1, b: 1, a: 1}
+  ricochetShellColor: {r: 1, g: 1, b: 1, a: 1}
+  explosiveShellColor: {r: 1, g: 0.06132078, b: 0.9856464, a: 0.65882355}
+  trailRenderer: {fileID: -6897678517889180112}
   normalTrailColor: {r: 1, g: 0.7873626, b: 0, a: 1}
   precisionTrailColor: {r: 0, g: 0.96981525, b: 1, a: 1}
+  ricochetTrailColor: {r: 0, g: 1, b: 0, a: 1}
+  explosiveTrailColor: {r: 1, g: 0.5, b: 0, a: 1}
   normalTrailWidth: 0.5
   precisionTrailWidth: 1
+  specialTrailWidth: 1.7
   normalTrailTime: 0.3
   precisionTrailTime: 0.6
+  specialTrailTime: 1
 --- !u!114 &-5720231297948589548
 MonoBehaviour:
   m_ObjectHideFlags: 0

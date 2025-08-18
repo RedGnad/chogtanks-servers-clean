@@ -188,9 +188,97 @@ public class PhotonLauncher : MonoBehaviourPunCallbacks
         PhotonNetwork.CreateRoom(roomName, options, TypedLobby.Default);
     }
 
+    [Header("Admin System")]
+    [SerializeField] private string[] adminWallets = { 
+        "0xD20CC1610BB0D0CF0daacb159AB6Cc4787D9e6D4" // Replace with your actual wallet address
+    };
+    
     public void JoinRoomByCode(string code)
     {
         roomName = code.ToUpper();
+        
+        // Check if current player is admin and room might be full
+        if (IsAdminWallet(PlayerSession.WalletAddress))
+        {
+            // Try to join normally first
+            PhotonNetwork.JoinRoom(roomName);
+        }
+        else
+        {
+            PhotonNetwork.JoinRoom(roomName);
+        }
+    }
+    
+    private bool IsAdminWallet(string walletAddress)
+    {
+        if (string.IsNullOrEmpty(walletAddress)) return false;
+        
+        foreach (string adminWallet in adminWallets)
+        {
+            if (walletAddress.Equals(adminWallet, System.StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    [PunRPC]
+    private void RequestAdminAccess(string adminWallet)
+    {
+        // Only master client can handle admin requests
+        if (!PhotonNetwork.IsMasterClient) return;
+        
+        // Verify the requesting wallet is actually an admin
+        if (!IsAdminWallet(adminWallet))
+        {
+            Debug.LogWarning($"[ADMIN] Non-admin wallet {adminWallet} attempted admin access!");
+            return;
+        }
+        
+        // Find the last non-admin player to kick
+        Player playerToKick = null;
+        foreach (Player player in PhotonNetwork.PlayerList)
+        {
+            // Skip if this player is an admin
+            string playerWallet = player.CustomProperties.ContainsKey("wallet") ? 
+                player.CustomProperties["wallet"].ToString() : "";
+            
+            if (!IsAdminWallet(playerWallet))
+            {
+                playerToKick = player;
+            }
+        }
+        
+        if (playerToKick != null)
+        {
+            Debug.Log($"[ADMIN] Kicking player {playerToKick.NickName} to make room for admin");
+            PhotonNetwork.CloseConnection(playerToKick);
+            
+            // Notify the admin that they can now join
+            photonView.RPC("NotifyAdminCanJoin", RpcTarget.All, adminWallet);
+        }
+        else
+        {
+            Debug.LogWarning("[ADMIN] No non-admin players found to kick!");
+        }
+    }
+    
+    [PunRPC]
+    private void NotifyAdminCanJoin(string adminWallet)
+    {
+        // Only the admin who requested access should act on this
+        if (PlayerSession.WalletAddress == adminWallet)
+        {
+            Debug.Log("[ADMIN] Slot available, joining room...");
+            // Wait a moment for the kicked player to disconnect, then join
+            StartCoroutine(DelayedJoinRoom());
+        }
+    }
+    
+    private System.Collections.IEnumerator DelayedJoinRoom()
+    {
+        yield return new WaitForSeconds(1f); // Wait for disconnect to process
         PhotonNetwork.JoinRoom(roomName);
     }
 
@@ -313,11 +401,6 @@ public class PhotonLauncher : MonoBehaviourPunCallbacks
 
     public override void OnJoinedRoom()
     {
-        // Logs de diagnostic pour confirmer la région et le matchmaking
-        Debug.Log($"[MATCHMAKING] ✅ Connexion réussie à la room: {PhotonNetwork.CurrentRoom.Name}");
-        Debug.Log($"[MATCHMAKING] Région connectée: {PhotonNetwork.CloudRegion}");
-        Debug.Log($"[MATCHMAKING] Joueurs dans la room: {PhotonNetwork.CurrentRoom.PlayerCount}/{PhotonNetwork.CurrentRoom.MaxPlayers}");
-        
         if (lobbyUI == null) lobbyUI = FindObjectOfType<LobbyUI>();
         if (lobbyUI != null)
         {
@@ -347,6 +430,15 @@ public class PhotonLauncher : MonoBehaviourPunCallbacks
 
     public override void OnJoinRoomFailed(short returnCode, string message)
     {
+        // Check if admin trying to join a full room (return code 32765 = room full)
+        if (returnCode == 32765 && IsAdminWallet(PlayerSession.WalletAddress))
+        {
+            Debug.Log("[ADMIN] Room is full, attempting admin override...");
+            // Request admin access to the room
+            photonView.RPC("RequestAdminAccess", RpcTarget.MasterClient, PlayerSession.WalletAddress);
+            return;
+        }
+        
         if (lobbyUI == null) lobbyUI = FindObjectOfType<LobbyUI>();
         if (lobbyUI != null)
         {
@@ -399,7 +491,6 @@ public class PhotonLauncher : MonoBehaviourPunCallbacks
             CleanupCacheOnLeave = true
         };
         
-        Debug.Log($"[MATCHMAKING] Création/rejointe de la room globale: {globalRoomName}");
         PhotonNetwork.JoinOrCreateRoom(globalRoomName, options, TypedLobby.Default);
     }
 

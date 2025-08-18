@@ -44,7 +44,15 @@ public class CameraFollow : MonoBehaviour
         }
 
         Vector3 desiredPosition = target.position + offset;
-        transform.position = Vector3.SmoothDamp(transform.position, desiredPosition, ref velocity, smoothTime);
+        
+        // Apply camera shake offset if available
+        Vector3 shakeOffset = Vector3.zero;
+        if (CameraShake2D.Instance != null)
+        {
+            shakeOffset = CameraShake2D.Instance.ShakeOffset;
+        }
+        
+        transform.position = Vector3.SmoothDamp(transform.position, desiredPosition + shakeOffset, ref velocity, smoothTime);
     }
 
     private void FindPlayerInstance()

@@ -67,6 +67,15 @@ MonoBehaviour:
   - RPC_PlayKillFeedSFX
   - PlayKillFeedSoundRPC
   - CollectCoinRPC
+  - RPC_ActivateCloak
+  - RPC_ActivateCloakPowerup
+  - RPC_ActivateRicochetPowerup
+  - RPC_PlayPickupFX
+  - ActivateExplosiveShotRPC
+  - ActivateRicochetRPC
+  - RPC_ActivateExplosivePowerup
+  - NotifyAdminCanJoin
+  - RequestAdminAccess
   DisableAutoOpenWizard: 1
   ShowSettings: 1
   DevRegionSetOnce: 1

@@ -417,6 +417,10 @@ MonoBehaviour:
   groundCheckDistance: 1
   groundCheck: {fileID: 4018829606093349745, guid: cb1580937bf554031ae61f8ccb0c6cdd, type: 3}
   groundCheckRadius: 0.2
+  hasRicochetPowerup: 0
+  hasExplosivePowerup: 0
+  hasCloakPowerup: 0
+  cloakDuration: 8
   chargeTimeThreshold: 0.55
   precisionShellSpeedMultiplier: 2.2
   precisionRecoilMultiplier: 0.15

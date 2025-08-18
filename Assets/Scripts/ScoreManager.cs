@@ -11,7 +11,7 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
 {
     private const float ROOM_LIFETIME = 180f; 
     private const float RESPAWN_TIME = 5f;
-    private const float COIN_SPAWN_INTERVAL = 20f; // Spawn un coin toutes les 20 secondes
+    private const float COIN_SPAWN_INTERVAL = 20f; 
     
     private const byte SCORE_UPDATE_EVENT = 1;
     private const byte MATCH_END_EVENT = 2;
@@ -29,9 +29,14 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
     private bool matchEnded = false;
     
     [Header("Coin System")]
-    public GameObject coinPrefab; // Prefab du coin à assigner dans l'inspecteur
-    public Transform[] coinSpawnPoints; // Points de spawn pour les coins
+    public GameObject coinPrefab; 
+    public Transform[] coinSpawnPoints; 
     private float nextCoinSpawnTime;
+    
+    [Header("Power-up System")]
+    public GameObject[] powerupPrefabs; 
+    public float powerupSpawnInterval = 15f;
+    private float nextPowerupSpawnTime;
     
     public static ScoreManager Instance { get; private set; }
     
@@ -148,7 +153,6 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
                 if (SFXManager.Instance != null)
                 {
                     SFXManager.Instance.PlayCountdownBeep();
-                    Debug.Log($"[SCOREMANAGER] ⏰ Son de décompte joué pour {currentSecond} seconde(s) restante(s)");
                 }
                 lastCountdownSecond = currentSecond;
             }
@@ -163,9 +167,24 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
                 }
                 catch (System.Exception e)
                 {
-                    Debug.LogError($"[COIN] ❌ Erreur lors du spawn de coin: {e.Message}");
+                    // Debug.LogError($"[COIN] ❌ Erreur lors du spawn de coin: {e.Message}");
                     // Réessayer dans 20 secondes même en cas d'erreur
                     nextCoinSpawnTime = Time.time + COIN_SPAWN_INTERVAL;
+                }
+            }
+            
+            // Spawn des power-ups (Master Client seulement)
+            if (PhotonNetwork.IsMasterClient && Time.time >= nextPowerupSpawnTime && !matchEnded)
+            {
+                try
+                {
+                    SpawnPowerup();
+                    nextPowerupSpawnTime = Time.time + powerupSpawnInterval;
+                }
+                catch (System.Exception e)
+                {
+                    // Debug.LogError($"[POWERUP] ❌ Erreur lors du spawn de power-up: {e.Message}");
+                    nextPowerupSpawnTime = Time.time + powerupSpawnInterval;
                 }
             }
             
@@ -207,7 +226,7 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
         }
         int scoreAfter = playerScores[playerActorNumber];
         
-        Debug.Log($"[SCOREMANAGER] ✅ {points} points ajoutés à ActorNumber {playerActorNumber} (Score: {scoreBefore} → {scoreAfter})");
+        // Debug.Log($"[SCOREMANAGER] ✅ {points} points ajoutés à ActorNumber {playerActorNumber} (Score: {scoreBefore} → {scoreAfter})");
         
         RaiseEventOptions options = new RaiseEventOptions { Receivers = ReceiverGroup.All };
         object[] content = new object[] { playerActorNumber, playerScores[playerActorNumber] };
@@ -298,13 +317,82 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
             LobbyUI.Instance.killFeedText.text = "";
     }
     
+    /// <summary>
+    /// Spawn un power-up aléatoire à une position aléatoire (Master Client seulement)
+    /// </summary>
+    private void SpawnPowerup()
+    {
+        if (!PhotonNetwork.IsMasterClient) 
+        {
+            // Debug.LogWarning("[POWERUP] ⚠️ SpawnPowerup appelé mais ce client n'est pas Master Client");
+            return;
+        }
+        
+        if (powerupPrefabs == null || powerupPrefabs.Length == 0)
+        {
+            // Debug.LogWarning("[POWERUP] ⚠️ Aucun power-up prefab assigné dans l'inspecteur - spawn ignoré");
+            return;
+        }
+        
+        if (!PhotonNetwork.IsConnected || !PhotonNetwork.InRoom)
+        {
+            // Debug.LogWarning("[POWERUP] ⚠️ Pas connecté à Photon ou pas dans une room - spawn ignoré");
+            return;
+        }
+        
+        // Choisir un power-up aléatoire
+        int randomPowerupIndex = Random.Range(0, powerupPrefabs.Length);
+        GameObject selectedPowerup = powerupPrefabs[randomPowerupIndex];
+        
+        if (selectedPowerup == null)
+        {
+            // Debug.LogWarning($"[POWERUP] ⚠️ Power-up prefab à l'index {randomPowerupIndex} est null");
+            return;
+        }
+        
+        Vector3 spawnPosition;
+        
+        // Utiliser les mêmes points de spawn que les coins
+        if (coinSpawnPoints != null && coinSpawnPoints.Length > 0)
+        {
+            // Choisir un point de spawn aléatoire
+            int randomIndex = Random.Range(0, coinSpawnPoints.Length);
+            Transform spawnPoint = coinSpawnPoints[randomIndex];
+            spawnPosition = spawnPoint.position;
+            
+            // Debug.Log($"[POWERUP] ⚡ Spawn {selectedPowerup.name} au point {randomIndex}: {spawnPosition}");
+        }
+        else
+        {
+            // Position aléatoire dans une zone définie (fallback)
+            spawnPosition = new Vector3(
+                Random.Range(-8f, 8f),  // X aléatoire
+                Random.Range(-4f, 4f),  // Y aléatoire
+                0f                      // Z fixe pour 2D
+            );
+            // Debug.Log($"[POWERUP] ⚡ Spawn {selectedPowerup.name} à position aléatoire: {spawnPosition}");
+        }
+        
+        // Spawner le power-up via Photon pour synchronisation réseau
+        try
+        {
+            GameObject powerup = PhotonNetwork.Instantiate(selectedPowerup.name, spawnPosition, Quaternion.identity);
+            if (powerup != null)
+            {
+                // Debug.Log($"[POWERUP] ✅ Power-up {selectedPowerup.name} spawné avec succès ! NetworkID: {powerup.GetComponent<PhotonView>()?.ViewID}");
+            }
+        }
+        catch (System.Exception e)
+        {
+            // Debug.LogError($"[POWERUP] ❌ Erreur lors de PhotonNetwork.Instantiate: {e.Message}");
+        }
+    }
+    
     [PunRPC]
     void PlayKillFeedSoundRPC()
     {
-        Debug.Log("[KILLFEED] 📨 RPC PlayKillFeedSoundRPC reçu sur ce client");
         if (SFXManager.Instance != null)
         {
-            Debug.Log("[KILLFEED] ✅ SFXManager trouvé, appel de PlayRandomKillFeedSoundLocal()");
             SFXManager.Instance.PlayRandomKillFeedSoundLocal();
         }
         else
@@ -320,19 +408,19 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
     {
         if (!PhotonNetwork.IsMasterClient) 
         {
-            Debug.LogWarning("[COIN] ⚠️ SpawnCoin appelé mais ce client n'est pas Master Client");
+            // Debug.LogWarning("[COIN] ⚠️ SpawnCoin appelé mais ce client n'est pas Master Client");
             return;
         }
         
         if (coinPrefab == null)
         {
-            Debug.LogWarning("[COIN] ⚠️ Coin prefab non assigné dans l'inspecteur - spawn ignoré");
+            // Debug.LogWarning("[COIN] ⚠️ Coin prefab non assigné dans l'inspecteur - spawn ignoré");
             return;
         }
         
         if (!PhotonNetwork.IsConnected || !PhotonNetwork.InRoom)
         {
-            Debug.LogWarning("[COIN] ⚠️ Pas connecté à Photon ou pas dans une room - spawn ignoré");
+            // Debug.LogWarning("[COIN] ⚠️ Pas connecté à Photon ou pas dans une room - spawn ignoré");
             return;
         }
         
@@ -346,10 +434,10 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
             Transform spawnPoint = coinSpawnPoints[randomIndex];
             spawnPosition = spawnPoint.position;
             
-            Debug.Log($"[COIN] 🪙 Spawn coin au point {randomIndex}:");
-            Debug.Log($"[COIN]   - Transform name: {spawnPoint.name}");
-            Debug.Log($"[COIN]   - Position: {spawnPosition}");
-            Debug.Log($"[COIN]   - Local position: {spawnPoint.localPosition}");
+            // Debug.Log($"[COIN] 🪙 Spawn coin au point {randomIndex}:");
+            // Debug.Log($"[COIN]   - Transform name: {spawnPoint.name}");
+            // Debug.Log($"[COIN]   - Position: {spawnPosition}");
+            // Debug.Log($"[COIN]   - Local position: {spawnPoint.localPosition}");
         }
         else
         {
@@ -360,7 +448,7 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
                 Random.Range(-4f, 4f),  // Y aléatoire (ajuste selon ta map)
                 0f                      // Z fixe pour 2D
             );
-            Debug.Log($"[COIN] 🪙 Spawn coin à position aléatoire: {spawnPosition}");
+            // Debug.Log($"[COIN] 🪙 Spawn coin à position aléatoire: {spawnPosition}");
         }
         
         // Spawner le coin via Photon pour synchronisation réseau
@@ -369,12 +457,12 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
             GameObject coin = PhotonNetwork.Instantiate(coinPrefab.name, spawnPosition, Quaternion.identity);
             if (coin != null)
             {
-                Debug.Log($"[COIN] ✅ Coin spawné avec succès ! NetworkID: {coin.GetComponent<PhotonView>()?.ViewID}");
+                // Debug.Log($"[COIN] ✅ Coin spawné avec succès ! NetworkID: {coin.GetComponent<PhotonView>()?.ViewID}");
             }
         }
         catch (System.Exception e)
         {
-            Debug.LogError($"[COIN] ❌ Erreur lors de PhotonNetwork.Instantiate: {e.Message}");
+            // Debug.LogError($"[COIN] ❌ Erreur lors de PhotonNetwork.Instantiate: {e.Message}");
         }
     }
     

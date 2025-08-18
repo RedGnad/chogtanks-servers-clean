@@ -1131,7 +1131,7 @@ public class ChogTanksNFTManager : MonoBehaviour
             {
                 if (level > 0)
                 {
-                    string levelMessage = $"NFT Level: {level} ";
+                    string levelMessage = $"Level: {level} ";
                     levelText.text = levelMessage;
                     Debug.Log($"[UI-LEVEL] ✅ levelText set to: '{levelMessage}'");
                 }

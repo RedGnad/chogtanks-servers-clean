@@ -1,6 +1,7 @@
 using Photon.Pun;
 using UnityEngine;
 using UnityEngine.EventSystems; 
+using System.Collections.Generic; 
 
 [RequireComponent(typeof(Rigidbody2D))]
 public class TankShoot2D : Photon.Pun.MonoBehaviourPunCallbacks
@@ -20,6 +21,12 @@ public class TankShoot2D : Photon.Pun.MonoBehaviourPunCallbacks
     [Header("Détection Sol partagée")]
     [SerializeField] private Transform groundCheck;
     [SerializeField] private float groundCheckRadius = 0.3f;
+
+    [Header("Power-ups")]
+    public bool hasRicochetPowerup = false; // Public for easy activation
+    public bool hasExplosivePowerup = false; // Public for easy activation
+    public bool hasCloakPowerup = false; // Public for easy activation
+    [SerializeField] private float cloakDuration = 8f; // Duration of cloak effect
 
     [Header("SFX")]
     // [SerializeField] private AudioSource fireNormalSFX;
@@ -115,7 +122,7 @@ public class TankShoot2D : Photon.Pun.MonoBehaviourPunCallbacks
             float heldTime = Time.time - chargeStartTime;
             if (heldTime >= chargeTimeThreshold)
             {
-                SFXManager.Instance.PlaySFX("chargeReady");
+                SFXManager.Instance.PlaySFX("chargeReady", 1f, 1f);
                 chargeSFXPlayed = true;
             }
         }
@@ -124,25 +131,49 @@ public class TankShoot2D : Photon.Pun.MonoBehaviourPunCallbacks
         {
             float heldTime = Time.time - chargeStartTime;
             bool isPrecision = heldTime >= chargeTimeThreshold;
-            FireShell(shootDir, angle, isPrecision);
+            FireShell(isPrecision, shootDir, angle);
             isCharging = false;
             chargeSFXPlayed = false;
         }
     }
 
-    private void FireShell(Vector2 shootDir, float angle, bool isPrecision)
+    private void FireShell(bool isPrecision, Vector2 shootDir, float angle)
     {
         if (Time.time - lastFireTime < fireCooldown) return;
         lastFireTime = Time.time;
 
-        if (isPrecision)
+        // --- Gamefeel: Camera Shake ---
+        if (CameraShake2D.Instance != null)
         {
-            SFXManager.Instance.PlaySFX("firePrecision");
+            float shakeMagnitude = isPrecision ? 1.5f : 0f;
+            float shakeDuration = isPrecision ? 0.08f : 0f;
+            CameraShake2D.Instance.Shake(shakeMagnitude, shakeDuration);
+            // Debug.Log($"[CameraShake] Shake triggered! Magnitude: {shakeMagnitude}, Duration: {shakeDuration}");
         }
         else
         {
-            SFXManager.Instance.PlaySFX("fireNormal");
+            Debug.LogWarning("[CameraShake] CameraShake2D.Instance is null! Make sure the script is attached to the Main Camera.");
         }
+
+        // --- Gamefeel: Pitch Variation & SFX ---
+        string sfxToPlay;
+        if (isPrecision)
+        {
+            // Different sounds for power-up precision shots
+            if (hasRicochetPowerup)
+                sfxToPlay = "fireRicochet";
+            else if (hasExplosivePowerup)
+                sfxToPlay = "fireExplosive";
+            else
+                sfxToPlay = "firePrecision";
+        }
+        else
+        {
+            sfxToPlay = "fireNormal";
+        }
+        
+        float pitch = Random.Range(0.95f, 1.05f);
+        SFXManager.Instance.PlaySFX(sfxToPlay, 1f, pitch);
 
         float recoilMultiplier = isPrecision ? precisionRecoilMultiplier : 1f;
 
@@ -198,8 +229,101 @@ public class TankShoot2D : Photon.Pun.MonoBehaviourPunCallbacks
         {
             shellHandler.photonView.RPC("SetPrecision", RpcTarget.AllBuffered, isPrecision);
             shellHandler.photonView.RPC("SetShooter", RpcTarget.AllBuffered, PhotonNetwork.LocalPlayer.ActorNumber);
+
+            // Apply power-ups only on charged shots (precision shots)
+            if (isPrecision)
+            {
+                if (hasRicochetPowerup)
+                {
+                    shellHandler.photonView.RPC("ActivateRicochetRPC", RpcTarget.AllBuffered);
+                    hasRicochetPowerup = false; // Consume the power-up
+                    // Debug.Log("[TankShoot2D] Ricochet power-up applied to charged shot!");
+                    
+                    // Fire additional shells in fan pattern for ricochet
+                    FireRicochetFanShells(shootDir, shellSpeedFinal, isPrecision);
+                }
+                else if (hasExplosivePowerup)
+                {
+                    shellHandler.photonView.RPC("ActivateExplosiveShotRPC", RpcTarget.AllBuffered);
+                    hasExplosivePowerup = false; // Consume the power-up
+                    // Debug.Log("[TankShoot2D] Explosive power-up applied to charged shot!");
+                }
+            }
         }
 
+    }
+
+    /// <summary>
+    /// Fire additional shells in a fan pattern for ricochet power-up
+    /// </summary>
+    private void FireRicochetFanShells(Vector2 baseDirection, float speed, bool isPrecision)
+    {
+        // Fire 4 additional shells at different angles (-30°, -15°, +15°, +30°)
+        float[] fanAngles = { -30f, -15f, 15f, 30f };
+        
+        foreach (float angleOffset in fanAngles)
+        {
+            // Calculate the rotated direction
+            float angleRad = angleOffset * Mathf.Deg2Rad;
+            Vector2 rotatedDir = new Vector2(
+                baseDirection.x * Mathf.Cos(angleRad) - baseDirection.y * Mathf.Sin(angleRad),
+                baseDirection.x * Mathf.Sin(angleRad) + baseDirection.y * Mathf.Cos(angleRad)
+            );
+            
+            // Spawn the shell
+            GameObject fanShell = PhotonNetwork.Instantiate(shellPrefab.name, firePoint.position, firePoint.rotation);
+            Rigidbody2D fanShellRb = fanShell.GetComponent<Rigidbody2D>();
+            fanShellRb.linearVelocity = rotatedDir * speed;
+            
+            // Configure the shell
+            var fanShellHandler = fanShell.GetComponent<ShellCollisionHandler>();
+            if (fanShellHandler != null)
+            {
+                fanShellHandler.photonView.RPC("SetPrecision", RpcTarget.AllBuffered, isPrecision);
+                fanShellHandler.photonView.RPC("SetShooter", RpcTarget.AllBuffered, PhotonNetwork.LocalPlayer.ActorNumber);
+                fanShellHandler.photonView.RPC("ActivateRicochetRPC", RpcTarget.AllBuffered);
+            }
+        }
+        
+        // Debug.Log("[TankShoot2D] Fired ricochet fan pattern with 4 additional shells!");
+    }
+
+    [PunRPC]
+    public void RPC_ActivateRicochetPowerup()
+    {
+        if (photonView.IsMine)
+        {
+            hasRicochetPowerup = true;
+        }
+    }
+
+    [PunRPC]
+    public void RPC_ActivateExplosivePowerup()
+    {
+        if (photonView.IsMine)
+        {
+            hasExplosivePowerup = true;
+        }
+    }
+
+    [PunRPC]
+    public void RPC_ActivateCloakPowerup()
+    {
+        if (photonView.IsMine)
+        {
+            hasCloakPowerup = true;
+            
+            // Find and activate cloak on minimap icon
+            MinimapIcon minimapIcon = GetComponent<MinimapIcon>();
+            if (minimapIcon != null)
+            {
+                minimapIcon.ActivateCloak(cloakDuration);
+            }
+            else
+            {
+                Debug.LogWarning("[TankShoot2D] MinimapIcon component not found for cloak activation!");
+            }
+        }
     }
     
     private bool IsPointerOverButton()
@@ -217,7 +341,7 @@ public class TankShoot2D : Photon.Pun.MonoBehaviourPunCallbacks
                 var eventData = new PointerEventData(EventSystem.current);
                 eventData.position = touch.position;
                 
-                var results = new System.Collections.Generic.List<RaycastResult>();
+                var results = new List<RaycastResult>();
                 EventSystem.current.RaycastAll(eventData, results);
                 
                 if (results.Count > 0)
@@ -231,7 +355,7 @@ public class TankShoot2D : Photon.Pun.MonoBehaviourPunCallbacks
             var eventData = new PointerEventData(EventSystem.current);
             eventData.position = Input.mousePosition;
             
-            var results = new System.Collections.Generic.List<RaycastResult>();
+            var results = new List<RaycastResult>();
             EventSystem.current.RaycastAll(eventData, results);
             
             if (results.Count > 0)

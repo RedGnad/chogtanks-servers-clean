@@ -82,6 +82,12 @@ public class SFXManager : MonoBehaviourPun
     
     public void PlaySFX(string sfxName, float volumeMultiplier = 1f)
     {
+        // Appelle la surcharge plus complète avec un pitch par défaut de 1.0f
+        PlaySFX(sfxName, volumeMultiplier, 1.0f);
+    }
+
+    public void PlaySFX(string sfxName, float volumeMultiplier, float pitch)
+    {
         if (string.IsNullOrEmpty(sfxName) || sfxDictionary == null) return;
         
         if (!sfxDictionary.TryGetValue(sfxName, out SFXClip sfxClip))
@@ -94,26 +100,28 @@ public class SFXManager : MonoBehaviourPun
         
         if (sfxClip.shareInMultiplayer)
         {
-            photonView.RPC("RPC_PlaySFX", RpcTarget.Others, sfxName, finalVolume);
+            photonView.RPC("RPC_PlaySFX", RpcTarget.Others, sfxName, finalVolume, pitch);
         }
         
-        PlayLocalSFX(sfxClip.clip, finalVolume);
+        PlayLocalSFX(sfxClip.clip, finalVolume, pitch);
     }
     
-    private void PlayLocalSFX(AudioClip clip, float volume)
+    private void PlayLocalSFX(AudioClip clip, float volume, float pitch)
     {
         if (audioSource != null)
         {
+            audioSource.pitch = pitch;
             audioSource.PlayOneShot(clip, volume * masterVolume);
+            audioSource.pitch = 1f; // Reset pitch to default after playing
         }
     }
     
     [PunRPC]
-    void RPC_PlaySFX(string sfxName, float volume)
+    void RPC_PlaySFX(string sfxName, float volume, float pitch)
     {
         if (sfxDictionary != null && sfxDictionary.TryGetValue(sfxName, out SFXClip sfxClip))
         {
-            PlayLocalSFX(sfxClip.clip, volume * multiplayerVolumeMultiplier);
+            PlayLocalSFX(sfxClip.clip, volume * multiplayerVolumeMultiplier, pitch);
         }
     }
     
@@ -196,7 +204,7 @@ public class SFXManager : MonoBehaviourPun
             AudioClip clipToPlay = killFeedSounds[clipIndex];
             if (clipToPlay != null)
             {
-                PlayLocalSFX(clipToPlay, volume * multiplayerVolumeMultiplier);
+                PlayLocalSFX(clipToPlay, volume * multiplayerVolumeMultiplier, 1.0f);
             }
         }
     }

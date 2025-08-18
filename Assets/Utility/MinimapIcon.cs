@@ -11,9 +11,22 @@ public class MinimapIcon : MonoBehaviourPunCallbacks
     private GameObject iconInstance;
     private SpriteRenderer iconRenderer;
     
+    [Header("Cloak Power-up")]
+    private bool isCloaked = false;
+    private float cloakEndTime = 0f;
+    
     private void Start()
     {
         CreateMinimapIcon();
+    }
+    
+    private void Update()
+    {
+        // Check if cloak should end
+        if (isCloaked && Time.time >= cloakEndTime)
+        {
+            SetCloaked(false);
+        }
     }
     
     private void CreateMinimapIcon()
@@ -44,6 +57,59 @@ public class MinimapIcon : MonoBehaviourPunCallbacks
         
         iconRenderer.color = iconColor;
         
+    }
+    
+    public void ActivateCloak(float duration)
+    {
+        // Send RPC to all clients to activate cloak
+        photonView.RPC("RPC_ActivateCloak", RpcTarget.All, duration);
+    }
+    
+    [PunRPC]
+    private void RPC_ActivateCloak(float duration)
+    {
+        isCloaked = true;
+        cloakEndTime = Time.time + duration;
+        SetCloaked(true);
+        Debug.Log($"[MinimapIcon] Cloak activated for {duration} seconds on {(photonView.IsMine ? "local" : "remote")} player");
+    }
+    
+    private void SetCloaked(bool cloaked)
+    {
+        isCloaked = cloaked;
+        if (iconRenderer != null)
+        {
+            // Only hide from OTHER players, not from yourself
+            if (photonView.IsMine)
+            {
+                // Local player always sees their own icon (maybe dimmed to show cloak is active)
+                iconRenderer.enabled = true;
+                if (cloaked)
+                {
+                    // Dim the icon to show cloak is active
+                    Color dimmedColor = iconRenderer.color;
+                    dimmedColor.a = 0.5f;
+                    iconRenderer.color = dimmedColor;
+                }
+                else
+                {
+                    // Restore full opacity
+                    Color normalColor = iconRenderer.color;
+                    normalColor.a = 1f;
+                    iconRenderer.color = normalColor;
+                }
+            }
+            else
+            {
+                // Other players see/don't see based on cloak status
+                iconRenderer.enabled = !cloaked;
+            }
+        }
+        
+        if (!cloaked)
+        {
+            Debug.Log("[MinimapIcon] Cloak deactivated");
+        }
     }
     
     private Sprite CreateSimpleSquare()
