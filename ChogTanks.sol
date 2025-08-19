@@ -23,7 +23,6 @@ contract ChogTanks is ERC721, ERC721Enumerable, Ownable {
     mapping(address => uint256[]) public walletNFTs;
     mapping(uint256 => uint256) private nftIndexInWallet;
     
-    // 🎯 AMÉLIORATION 1: Restriction permanente de mint
     mapping(address => bool) public hasMintedBefore;
     
     address public gameServerSigner;
@@ -37,16 +36,15 @@ contract ChogTanks is ERC721, ERC721Enumerable, Ownable {
     constructor(address _gameServerSigner) ERC721("ChogTanks", "TANK") Ownable(msg.sender) {
         gameServerSigner = _gameServerSigner;
         
-        // 🎯 AMÉLIORATION 2: Coûts d'évolution plus abordables
         evolutionCosts[2] = 2;
-        evolutionCosts[3] = 100;    // Au lieu de 200
-        evolutionCosts[4] = 200;    // Au lieu de 300
-        evolutionCosts[5] = 300;    // Au lieu de 400
-        evolutionCosts[6] = 400;    // Au lieu de 500
-        evolutionCosts[7] = 500;    // Au lieu de 600
-        evolutionCosts[8] = 600;    // Au lieu de 700
-        evolutionCosts[9] = 700;    // Au lieu de 800
-        evolutionCosts[10] = 800;   // Au lieu de 900
+        evolutionCosts[3] = 100;   
+        evolutionCosts[4] = 200;   
+        evolutionCosts[5] = 300;   
+        evolutionCosts[6] = 400;  
+        evolutionCosts[7] = 500;  
+        evolutionCosts[8] = 600;  
+        evolutionCosts[9] = 700;   
+        evolutionCosts[10] = 800; 
     }
     
     function totalSupply() public view override returns (uint256) {
@@ -65,13 +63,12 @@ contract ChogTanks is ERC721, ERC721Enumerable, Ownable {
         return MAX_SUPPLY - current;
     }
     
-    // 🎯 FONCTION ESSENTIELLE: canMintNFT (gardée de v2)
     function canMintNFT(address wallet) external view returns (bool, string memory) {
         if (isMaxSupplyReached()) {
             return (false, "Max supply reached");
         }
         if (hasMintedBefore[wallet]) {
-            return (false, "Already minted NFT"); // 🎯 Restriction permanente
+            return (false, "Already minted NFT"); 
         }
         return (true, "");
     }
@@ -83,7 +80,7 @@ contract ChogTanks is ERC721, ERC721Enumerable, Ownable {
     ) external payable {
         require(msg.value >= MINT_PRICE, "Insufficient payment");
         require(!isMaxSupplyReached(), "Max supply reached");
-        require(!hasMintedBefore[msg.sender], "Already minted NFT"); // 🎯 Restriction permanente
+        require(!hasMintedBefore[msg.sender], "Already minted NFT"); 
         
         bytes32 messageHash = keccak256(abi.encodePacked(
             msg.sender,
@@ -96,7 +93,7 @@ contract ChogTanks is ERC721, ERC721Enumerable, Ownable {
         require(messageHash.recover(signature) == gameServerSigner, "Invalid signature");
         
         usedSignatures[messageHash] = true;
-        hasMintedBefore[msg.sender] = true; // 🎯 Marquage permanent
+        hasMintedBefore[msg.sender] = true; 
         
         uint256 tokenId = _tokenIdCounter++;
         _safeMint(msg.sender, tokenId);
@@ -129,7 +126,6 @@ contract ChogTanks is ERC721, ERC721Enumerable, Ownable {
         
         require(playerPoints >= evolutionCost, "Insufficient points");
         
-        // 🎯 AMÉLIORATION 3: Signature sécurisée avec targetLevel
         bytes32 messageHash = keccak256(abi.encodePacked(
             msg.sender,
             tokenId,
@@ -167,25 +163,20 @@ contract ChogTanks is ERC721, ERC721Enumerable, Ownable {
         }
     }
     
-    // 🎯 AMÉLIORATION 4: Fix array bounds avec vérifications robustes
     function _removeNFTFromWallet(address wallet, uint256 tokenId) private {
         uint256[] storage nfts = walletNFTs[wallet];
         
-        // Protection 1: Array vide
         if (nfts.length == 0) {
             return;
         }
         
         uint256 index = nftIndexInWallet[tokenId];
         
-        // Protection 2: Index invalide
         if (index >= nfts.length) {
             return;
         }
         
-        // Protection 3: Vérification que le tokenId correspond bien à l'index
         if (nfts[index] != tokenId) {
-            // Fallback: recherche linéaire pour trouver le bon index
             bool found = false;
             for (uint256 i = 0; i < nfts.length; i++) {
                 if (nfts[i] == tokenId) {
@@ -195,7 +186,7 @@ contract ChogTanks is ERC721, ERC721Enumerable, Ownable {
                 }
             }
             if (!found) {
-                return; // TokenId pas trouvé dans l'array
+                return; 
             }
         }
         
@@ -220,7 +211,6 @@ contract ChogTanks is ERC721, ERC721Enumerable, Ownable {
         return walletNFTs[wallet];
     }
     
-    // 🎯 FONCTION COMPLÈTE: getWalletNFTsDetails avec canEvolve + evolutionCosts
     function getWalletNFTsDetails(address wallet) external view returns (
         uint256[] memory tokenIds,
         uint256[] memory levels,
@@ -262,7 +252,6 @@ contract ChogTanks is ERC721, ERC721Enumerable, Ownable {
         return nftLevels[tokenId] < MAX_LEVEL;
     }
     
-    // 🎯 FONCTIONS UTILITAIRES (gardées de v2)
     function getMaxSupply() external pure returns (uint256) {
         return MAX_SUPPLY;
     }
@@ -294,10 +283,8 @@ contract ChogTanks is ERC721, ERC721Enumerable, Ownable {
         
         return string(
             abi.encodePacked(
-                "https://df1284899722.ngrok-free.app/metadata/level",
+                "ipfs://bafybeidrtmbrzj7whdlbkipdrvxqaumiem323x4hglguf3oivhiuoqvomu/level",
                 level.toString(),
-                "/",
-                tokenId.toString(),
                 ".json"
             )
         );

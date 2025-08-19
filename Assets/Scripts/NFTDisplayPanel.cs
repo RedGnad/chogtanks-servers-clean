@@ -558,7 +558,7 @@ public class NFTDisplayPanel : MonoBehaviour
             
             var contractAddresses = new string[]
             {
-                "0x07045605a0d70b12f3688a438db706bc1eda7e8c"
+                "0x04223adab3a0c1a2e8aade678bebd3fddd580a38"
             };
             
             Debug.Log($"[NFT-LIST] Checking {contractAddresses.Length} contracts for NFTs");

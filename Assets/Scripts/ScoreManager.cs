@@ -565,6 +565,9 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
             object[] content = new object[] { winnerActorNumber, winnerName, highestScore };
             RaiseEventOptions options = new RaiseEventOptions { Receivers = ReceiverGroup.All };
             PhotonNetwork.RaiseEvent(MATCH_END_EVENT, content, options, SendOptions.SendReliable);
+            
+            // Fallback: Also call ShowWinnerToAllRPC directly in case the event fails
+            StartCoroutine(FallbackShowWinner(winnerActorNumber, winnerName, highestScore));
         }
         else
         {
@@ -691,6 +694,24 @@ public class ScoreManager : MonoBehaviourPunCallbacks, IOnEventCallback
         
         RaiseEventOptions options = new RaiseEventOptions { Receivers = ReceiverGroup.All };
         PhotonNetwork.RaiseEvent(SYNC_TIMER_EVENT, timeLeft, options, SendOptions.SendReliable);
+    }
+    
+    private IEnumerator FallbackShowWinner(int winnerActorNumber, string winnerName, int highestScore)
+    {
+        // Wait 2 seconds to see if the event was received
+        yield return new WaitForSeconds(2f);
+        
+        // If no GameOverUI was created, the event probably failed
+        GameObject[] gameOverUIs = GameObject.FindGameObjectsWithTag("GameOverUI");
+        if (gameOverUIs.Length == 0)
+        {
+            Debug.LogWarning("[SCOREMANAGER] Photon event may have failed, calling ShowWinnerToAllRPC directly");
+            PhotonLauncher launcher = FindObjectOfType<PhotonLauncher>();
+            if (launcher != null && launcher.photonView != null)
+            {
+                launcher.photonView.RPC("ShowWinnerToAllRPC", RpcTarget.All, winnerName, winnerActorNumber);
+            }
+        }
     }
     
     public void OnEvent(EventData photonEvent)

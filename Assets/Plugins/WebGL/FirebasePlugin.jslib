@@ -536,7 +536,7 @@ mergeInto(LibraryManager.library, {
 
           let onChainLevel = 0;
           let foundTokenId = null;
-          let foundContract = "0x07045605a0d70b12f3688a438db706bc1eda7e8c";
+          let foundContract = "0x04223adab3a0c1a2e8aade678bebd3fddd580a38";
 
           if (unityNFTState.hasNFT && unityNFTState.level > 0) {
             onChainLevel = unityNFTState.level;
@@ -614,18 +614,21 @@ mergeInto(LibraryManager.library, {
                       `[EVOL] Calling signature server for evolution authorization...`
                     );
 
-                    fetch("http://localhost:3001/api/evolve-authorization", {
-                      method: "POST",
-                      headers: {
-                        "Content-Type": "application/json",
-                      },
-                      body: JSON.stringify({
-                        walletAddress: normalizedAddress,
-                        tokenId: foundTokenId,
-                        playerPoints: Number(currentScore),
-                        targetLevel: onChainLevel + 1,
-                      }),
-                    })
+                    fetch(
+                      "https://chogtanks-nft-servers.onrender.com/api/evolve-authorization",
+                      {
+                        method: "POST",
+                        headers: {
+                          "Content-Type": "application/json",
+                        },
+                        body: JSON.stringify({
+                          walletAddress: normalizedAddress,
+                          tokenId: foundTokenId,
+                          playerPoints: Number(currentScore),
+                          targetLevel: onChainLevel + 1,
+                        }),
+                      }
+                    )
                       .then((response) => response.json())
                       .then((data) => {
                         console.log(`[EVOL] Server response:`, data);
@@ -1087,7 +1090,7 @@ mergeInto(LibraryManager.library, {
         return false;
       }
 
-      const contractAddress = "0x07045605a0d70b12f3688a438db706bc1eda7e8c";
+      const contractAddress = "0x04223adab3a0c1a2e8aade678bebd3fddd580a38";
 
       function padHex(value, length = 64) {
         return value.toString(16).padStart(length, "0");
@@ -1273,7 +1276,7 @@ mergeInto(LibraryManager.library, {
       const getAllNFTsFromBlockchain = async () => {
         try {
           const contractAddresses = [
-            "0x07045605a0d70b12f3688a438db706bc1eda7e8c",
+            "0x04223adab3a0c1a2e8aade678bebd3fddd580a38",
           ];
 
           let allNFTs = [];
@@ -1406,16 +1409,19 @@ mergeInto(LibraryManager.library, {
 
       console.log(`[DIRECT-MINT] Calling signature server...`);
 
-      fetch("http://localhost:3001/api/mint-authorization", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          walletAddress: address,
-          playerPoints: 0, // Mint requires 0 points
-        }),
-      })
+      fetch(
+        "https://chogtanks-nft-servers.onrender.com/api/mint-authorization",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            walletAddress: address,
+            playerPoints: 0, // Mint requires 0 points
+          }),
+        }
+      )
         .then((response) => response.json())
         .then((data) => {
           console.log(`[DIRECT-MINT] Server response:`, data);
@@ -1643,18 +1649,20 @@ mergeInto(LibraryManager.library, {
     console.log(`[EVOL-DIRECT] Player points: ${playerPoints}`);
     console.log(`[EVOL-DIRECT] Target level: ${targetLevel}`);
 
-    fetch("http://localhost:3001/api/evolve-authorization", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        walletAddress: normalizedAddress,
-        tokenId: tokenId,
-        playerPoints: Number(playerPoints),
-        targetLevel: targetLevel,
-      }),
-    })
+    fetch(
+      "https://chogtanks-nft-servers.onrender.com/api/evolve-authorization",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          walletAddress: normalizedAddress,
+          playerPoints: playerPoints,
+          targetLevel: targetLevel,
+        }),
+      }
+    )
       .then((response) => response.json())
       .then((data) => {
         console.log(`[EVOL-DIRECT] Server response:`, data);
@@ -1778,18 +1786,27 @@ mergeInto(LibraryManager.library, {
                     `[EVOLUTION-CHECK] ✅ Eligibility confirmed - proceeding to evolution`
                   );
 
-                  fetch("http://localhost:3001/api/evolve-authorization", {
-                    method: "POST",
-                    headers: {
-                      "Content-Type": "application/json",
-                    },
-                    body: JSON.stringify({
-                      walletAddress: normalizedAddress,
-                      tokenId: tokenId,
-                      playerPoints: currentScore,
-                      targetLevel: targetLevel,
-                    }),
-                  })
+                  const unityNFTState = window.unityNFTState || {
+                    level: 1,
+                    tokenId: tokenId,
+                  };
+                  const currentLevelFromUnity = unityNFTState.level || 1;
+
+                  fetch(
+                    "https://chogtanks-nft-servers.onrender.com/api/evolve-authorization",
+                    {
+                      method: "POST",
+                      headers: {
+                        "Content-Type": "application/json",
+                      },
+                      body: JSON.stringify({
+                        walletAddress: normalizedAddress,
+                        tokenId: tokenId,
+                        playerPoints: Number(currentScore),
+                        targetLevel: currentLevelFromUnity + 1,
+                      }),
+                    }
+                  )
                     .then((response) => response.json())
                     .then((authData) => {
                       console.log(

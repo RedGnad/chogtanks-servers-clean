@@ -109,7 +109,7 @@ public class PointsConsumptionResponse
 public class ChogTanksNFTManager : MonoBehaviour
 {
     [Header("Contract Settings")]
-    private const string CONTRACT_ADDRESS = "0x07045605a0d70b12f3688a438db706bc1eda7e8c";
+    private const string CONTRACT_ADDRESS = "0x04223adab3a0c1a2e8aade678bebd3fddd580a38";
     
     // Events for UI updates
     public static System.Action<bool, int> OnNFTStateChanged; 
