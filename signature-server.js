@@ -211,65 +211,6 @@ app.post('/api/monad-games-id/update-player', async (req, res) => {
     }
 });
 
-// Endpoint pour consulter les liaisons wallet Privy → AppKit
-app.get('/api/wallet-bindings/:privyAddress', (req, res) => {
-    try {
-        const { privyAddress } = req.params;
-        
-        if (!privyAddress) {
-            return res.status(400).json({ error: "Privy address required" });
-        }
-        
-        const boundAppKitWallet = walletBindings.get(privyAddress);
-        
-        if (boundAppKitWallet) {
-            res.json({
-                success: true,
-                privyWallet: privyAddress,
-                appKitWallet: boundAppKitWallet,
-                message: "Wallet binding found"
-            });
-        } else {
-            res.json({
-                success: false,
-                privyWallet: privyAddress,
-                appKitWallet: null,
-                message: "No wallet binding found for this Privy address"
-            });
-        }
-        
-    } catch (error) {
-        console.error('[WALLET-BINDINGS] Error:', error);
-        res.status(500).json({ 
-            error: "Failed to check wallet binding", 
-            details: error.message 
-        });
-    }
-});
-
-// Endpoint pour lister toutes les liaisons (debug)
-app.get('/api/wallet-bindings', (req, res) => {
-    try {
-        const bindings = {};
-        walletBindings.forEach((appKitWallet, privyWallet) => {
-            bindings[privyWallet] = appKitWallet;
-        });
-        
-        res.json({
-            success: true,
-            totalBindings: walletBindings.size,
-            bindings: bindings
-        });
-        
-    } catch (error) {
-        console.error('[WALLET-BINDINGS] Error:', error);
-        res.status(500).json({ 
-            error: "Failed to list wallet bindings", 
-            details: error.message 
-        });
-    }
-});
-
 app.listen(port, () => {
     console.log(`Signature server running on port ${port}`);
     console.log(`Game Server Address: ${gameWallet.address}`);
