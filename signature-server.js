@@ -99,8 +99,35 @@ app.post('/api/evolve-authorization', async (req, res) => {
     }
 });
 
-// Anti-farming: Stockage des liaisons wallet Privy -> wallet AppKit
+// Anti-farming: Map pour lier les wallets Privy aux wallets AppKit
 const walletBindings = new Map();
+
+// Gestion de nonce: Cache pour éviter les erreurs "nonce too low"
+let currentNonce = null;
+let nonceLastUpdated = 0;
+const NONCE_CACHE_DURATION = 30000; // 30 secondes
+
+async function getNextNonce(wallet) {
+    const now = Date.now();
+    
+    // Si le cache est expiré ou pas initialisé, récupérer le nonce depuis la blockchain
+    if (!currentNonce || (now - nonceLastUpdated) > NONCE_CACHE_DURATION) {
+        try {
+            currentNonce = await wallet.getTransactionCount('pending');
+            nonceLastUpdated = now;
+            console.log(`[NONCE] Nonce récupéré depuis blockchain: ${currentNonce}`);
+        } catch (error) {
+            console.error('[NONCE] Erreur récupération nonce:', error);
+            throw error;
+        }
+    }
+    
+    const nonce = currentNonce;
+    currentNonce++; // Incrémenter pour la prochaine transaction
+    console.log(`[NONCE] Utilisation nonce: ${nonce}, prochain: ${currentNonce}`);
+    
+    return nonce;
+}
 
 app.post('/api/monad-games-id/update-player', async (req, res) => {
     try {
@@ -148,10 +175,13 @@ app.post('/api/monad-games-id/update-player', async (req, res) => {
         
         console.log(`[Monad Games ID] Calling updatePlayerData(${playerAddress}, ${scoreAmount}, ${transactionAmount})`);
         
+        const nonce = await getNextNonce(wallet);
+        
         const tx = await contract.updatePlayerData(playerAddress, scoreAmount, transactionAmount, {
             gasLimit: 100000, // Set explicit gas limit for consistent costs
             maxPriorityFeePerGas: ethers.utils.parseUnits('1', 'gwei'), // 1 gwei priority fee
-            maxFeePerGas: ethers.utils.parseUnits('60', 'gwei') // 50 base + 10 buffer
+            maxFeePerGas: ethers.utils.parseUnits('60', 'gwei'), // 50 base + 10 buffer
+            nonce: nonce
         });
         
         console.log(`[Monad Games ID] Transaction sent: ${tx.hash}`);
