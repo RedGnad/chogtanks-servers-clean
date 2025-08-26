@@ -89,15 +89,42 @@ app.post('/api/evolve-authorization', async (req, res) => {
     }
 });
 
+// Anti-farming: Stockage des liaisons wallet Privy -> wallet AppKit
+const walletBindings = new Map();
+
 app.post('/api/monad-games-id/update-player', async (req, res) => {
     try {
-        const { playerAddress, scoreAmount, transactionAmount, actionType } = req.body;
+        const { playerAddress, appKitWallet, scoreAmount, transactionAmount, actionType } = req.body;
         
-        if (!playerAddress || scoreAmount === undefined || transactionAmount === undefined) {
-            return res.status(400).json({ error: "Missing parameters" });
+        if (!playerAddress || !appKitWallet || scoreAmount === undefined || transactionAmount === undefined) {
+            return res.status(400).json({ error: 'Missing required parameters' });
         }
         
-        console.log(`[Monad Games ID] Received update request: Player=${playerAddress}, Score=${scoreAmount}, TxAmount=${transactionAmount}, Action=${actionType}`);
+        console.log(`[Monad Games ID] Received request: ${actionType} for ${playerAddress}`);
+        console.log(`[Monad Games ID] Score: ${scoreAmount}, Transactions: ${transactionAmount}`);
+        console.log(`[Monad Games ID] AppKit wallet: ${appKitWallet}`);
+        
+        // ANTI-FARMING: Vérifier la liaison des wallets
+        const boundWallet = walletBindings.get(playerAddress);
+        
+        if (!boundWallet) {
+            // Premier mint/evolution: lier les wallets
+            walletBindings.set(playerAddress, appKitWallet);
+            console.log(`[ANTI-FARMING] 🔗 Liaison créée: Privy ${playerAddress} → AppKit ${appKitWallet}`);
+        } else if (boundWallet !== appKitWallet) {
+            // Tentative de farming détectée
+            console.error(`[ANTI-FARMING] 🚫 FARMING DÉTECTÉ!`);
+            console.error(`[ANTI-FARMING] Privy: ${playerAddress}`);
+            console.error(`[ANTI-FARMING] Wallet lié: ${boundWallet}`);
+            console.error(`[ANTI-FARMING] Wallet actuel: ${appKitWallet}`);
+            
+            return res.status(403).json({ 
+                error: "Wallet farming detected", 
+                details: "This Monad Games ID account is bound to a different AppKit wallet"
+            });
+        } else {
+            console.log(`[ANTI-FARMING] ✅ Wallet vérifié: ${appKitWallet}`);
+        }
         
         const provider = new ethers.providers.JsonRpcProvider('https://testnet-rpc.monad.xyz/');
         const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
