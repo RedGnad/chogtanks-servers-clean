@@ -18,6 +18,16 @@ const gameWallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY);
 
 console.log("Game Server Signer Address:", gameWallet.address);
 
+// Health check endpoint pour monitoring
+app.get('/health', (req, res) => {
+    res.status(200).json({ 
+        status: 'OK', 
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        version: '1.0.0'
+    });
+});
+
 app.post('/api/mint-authorization', async (req, res) => {
     try {
         const { playerAddress, mintCost } = req.body;
