@@ -193,9 +193,9 @@ app.post('/api/monad-games-id/update-player', async (req, res) => {
         const nonce = await getNextNonce(wallet);
         
         const tx = await contract.updatePlayerData(playerAddress, scoreAmount, transactionAmount, {
-            gasLimit: 100000, // Set explicit gas limit for consistent costs
-            maxPriorityFeePerGas: ethers.utils.parseUnits('1', 'gwei'), // 1 gwei priority fee
-            maxFeePerGas: ethers.utils.parseUnits('60', 'gwei'), // 50 base + 10 buffer
+            gasLimit: 150000, // Augmenté pour plus de sécurité
+            maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'), // 2 gwei priority fee
+            maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'), // 100 gwei pour être sûr d'être inclus
             nonce: nonce
         });
         
