@@ -99,8 +99,37 @@ app.post('/api/evolve-authorization', async (req, res) => {
     }
 });
 
-// Anti-farming: Map pour lier les wallets Privy aux wallets AppKit
-const walletBindings = new Map();
+// Anti-farming: Stockage persistant des liaisons wallet
+const fs = require('fs');
+const path = require('path');
+
+const WALLET_BINDINGS_FILE = path.join(__dirname, 'wallet-bindings.json');
+
+// Charger les liaisons existantes
+function loadWalletBindings() {
+    try {
+        if (fs.existsSync(WALLET_BINDINGS_FILE)) {
+            const data = fs.readFileSync(WALLET_BINDINGS_FILE, 'utf8');
+            return new Map(Object.entries(JSON.parse(data)));
+        }
+    } catch (error) {
+        console.error('[ANTI-FARMING] Erreur lecture fichier liaisons:', error.message);
+    }
+    return new Map();
+}
+
+// Sauvegarder les liaisons
+function saveWalletBindings(bindings) {
+    try {
+        const data = JSON.stringify(Object.fromEntries(bindings), null, 2);
+        fs.writeFileSync(WALLET_BINDINGS_FILE, data, 'utf8');
+    } catch (error) {
+        console.error('[ANTI-FARMING] Erreur sauvegarde fichier liaisons:', error.message);
+    }
+}
+
+const walletBindings = loadWalletBindings();
+console.log(`[ANTI-FARMING] ${walletBindings.size} liaisons chargées depuis ${WALLET_BINDINGS_FILE}`);
 
 async function getNextNonce(wallet) {
     try {
@@ -132,7 +161,8 @@ app.post('/api/monad-games-id/update-player', async (req, res) => {
         if (!boundWallet) {
             // Premier mint/evolution: lier les wallets
             walletBindings.set(playerAddress, appKitWallet);
-            console.log(`[ANTI-FARMING] 🔗 Liaison créée: Privy ${playerAddress} → AppKit ${appKitWallet}`);
+            saveWalletBindings(walletBindings);
+            console.log(`[ANTI-FARMING] 🔗 Liaison créée et sauvegardée: Privy ${playerAddress} → AppKit ${appKitWallet}`);
         } else if (boundWallet !== appKitWallet) {
             // Tentative de farming détectée
             console.error(`[ANTI-FARMING] 🚫 FARMING DÉTECTÉ!`);
