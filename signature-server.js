@@ -9,14 +9,30 @@ app.use(cors());
 
 const port = process.env.PORT || 3001;
 
-// Démarrage en mode dégradé si la clé n'est pas présente: ne pas quitter, garder /health up
+// Clé serveur (signatures et tx) + provider RPC privé (Alchemy)
+const ALCHEMY_RPC = 'https://monad-testnet.g.alchemy.com/v2/JD1BgcAhWzSNu8vHiT1chCKaHUq3kH6-';
 let gameWallet = null;
-if (!process.env.GAME_SERVER_PRIVATE_KEY) {
-    console.error("ERREUR: GAME_SERVER_PRIVATE_KEY non définie. Les endpoints signés seront désactivés tant que la clé n'est pas configurée.");
-} else {
-    gameWallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY);
-    console.log("Game Server Signer Address:", gameWallet.address);
+let provider = null;
+let txWallet = null; // wallet connecté au provider pour les transactions on-chain
+
+function initInfra() {
+    if (!process.env.GAME_SERVER_PRIVATE_KEY) {
+        console.error('ERREUR: GAME_SERVER_PRIVATE_KEY non définie. Les endpoints signés seront désactivés.');
+        return;
+    }
+    if (!provider) {
+        provider = new ethers.providers.JsonRpcProvider(ALCHEMY_RPC);
+        provider.getNetwork().then(n => console.log('[RPC] chainId:', n.chainId)).catch(()=>{});
+    }
+    if (!gameWallet) {
+        gameWallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY);
+        console.log('Game Server Signer Address:', gameWallet.address);
+    }
+    if (!txWallet) {
+        txWallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
+    }
 }
+initInfra();
 
 // Middleware: exige la présence du wallet pour les routes nécessitant une signature/tx
 function requireWallet(req, res, next) {
@@ -143,98 +159,74 @@ const walletBindings = loadWalletBindings();
 console.log(`[ANTI-FARMING] ${walletBindings.size} liaisons chargées depuis ${WALLET_BINDINGS_FILE}`);
 
 async function getNextNonce(wallet) {
-    try {
-        // Toujours récupérer le nonce le plus récent depuis la blockchain
-        const nonce = await wallet.getTransactionCount('latest');
-        console.log(`[NONCE] Nonce récupéré depuis blockchain: ${nonce}`);
-        return nonce;
-    } catch (error) {
-        console.error('[NONCE] Erreur récupération nonce:', error);
-        throw error;
-    }
+    return wallet.getTransactionCount('latest');
 }
 
-app.post('/api/monad-games-id/update-player', requireWallet, async (req, res) => {
-    try {
-        const { playerAddress, appKitWallet, scoreAmount, transactionAmount, actionType } = req.body;
-        
-        if (!playerAddress || !appKitWallet || scoreAmount === undefined || transactionAmount === undefined) {
-            return res.status(400).json({ error: 'Missing required parameters' });
-        }
-        
-        console.log(`[Monad Games ID] Received request: ${actionType} for ${playerAddress}`);
-        console.log(`[Monad Games ID] Score: ${scoreAmount}, Transactions: ${transactionAmount}`);
-        console.log(`[Monad Games ID] AppKit wallet: ${appKitWallet}`);
-        
-        // ANTI-FARMING: Vérifier la liaison des wallets
-        const boundWallet = walletBindings.get(playerAddress);
-        
-        if (!boundWallet) {
-            // Premier mint/evolution: lier les wallets
-            walletBindings.set(playerAddress, appKitWallet);
-            saveWalletBindings(walletBindings);
-            console.log(`[ANTI-FARMING] 🔗 Liaison créée et sauvegardée: Privy ${playerAddress} → AppKit ${appKitWallet}`);
-        } else if (boundWallet !== appKitWallet) {
-            // Tentative de farming détectée
-            console.error(`[ANTI-FARMING] 🚫 FARMING DÉTECTÉ!`);
-            console.error(`[ANTI-FARMING] Privy: ${playerAddress}`);
-            console.error(`[ANTI-FARMING] Wallet lié: ${boundWallet}`);
-            console.error(`[ANTI-FARMING] Wallet actuel: ${appKitWallet}`);
-            
-            return res.status(403).json({ 
-                error: "Wallet farming detected", 
-                details: "This Monad Games ID account is bound to a different AppKit wallet"
-            });
-        } else {
-            console.log(`[ANTI-FARMING] ✅ Wallet vérifié: ${appKitWallet}`);
-        }
-        
-        const provider = new ethers.providers.JsonRpcProvider('https://testnet-rpc.monad.xyz/');
-        const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
-        
-        const MONAD_GAMES_ID_CONTRACT = "0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0";
-        const contractABI = [
-            "function updatePlayerData(address player, uint256 scoreAmount, uint256 transactionAmount)"
-        ];
-        
-        const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
-        
-        console.log(`[Monad Games ID] Calling updatePlayerData(${playerAddress}, ${scoreAmount}, ${transactionAmount})`);
-        
-        const nonce = await getNextNonce(wallet);
-        
-        const tx = await contract.updatePlayerData(playerAddress, scoreAmount, transactionAmount, {
-            gasLimit: 150000, // Augmenté pour plus de sécurité
-            maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'), // 2 gwei priority fee
-            maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'), // 100 gwei pour être sûr d'être inclus
-            nonce: nonce
-        });
-        
-        console.log(`[Monad Games ID] Transaction sent: ${tx.hash}`);
-        
-        const receipt = await tx.wait();
-        console.log(`[Monad Games ID] Transaction confirmed in block ${receipt.blockNumber}`);
-        console.log(`[Monad Games ID] Gas used: ${receipt.gasUsed.toString()}`);
-        
-        res.json({ 
-            success: true, 
-            transactionHash: tx.hash, 
-            blockNumber: receipt.blockNumber, 
-            gasUsed: receipt.gasUsed.toString(),
-            playerAddress, 
-            scoreAmount, 
-            transactionAmount, 
-            actionType,
-            message: "Score submitted to Monad Games ID contract"
-        });
-        
-    } catch (error) {
-        console.error('[Monad Games ID] Error:', error);
-        res.status(500).json({ 
-            error: "Failed to submit to Monad Games ID", 
-            details: error.message 
-        });
+// Queue séquentielle très légère pour éviter collisions nonce sous burst
+let txQueue = Promise.resolve();
+let queueDepth = 0;
+const MAX_QUEUE_DEPTH = 40; // Backpressure guard
+function enqueueTx(fn, res) {
+    if (queueDepth >= MAX_QUEUE_DEPTH) {
+        if (res && !res.headersSent) res.status(503).json({ error: 'Server busy, retry later' });
+        return;
     }
+    queueDepth++;
+    txQueue = txQueue
+        .then(() => fn())
+        .catch(e => console.error('[QUEUE]', e.message))
+        .finally(() => { queueDepth--; });
+    return txQueue;
+}
+
+// Simple fixed-window rate limit per IP (lightweight, in-memory)
+const rateBuckets = new Map();
+const WINDOW_MS = 10_000; // 10s window
+const MAX_REQ = 30;       // per IP per window (tune as needed)
+function rateLimit(req, res, next) {
+    const ip = req.headers['x-forwarded-for']?.toString().split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    let b = rateBuckets.get(ip);
+    if (!b || now - b.start > WINDOW_MS) {
+        b = { start: now, count: 0 };
+    }
+    b.count++;
+    rateBuckets.set(ip, b);
+    if (b.count > MAX_REQ) {
+        return res.status(429).json({ error: 'Too many requests' });
+    }
+    next();
+}
+
+app.post('/api/monad-games-id/update-player', rateLimit, requireWallet, async (req, res) => {
+    enqueueTx(async () => {
+        try {
+            const { playerAddress, appKitWallet, scoreAmount, transactionAmount, actionType } = req.body;
+            if (!playerAddress || !appKitWallet || scoreAmount === undefined || transactionAmount === undefined) {
+                return res.status(400).json({ error: 'Missing required parameters' });
+            }
+            const boundWallet = walletBindings.get(playerAddress);
+            if (!boundWallet) {
+                walletBindings.set(playerAddress, appKitWallet);
+                saveWalletBindings(walletBindings);
+            } else if (boundWallet !== appKitWallet) {
+                return res.status(403).json({ error: 'Wallet farming detected' });
+            }
+            if (!txWallet) return res.status(503).json({ error: 'Tx wallet unavailable' });
+            const contractAddress = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
+            const contractABI = ["function updatePlayerData(address player, uint256 scoreAmount, uint256 transactionAmount)"];
+            const contract = new ethers.Contract(contractAddress, contractABI, txWallet);
+        // Nonce laissé au gestionnaire interne d'ethers (séquence sécurisée par la queue)
+        const tx = await contract.updatePlayerData(playerAddress, scoreAmount, transactionAmount, { gasLimit: 150000 });
+            console.log('[UPDATE] Tx sent', tx.hash);
+            const receipt = await tx.wait();
+            console.log('[UPDATE] Confirmed block', receipt.blockNumber);
+            if (!res.headersSent) res.json({ success: true, transactionHash: tx.hash, blockNumber: receipt.blockNumber, playerAddress, scoreAmount, transactionAmount, actionType });
+        } catch (error) {
+            console.error('[UPDATE] Error:', error.message);
+            if (!res.headersSent) res.status(500).json({ error: 'Failed to submit', details: error.message });
+        }
+    }, res);
 });
 
 app.listen(port, () => {
