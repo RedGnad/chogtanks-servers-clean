@@ -192,7 +192,7 @@ app.post('/api/monad-games-id/update-player', requireWallet, async (req, res) =>
         const provider = new ethers.providers.JsonRpcProvider('https://testnet-rpc.monad.xyz/');
         const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
         
-        const MONAD_GAMES_ID_CONTRACT = "0xceCBFF203C8B6044F52CE23D914A1bfD997541A4";
+        const MONAD_GAMES_ID_CONTRACT = "0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0";
         const contractABI = [
             "function updatePlayerData(address player, uint256 scoreAmount, uint256 transactionAmount)"
         ];
