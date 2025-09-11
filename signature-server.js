@@ -3,6 +3,42 @@ const { ethers } = require('ethers');
 const cors = require('cors');
 require('dotenv').config();
 
+// Build tag (helps verify correct deployed revision visually in logs)
+const BUILD_TAG = 'CT-SIG-2025-09-11-1';
+
+// Firebase (optionnel) – vérification token ID (initialisation lazy, sans fallback caché)
+let firebaseAdmin = null;
+try { firebaseAdmin = require('firebase-admin'); } catch { /* module absent -> silencieux */ }
+let firebaseInitialized = false;
+const fs = require('fs'); // utilisé pour vérifier l'existence du fichier de service
+function initFirebaseIfPossible() {
+    if (!firebaseAdmin || firebaseInitialized) return;
+    try {
+        if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+            const pk = process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g,'\n');
+            firebaseAdmin.initializeApp({ credential: firebaseAdmin.credential.cert({
+                projectId: process.env.FIREBASE_PROJECT_ID,
+                clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+                privateKey: pk
+            }) });
+            firebaseInitialized = true; console.log('[FIREBASE] init (triple env vars)');
+        } else if (process.env.FIREBASE_REQUIRE_AUTH === '1') {
+            console.error('[FIREBASE] configuration manquante (FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY)');
+        }
+    } catch(e){ console.log('[FIREBASE] init skipped:', e.message); }
+}
+function requireFirebaseAuth(req,res,next){
+    if (process.env.FIREBASE_REQUIRE_AUTH !== '1') return next(); // mode permissif si non forcé
+    initFirebaseIfPossible();
+    if (!firebaseInitialized) return res.status(503).json({ error:'Auth unavailable' });
+    const auth = req.headers.authorization || '';
+    if (!auth.startsWith('Bearer ')) return res.status(401).json({ error:'Missing token' });
+    const token = auth.slice(7);
+    firebaseAdmin.auth().verifyIdToken(token)
+        .then(decoded => { req.firebaseUser = decoded; next(); })
+        .catch(()=> res.status(401).json({ error:'Invalid token' }));
+}
+
 const app = express();
 app.use(express.json());
 app.use(cors());
@@ -34,6 +70,53 @@ function initInfra() {
 }
 initInfra();
 
+// Préflight sécurité basique
+function preflight() {
+    const key = process.env.GAME_SERVER_PRIVATE_KEY || '';
+    if (!/^0x[0-9a-fA-F]{64}$/.test(key)) {
+        console.error('[PRECHECK] GAME_SERVER_PRIVATE_KEY format invalide. Attendu 0x + 64 hex.');
+        process.exit(1);
+    }
+    if (process.env.FIREBASE_REQUIRE_AUTH === '1') {
+        const ready = process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY;
+        if (!ready) {
+            console.error('[PRECHECK] Auth Firebase exigée mais variables manquantes (FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY).');
+            console.error('[AIDE] Fournis ces exports (exemple):');
+            console.error(' export FIREBASE_PROJECT_ID="ton_project"');
+            console.error(' export FIREBASE_CLIENT_EMAIL="service-account@ton_project.iam.gserviceaccount.com"');
+            console.error(' export FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"');
+            process.exit(1);
+        }
+    }
+}
+preflight();
+
+function logSecuritySummary() {
+    const fbRequired = process.env.FIREBASE_REQUIRE_AUTH === '1';
+    console.log('================ SECURITY SUMMARY ================');
+    console.log(`[BUILD] Tag: ${BUILD_TAG}`);
+    // Minimal env diagnostic (no secret values) to confirm Render injected vars
+    try {
+        const diag = {
+            GAME_SERVER_PRIVATE_KEY: process.env.GAME_SERVER_PRIVATE_KEY ? `present(len=${process.env.GAME_SERVER_PRIVATE_KEY.length})` : 'MISSING',
+            FIREBASE_REQUIRE_AUTH: process.env.FIREBASE_REQUIRE_AUTH || 'not set',
+            FIREBASE_PROJECT_ID: process.env.FIREBASE_PROJECT_ID ? 'present' : 'absent',
+            FIREBASE_CLIENT_EMAIL: process.env.FIREBASE_CLIENT_EMAIL ? 'present' : 'absent',
+            FIREBASE_PRIVATE_KEY: process.env.FIREBASE_PRIVATE_KEY ? `present(len=${process.env.FIREBASE_PRIVATE_KEY.length})` : 'absent'
+        };
+        console.log('[ENV-DIAG]', JSON.stringify(diag));
+    } catch {}
+    console.log(`[SECURITY] Firebase Auth: ${fbRequired ? (firebaseInitialized ? 'ENABLED (initialized)' : 'ENABLED (lazy init)') : 'DISABLED (dev mode)'}`);
+    if (fbRequired && !firebaseInitialized) {
+        console.log('[SECURITY] -> Sera initialisé lors de la première requête protégée.');
+    }
+    console.log(`[SECURITY] Score window: PLAYER_RATE_MAX=${process.env.PLAYER_RATE_MAX||3} sur ${(process.env.PLAYER_RATE_WINDOW_MS||300000)/1000}s (delta max update=${process.env.MAX_SINGLE_DELTA||1200})`);
+    console.log(`[SECURITY] Window delta cap: ${process.env.MAX_WINDOW_DELTA||6000}`);
+    console.log(`[SECURITY] Min interval entre updates: ${process.env.MIN_INTERVAL_MS||2000} ms`);
+    console.log('[SECURITY] Wallet binding anti-farming: ACTIVE');
+    console.log('==================================================');
+}
+
 // Middleware: exige la présence du wallet pour les routes nécessitant une signature/tx
 function requireWallet(req, res, next) {
     if (!gameWallet) {
@@ -55,7 +138,24 @@ app.get('/health', (req, res) => {
 // Supporte aussi la méthode HEAD sur /health
 app.head('/health', (req, res) => res.sendStatus(200));
 
-app.post('/api/mint-authorization', requireWallet, async (req, res) => {
+// Expose configuration sécurité (lecture seule – pas de secrets)
+app.get('/config-info', (req,res)=>{
+    res.json({
+        firebaseRequired: process.env.FIREBASE_REQUIRE_AUTH === '1',
+        firebaseInitialized,
+        walletAddress: gameWallet ? gameWallet.address : null,
+        rateConfig: {
+            MIN_INTERVAL_MS,
+            PLAYER_RATE_WINDOW_MS,
+            PLAYER_RATE_MAX,
+            MAX_SINGLE_DELTA,
+            MAX_WINDOW_DELTA
+        },
+        queueDepth
+    });
+});
+
+app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, mintCost } = req.body;
         
@@ -84,7 +184,7 @@ app.post('/api/mint-authorization', requireWallet, async (req, res) => {
     }
 });
 
-app.post('/api/evolve-authorization', requireWallet, async (req, res) => {
+app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, tokenId, targetLevel } = req.body;
         
@@ -127,7 +227,7 @@ app.post('/api/evolve-authorization', requireWallet, async (req, res) => {
 });
 
 // Anti-farming: Stockage persistant des liaisons wallet
-const fs = require('fs');
+// (fs déjà importé plus haut)
 const path = require('path');
 
 const WALLET_BINDINGS_FILE = path.join(__dirname, 'wallet-bindings.json');
@@ -198,12 +298,113 @@ function rateLimit(req, res, next) {
     next();
 }
 
-app.post('/api/monad-games-id/update-player', rateLimit, requireWallet, async (req, res) => {
+// =====================
+// Minimal score validation & per-player throttling
+// =====================
+const pathLastScores = path.join(__dirname, 'last-scores.json');
+// Score validation tuning (env overrides supported)
+// Définitions:
+//  - delta (par update) = nouveauScoreSoumis - dernierScoreAccepté
+//  - fenêtre = période PLAYER_RATE_WINDOW_MS (ex: 5 min) utilisée aussi pour plafonner l'accumulation totale
+// Constraints:
+//  (1) Monotonicité (pas de régression)
+//  (2) Delta par update <= MAX_SINGLE_DELTA (ex: permettre une évolution ~900-1000)
+//  (3) Somme des deltas acceptés dans la fenêtre courante <= MAX_WINDOW_DELTA (rarement > ~5000 selon ton retour)
+//  (4) Espacement minimal entre updates (MIN_INTERVAL_MS)
+//  (5) Nombre maximal d'updates acceptées dans la fenêtre (PLAYER_RATE_MAX)
+const MIN_INTERVAL_MS = Number(process.env.MIN_INTERVAL_MS || 2000);
+const PLAYER_RATE_WINDOW_MS = Number(process.env.PLAYER_RATE_WINDOW_MS || 300000); // 5 min
+const PLAYER_RATE_MAX = Number(process.env.PLAYER_RATE_MAX || 3); // ex: 2 ou 3 attendu
+const MAX_SINGLE_DELTA = Number(process.env.MAX_SINGLE_DELTA || 1200); // >1000 pour marge evolution
+// Mettre MAX_WINDOW_DELTA=0 pour désactiver totalement le plafond cumul fenêtre
+const MAX_WINDOW_DELTA = Number(process.env.MAX_WINDOW_DELTA || 6000); // 0 => disabled
+
+let lastScores = new Map(); // playerAddress -> { score, lastAt, windowStart, count, windowDelta }
+const metrics = {
+    accepted: 0,
+    rejectedDelta: 0,
+    rejectedRegression: 0,
+    rejectedThrottle: 0,
+    rejectedRate: 0,
+    rejectedWindowDelta: 0
+};
+
+function loadLastScores() {
+    try {
+        if (fs.existsSync(pathLastScores)) {
+            const raw = JSON.parse(fs.readFileSync(pathLastScores,'utf8'));
+            lastScores = new Map(Object.entries(raw));
+        }
+    } catch(e){ console.error('[SCORES] load error', e.message); }
+}
+function persistLastScores() {
+    try {
+        const tmp = pathLastScores + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(Object.fromEntries(lastScores), null, 2));
+        fs.renameSync(tmp, pathLastScores);
+    } catch(e){ console.error('[SCORES] persist error', e.message); }
+}
+loadLastScores();
+
+function validateAndRecordScore(playerAddress, newScore) {
+    const now = Date.now();
+    const rec = lastScores.get(playerAddress) || { score: 0, lastAt: 0, windowStart: now, count: 0, windowDelta: 0 };
+    if (newScore < rec.score) { metrics.rejectedRegression++; return { ok:false, code:400, msg:'Score regression' }; }
+    const delta = newScore - rec.score;
+    if (delta > MAX_SINGLE_DELTA) { metrics.rejectedDelta++; return { ok:false, code:400, msg:`Delta too large (> ${MAX_SINGLE_DELTA})` }; }
+    if (now - rec.lastAt < MIN_INTERVAL_MS) { metrics.rejectedThrottle++; return { ok:false, code:429, msg:'Too fast' }; }
+    if (now - rec.windowStart > PLAYER_RATE_WINDOW_MS) { rec.windowStart = now; rec.count = 0; rec.windowDelta = 0; }
+    // Plafond cumul fenêtre
+    if (MAX_WINDOW_DELTA > 0 && (rec.windowDelta + delta) > MAX_WINDOW_DELTA) { metrics.rejectedWindowDelta++; return { ok:false, code:400, msg:`Window delta limit (> ${MAX_WINDOW_DELTA})` }; }
+    rec.count++;
+    if (rec.count > PLAYER_RATE_MAX) { metrics.rejectedRate++; return { ok:false, code:429, msg:'Rate limit player' }; }
+    // accept
+    rec.score = newScore;
+    rec.lastAt = now;
+    rec.windowDelta += delta;
+    lastScores.set(playerAddress, rec);
+    metrics.accepted++;
+    // Persist synchronously (low frequency expected) - could be buffered later
+    persistLastScores();
+    return { ok:true };
+}
+
+// Metrics endpoint
+app.get('/metrics', (req,res)=>{
+    res.json({
+        queueDepth,
+        trackedPlayers: lastScores.size,
+        ...metrics,
+    config: { MIN_INTERVAL_MS, PLAYER_RATE_WINDOW_MS, PLAYER_RATE_MAX, MAX_SINGLE_DELTA, MAX_WINDOW_DELTA }
+    });
+});
+
+// Simple allowlisted JSON-RPC proxy (no private key exposure client-side if used)
+const RPC_METHOD_ALLOWLIST = new Set(['eth_blockNumber','eth_chainId','eth_call','eth_getLogs']);
+app.post('/rpc', rateLimit, async (req,res)=>{
+    const { method, params, id } = req.body || {};
+    if (!method || !RPC_METHOD_ALLOWLIST.has(method)) return res.status(403).json({ error:'method not allowed' });
+    try {
+        if (!provider) return res.status(503).json({ error:'provider not ready' });
+        const result = await provider.send(method, params || []);
+        res.json({ jsonrpc:'2.0', id: id ?? 1, result });
+    } catch(e){
+        console.error('[RPC-PROXY]', e.message);
+        res.status(500).json({ error:'rpc error' });
+    }
+});
+
+app.post('/api/monad-games-id/update-player', rateLimit, requireWallet, requireFirebaseAuth, async (req, res) => {
     enqueueTx(async () => {
         try {
-            const { playerAddress, appKitWallet, scoreAmount, transactionAmount, actionType } = req.body;
+            const { playerAddress, appKitWallet, scoreAmount, transactionAmount } = req.body; // actionType ignoré (plus utilisé)
             if (!playerAddress || !appKitWallet || scoreAmount === undefined || transactionAmount === undefined) {
                 return res.status(400).json({ error: 'Missing required parameters' });
+            }
+            // Validate score progression (simple, non-batch logic)
+            const validation = validateAndRecordScore(playerAddress.toLowerCase(), Number(scoreAmount));
+            if (!validation.ok) {
+                return res.status(validation.code).json({ error: validation.msg });
             }
             const boundWallet = walletBindings.get(playerAddress);
             if (!boundWallet) {
@@ -221,7 +422,7 @@ app.post('/api/monad-games-id/update-player', rateLimit, requireWallet, async (r
             console.log('[UPDATE] Tx sent', tx.hash);
             const receipt = await tx.wait();
             console.log('[UPDATE] Confirmed block', receipt.blockNumber);
-            if (!res.headersSent) res.json({ success: true, transactionHash: tx.hash, blockNumber: receipt.blockNumber, playerAddress, scoreAmount, transactionAmount, actionType });
+            if (!res.headersSent) res.json({ success: true, transactionHash: tx.hash, blockNumber: receipt.blockNumber, playerAddress, scoreAmount, transactionAmount });
         } catch (error) {
             console.error('[UPDATE] Error:', error.message);
             if (!res.headersSent) res.status(500).json({ error: 'Failed to submit', details: error.message });
@@ -230,8 +431,9 @@ app.post('/api/monad-games-id/update-player', rateLimit, requireWallet, async (r
 });
 
 app.listen(port, () => {
-    console.log(`Signature server running on port ${port}`);
-    console.log(`Game Server Address: ${gameWallet ? gameWallet.address : 'N/A (no private key)'}`);
+    console.log(`[START] Signature server running on port ${port}`);
+    console.log(`[START] Game server signer: ${gameWallet ? gameWallet.address : 'N/A (no private key)'}`);
+    logSecuritySummary();
 });
 
 // Garde-fous contre les crashs silencieux
