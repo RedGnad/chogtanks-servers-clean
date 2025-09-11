@@ -3,27 +3,27 @@ const { ethers } = require('ethers');
 const cors = require('cors');
 require('dotenv').config();
 
-// Firebase (optionnel) – vérification token ID (initialisation lazy)
+// Build tag (helps verify correct deployed revision visually in logs)
+const BUILD_TAG = 'CT-SIG-2025-09-11-1';
+
+// Firebase (optionnel) – vérification token ID (initialisation lazy, sans fallback caché)
 let firebaseAdmin = null;
-try {
-    firebaseAdmin = require('firebase-admin');
-} catch { /* module absent -> silencieux */ }
+try { firebaseAdmin = require('firebase-admin'); } catch { /* module absent -> silencieux */ }
 let firebaseInitialized = false;
+const fs = require('fs'); // utilisé pour vérifier l'existence du fichier de service
 function initFirebaseIfPossible() {
     if (!firebaseAdmin || firebaseInitialized) return;
     try {
-        if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
-            const svc = require(process.env.FIREBASE_SERVICE_ACCOUNT_PATH);
-            firebaseAdmin.initializeApp({ credential: firebaseAdmin.credential.cert(svc) });
-            firebaseInitialized = true; console.log('[FIREBASE] init via fichier service account');
-        } else if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+        if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
             const pk = process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g,'\n');
             firebaseAdmin.initializeApp({ credential: firebaseAdmin.credential.cert({
                 projectId: process.env.FIREBASE_PROJECT_ID,
                 clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
                 privateKey: pk
             }) });
-            firebaseInitialized = true; console.log('[FIREBASE] init via env vars');
+            firebaseInitialized = true; console.log('[FIREBASE] init (triple env vars)');
+        } else if (process.env.FIREBASE_REQUIRE_AUTH === '1') {
+            console.error('[FIREBASE] configuration manquante (FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY)');
         }
     } catch(e){ console.log('[FIREBASE] init skipped:', e.message); }
 }
@@ -70,6 +70,53 @@ function initInfra() {
 }
 initInfra();
 
+// Préflight sécurité basique
+function preflight() {
+    const key = process.env.GAME_SERVER_PRIVATE_KEY || '';
+    if (!/^0x[0-9a-fA-F]{64}$/.test(key)) {
+        console.error('[PRECHECK] GAME_SERVER_PRIVATE_KEY format invalide. Attendu 0x + 64 hex.');
+        process.exit(1);
+    }
+    if (process.env.FIREBASE_REQUIRE_AUTH === '1') {
+        const ready = process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY;
+        if (!ready) {
+            console.error('[PRECHECK] Auth Firebase exigée mais variables manquantes (FIREBASE_PROJECT_ID / FIREBASE_CLIENT_EMAIL / FIREBASE_PRIVATE_KEY).');
+            console.error('[AIDE] Fournis ces exports (exemple):');
+            console.error(' export FIREBASE_PROJECT_ID="ton_project"');
+            console.error(' export FIREBASE_CLIENT_EMAIL="service-account@ton_project.iam.gserviceaccount.com"');
+            console.error(' export FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"');
+            process.exit(1);
+        }
+    }
+}
+preflight();
+
+function logSecuritySummary() {
+    const fbRequired = process.env.FIREBASE_REQUIRE_AUTH === '1';
+    console.log('================ SECURITY SUMMARY ================');
+    console.log(`[BUILD] Tag: ${BUILD_TAG}`);
+    // Minimal env diagnostic (no secret values) to confirm Render injected vars
+    try {
+        const diag = {
+            GAME_SERVER_PRIVATE_KEY: process.env.GAME_SERVER_PRIVATE_KEY ? `present(len=${process.env.GAME_SERVER_PRIVATE_KEY.length})` : 'MISSING',
+            FIREBASE_REQUIRE_AUTH: process.env.FIREBASE_REQUIRE_AUTH || 'not set',
+            FIREBASE_PROJECT_ID: process.env.FIREBASE_PROJECT_ID ? 'present' : 'absent',
+            FIREBASE_CLIENT_EMAIL: process.env.FIREBASE_CLIENT_EMAIL ? 'present' : 'absent',
+            FIREBASE_PRIVATE_KEY: process.env.FIREBASE_PRIVATE_KEY ? `present(len=${process.env.FIREBASE_PRIVATE_KEY.length})` : 'absent'
+        };
+        console.log('[ENV-DIAG]', JSON.stringify(diag));
+    } catch {}
+    console.log(`[SECURITY] Firebase Auth: ${fbRequired ? (firebaseInitialized ? 'ENABLED (initialized)' : 'ENABLED (lazy init)') : 'DISABLED (dev mode)'}`);
+    if (fbRequired && !firebaseInitialized) {
+        console.log('[SECURITY] -> Sera initialisé lors de la première requête protégée.');
+    }
+    console.log(`[SECURITY] Score window: PLAYER_RATE_MAX=${process.env.PLAYER_RATE_MAX||3} sur ${(process.env.PLAYER_RATE_WINDOW_MS||300000)/1000}s (delta max update=${process.env.MAX_SINGLE_DELTA||1200})`);
+    console.log(`[SECURITY] Window delta cap: ${process.env.MAX_WINDOW_DELTA||6000}`);
+    console.log(`[SECURITY] Min interval entre updates: ${process.env.MIN_INTERVAL_MS||2000} ms`);
+    console.log('[SECURITY] Wallet binding anti-farming: ACTIVE');
+    console.log('==================================================');
+}
+
 // Middleware: exige la présence du wallet pour les routes nécessitant une signature/tx
 function requireWallet(req, res, next) {
     if (!gameWallet) {
@@ -91,7 +138,24 @@ app.get('/health', (req, res) => {
 // Supporte aussi la méthode HEAD sur /health
 app.head('/health', (req, res) => res.sendStatus(200));
 
-app.post('/api/mint-authorization', requireWallet, async (req, res) => {
+// Expose configuration sécurité (lecture seule – pas de secrets)
+app.get('/config-info', (req,res)=>{
+    res.json({
+        firebaseRequired: process.env.FIREBASE_REQUIRE_AUTH === '1',
+        firebaseInitialized,
+        walletAddress: gameWallet ? gameWallet.address : null,
+        rateConfig: {
+            MIN_INTERVAL_MS,
+            PLAYER_RATE_WINDOW_MS,
+            PLAYER_RATE_MAX,
+            MAX_SINGLE_DELTA,
+            MAX_WINDOW_DELTA
+        },
+        queueDepth
+    });
+});
+
+app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, mintCost } = req.body;
         
@@ -120,7 +184,7 @@ app.post('/api/mint-authorization', requireWallet, async (req, res) => {
     }
 });
 
-app.post('/api/evolve-authorization', requireWallet, async (req, res) => {
+app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, tokenId, targetLevel } = req.body;
         
@@ -163,7 +227,7 @@ app.post('/api/evolve-authorization', requireWallet, async (req, res) => {
 });
 
 // Anti-farming: Stockage persistant des liaisons wallet
-const fs = require('fs');
+// (fs déjà importé plus haut)
 const path = require('path');
 
 const WALLET_BINDINGS_FILE = path.join(__dirname, 'wallet-bindings.json');
@@ -367,8 +431,9 @@ app.post('/api/monad-games-id/update-player', rateLimit, requireWallet, requireF
 });
 
 app.listen(port, () => {
-    console.log(`Signature server running on port ${port}`);
-    console.log(`Game Server Address: ${gameWallet ? gameWallet.address : 'N/A (no private key)'}`);
+    console.log(`[START] Signature server running on port ${port}`);
+    console.log(`[START] Game server signer: ${gameWallet ? gameWallet.address : 'N/A (no private key)'}`);
+    logSecuritySummary();
 });
 
 // Garde-fous contre les crashs silencieux
