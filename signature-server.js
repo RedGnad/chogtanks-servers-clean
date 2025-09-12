@@ -75,6 +75,38 @@ app.use((req, res, next) => {
     next();
 });
 
+// FIREBASE ADMIN SDK - Pour validation sécurisée des scores
+const admin = require('firebase-admin');
+
+// Initialiser Firebase Admin (si pas déjà fait)
+if (!admin.apps.length) {
+    try {
+        // Utiliser les variables d'environnement pour Firebase
+        const serviceAccount = {
+            type: "service_account",
+            project_id: process.env.FIREBASE_PROJECT_ID,
+            private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+            private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+            client_email: process.env.FIREBASE_CLIENT_EMAIL,
+            client_id: process.env.FIREBASE_CLIENT_ID,
+            auth_uri: "https://accounts.google.com/o/oauth2/auth",
+            token_uri: "https://oauth2.googleapis.com/token",
+            auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+            client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
+        };
+
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount),
+            projectId: process.env.FIREBASE_PROJECT_ID
+        });
+        
+        console.log('[FIREBASE] ✅ Admin SDK initialisé pour validation des scores');
+    } catch (error) {
+        console.error('[FIREBASE] ❌ Erreur initialisation Admin SDK:', error.message);
+        console.warn('[FIREBASE] ⚠️ Validation des scores désactivée - config manquante');
+    }
+}
+
 const port = process.env.PORT || 3001;
 
 // Démarrage en mode dégradé si la clé n'est pas présente: ne pas quitter, garder /health up
@@ -621,6 +653,156 @@ app.post('/api/monad-games-id/batch-update', requireWallet, async (req, res) => 
             error: "Batch update failed", 
             details: error.message,
             duration: duration
+        });
+    }
+});
+
+// ===== FIREBASE SCORE VALIDATION ENDPOINT =====
+// Endpoint sécurisé pour valider et soumettre les scores Firebase
+app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
+    const startTime = Date.now();
+    
+    try {
+        const { walletAddress, score, bonus, matchId, playerSignature } = req.body;
+        
+        console.log(`[FIREBASE-SCORE] 📊 Score submission request from ${walletAddress}`);
+        console.log(`[FIREBASE-SCORE] Score: ${score}, Bonus: ${bonus}, Match: ${matchId}`);
+        
+        // Validation des paramètres
+        if (!walletAddress || score === undefined || !matchId) {
+            return res.status(400).json({ 
+                error: 'Missing required parameters: walletAddress, score, matchId' 
+            });
+        }
+        
+        // Validation de l'adresse wallet
+        if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
+            return res.status(400).json({ 
+                error: 'Invalid wallet address format' 
+            });
+        }
+        
+        const normalizedAddress = walletAddress.toLowerCase();
+        const totalScore = parseInt(score) + (parseInt(bonus) || 0);
+        
+        // Validation du score (anti-triche)
+        if (totalScore < 0 || totalScore > 1000) {
+            console.warn(`[FIREBASE-SCORE] ⚠️ Score suspect: ${totalScore} from ${normalizedAddress}`);
+            return res.status(403).json({ 
+                error: 'Score out of reasonable range (0-1000)' 
+            });
+        }
+        
+        // Rate limiting spécifique aux scores
+        const scoreKey = `score_${normalizedAddress}`;
+        const now = Date.now();
+        
+        if (!scoreRateLimit.has(scoreKey)) {
+            scoreRateLimit.set(scoreKey, { count: 1, resetTime: now + 60000 });
+        } else {
+            const data = scoreRateLimit.get(scoreKey);
+            if (now < data.resetTime) {
+                if (data.count >= 10) { // 10 scores par minute max
+                    return res.status(429).json({ 
+                        error: 'Too many score submissions, please wait' 
+                    });
+                }
+                data.count++;
+            } else {
+                scoreRateLimit.set(scoreKey, { count: 1, resetTime: now + 60000 });
+            }
+        }
+        
+        // Vérifier l'intervalle minimum entre soumissions
+        const lastSubmission = lastScoreSubmission.get(normalizedAddress);
+        if (lastSubmission && (now - lastSubmission) < 5000) { // 5 secondes minimum
+            return res.status(429).json({ 
+                error: 'Please wait before submitting another score' 
+            });
+        }
+        
+        lastScoreSubmission.set(normalizedAddress, now);
+        
+        // Vérifier si Firebase Admin est disponible
+        if (!admin.apps.length) {
+            console.error('[FIREBASE-SCORE] ❌ Firebase Admin not initialized');
+            return res.status(503).json({ 
+                error: 'Score validation service unavailable' 
+            });
+        }
+        
+        // Écriture sécurisée dans Firebase via Admin SDK
+        const db = admin.firestore();
+        const docRef = db.collection('WalletScores').doc(normalizedAddress);
+        
+        await db.runTransaction(async (transaction) => {
+            const doc = await transaction.get(docRef);
+            
+            if (!doc.exists) {
+                // Nouveau joueur
+                transaction.set(docRef, {
+                    score: totalScore,
+                    nftLevel: 0,
+                    walletAddress: normalizedAddress,
+                    lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    matchId: matchId,
+                    validatedBy: 'server',
+                    serverSignature: await gameWallet.signMessage(
+                        ethers.utils.arrayify(
+                            ethers.utils.solidityKeccak256(
+                                ['address', 'uint256', 'string'],
+                                [normalizedAddress, totalScore, matchId]
+                            )
+                        )
+                    )
+                });
+                
+                console.log(`[FIREBASE-SCORE] ✅ Nouveau joueur créé: ${normalizedAddress} avec score: ${totalScore}`);
+            } else {
+                // Joueur existant - addition des scores
+                const currentData = doc.data();
+                const currentScore = Number(currentData.score || 0);
+                const newScore = currentScore + totalScore;
+                
+                transaction.update(docRef, {
+                    score: newScore,
+                    walletAddress: normalizedAddress,
+                    lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+                    matchId: matchId,
+                    validatedBy: 'server',
+                    serverSignature: await gameWallet.signMessage(
+                        ethers.utils.arrayify(
+                            ethers.utils.solidityKeccak256(
+                                ['address', 'uint256', 'string'],
+                                [normalizedAddress, newScore, matchId]
+                            )
+                        )
+                    )
+                });
+                
+                console.log(`[FIREBASE-SCORE] ✅ Score mis à jour: ${currentScore} + ${totalScore} = ${newScore}`);
+            }
+        });
+        
+        const duration = Date.now() - startTime;
+        console.log(`[FIREBASE-SCORE] 🎉 Score validé et soumis en ${duration}ms`);
+        
+        res.json({
+            success: true,
+            walletAddress: normalizedAddress,
+            score: totalScore,
+            matchId: matchId,
+            validated: true,
+            duration: duration,
+            message: "Score validated and submitted securely"
+        });
+        
+    } catch (error) {
+        console.error('[FIREBASE-SCORE] ❌ Error:', error);
+        res.status(500).json({ 
+            error: "Failed to validate and submit score", 
+            details: error.message 
         });
     }
 });
