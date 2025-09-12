@@ -22,6 +22,10 @@ const requestCounts = new Map();
 const GLOBAL_RATE_LIMIT = 100; // 100 req/min par IP
 const RATE_WINDOW = 60000; // 1 minute
 
+// ALCHEMY PROTECTION: Éviter de dépasser les limites gratuites
+const alchemyUsage = { count: 0, resetTime: Date.now() + 60000 }; // Reset chaque minute
+const ALCHEMY_FREE_LIMIT = 270; // 270 req/min (300 - 30 marge conservatrice)
+
 app.use((req, res, next) => {
     const clientIP = req.ip || req.connection.remoteAddress;
     const now = Date.now();
@@ -38,6 +42,34 @@ app.use((req, res, next) => {
         } else {
             requestCounts.set(clientIP, { count: 1, resetTime: now + RATE_WINDOW });
         }
+    }
+    
+    next();
+});
+
+// ALCHEMY PROTECTION: Middleware pour éviter de dépasser les limites
+app.use((req, res, next) => {
+    // Seulement pour les endpoints qui utilisent Alchemy
+    if (req.path.includes('/api/monad-games-id/') || req.path.includes('/api/validate-score')) {
+        const now = Date.now();
+        
+        // Reset counter chaque minute
+        if (now > alchemyUsage.resetTime) {
+            alchemyUsage.count = 0;
+            alchemyUsage.resetTime = now + 60000;
+        }
+        
+        // Vérifier la limite
+        if (alchemyUsage.count >= ALCHEMY_FREE_LIMIT) {
+            console.warn(`[ALCHEMY] ⚠️ Approaching free tier limit: ${alchemyUsage.count}/${ALCHEMY_FREE_LIMIT}`);
+            return res.status(429).json({ 
+                error: 'Service temporarily unavailable',
+                message: 'Too many requests, please try again later',
+                retryAfter: Math.ceil((alchemyUsage.resetTime - now) / 1000)
+            });
+        }
+        
+        alchemyUsage.count++;
     }
     
     next();
