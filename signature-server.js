@@ -4,8 +4,44 @@ const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json());
-app.use(cors());
+
+app.use(express.json({ limit: '10mb' })); // Limite de taille pour éviter les attaques
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(cors({
+    origin: [
+        'https://chogtanks.vercel.app',
+        'https://redgnad.github.io', 
+        'https://monadclip.com', 
+        'https://*.monadclip.com'
+    ],
+    credentials: true
+}));
+
+// Rate limiting global pour éviter le spam
+const requestCounts = new Map();
+const GLOBAL_RATE_LIMIT = 100; // 100 req/min par IP
+const RATE_WINDOW = 60000; // 1 minute
+
+app.use((req, res, next) => {
+    const clientIP = req.ip || req.connection.remoteAddress;
+    const now = Date.now();
+    
+    if (!requestCounts.has(clientIP)) {
+        requestCounts.set(clientIP, { count: 1, resetTime: now + RATE_WINDOW });
+    } else {
+        const data = requestCounts.get(clientIP);
+        if (now < data.resetTime) {
+            if (data.count >= GLOBAL_RATE_LIMIT) {
+                return res.status(429).json({ error: 'Too many requests' });
+            }
+            data.count++;
+        } else {
+            requestCounts.set(clientIP, { count: 1, resetTime: now + RATE_WINDOW });
+        }
+    }
+    
+    next();
+});
 
 const port = process.env.PORT || 3001;
 
@@ -26,17 +62,25 @@ function requireWallet(req, res, next) {
     next();
 }
 
-// Health check endpoint pour monitoring
+// Health check endpoint pour monitoring (optimisé pour cron-job)
 app.get('/health', (req, res) => {
+    // Log minimal seulement si problème
+    if (!gameWallet) {
+        console.error('[HEALTH] ❌ Game wallet not configured');
+    }
+    
     res.status(200).json({ 
         status: 'OK', 
         timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-    version: '1.0.0',
-    walletReady: Boolean(gameWallet)
+        uptime: Math.floor(process.uptime()),
+        version: '2.0.0',
+        walletReady: Boolean(gameWallet),
+        rpc: 'Alchemy Monad Testnet',
+        contract: '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0'
     });
 });
-// Supporte aussi la méthode HEAD sur /health
+
+// Supporte aussi la méthode HEAD sur /health (pour cron-job)
 app.head('/health', (req, res) => res.sendStatus(200));
 
 app.post('/api/mint-authorization', requireWallet, async (req, res) => {
@@ -152,6 +196,12 @@ const MAX_REASONABLE_SCORE = 1000; // Score maximum raisonnable par match
 const MIN_SCORE_INTERVAL = 5000; // Minimum 5 secondes entre soumissions
 const lastScoreSubmission = new Map(); // wallet -> timestamp
 
+// ANTI-BOT: Détection de comportements suspects
+const botDetection = new Map(); // IP -> { count, lastActivity, suspicious }
+const BOT_THRESHOLD = 20; // 20 requêtes en 1 minute = suspect
+const BOT_BAN_DURATION = 300000; // 5 minutes de ban
+const suspiciousIPs = new Set(); // IPs bannies temporairement
+
 // SECURITY: Fonction de validation des scores
 function validateScoreSubmission(walletAddress, scoreAmount, transactionAmount) {
     const now = Date.now();
@@ -197,6 +247,62 @@ function validateScoreSubmission(walletAddress, scoreAmount, transactionAmount) 
     return { valid: true };
 }
 
+// ANTI-BOT: Fonction de détection de bots
+function detectBotBehavior(clientIP, userAgent, req) {
+    const now = Date.now();
+    
+    // Vérifier si IP est bannie
+    if (suspiciousIPs.has(clientIP)) {
+        console.error(`[ANTI-BOT] 🚫 Banned IP attempting access: ${clientIP}`);
+        return { isBot: true, reason: "IP temporarily banned" };
+    }
+    
+    // Détecter patterns suspects
+    const suspiciousPatterns = [
+        /bot/i, /crawler/i, /spider/i, /scraper/i,
+        /curl/i, /wget/i, /python/i, /java/i,
+        /postman/i, /insomnia/i, /httpie/i
+    ];
+    
+    if (userAgent && suspiciousPatterns.some(pattern => pattern.test(userAgent))) {
+        console.error(`[ANTI-BOT] 🤖 Suspicious user agent: ${userAgent}`);
+        return { isBot: true, reason: "Suspicious user agent" };
+    }
+    
+    // Détecter requêtes trop rapides
+    if (!botDetection.has(clientIP)) {
+        botDetection.set(clientIP, { count: 1, lastActivity: now, suspicious: false });
+    } else {
+        const data = botDetection.get(clientIP);
+        const timeDiff = now - data.lastActivity;
+        
+        if (timeDiff < 1000) { // Moins d'1 seconde entre requêtes
+            data.count++;
+            if (data.count > BOT_THRESHOLD) {
+                data.suspicious = true;
+                suspiciousIPs.add(clientIP);
+                console.error(`[ANTI-BOT] 🚫 Bot detected: ${clientIP} - ${data.count} requests in ${timeDiff}ms`);
+                
+                // Auto-unban après 5 minutes
+                setTimeout(() => {
+                    suspiciousIPs.delete(clientIP);
+                    botDetection.delete(clientIP);
+                    console.log(`[ANTI-BOT] ✅ IP unbanned: ${clientIP}`);
+                }, BOT_BAN_DURATION);
+                
+                return { isBot: true, reason: "Too many requests too fast" };
+            }
+        } else {
+            // Reset counter si plus d'1 seconde
+            data.count = 1;
+        }
+        
+        data.lastActivity = now;
+    }
+    
+    return { isBot: false };
+}
+
 async function getNextNonce(wallet) {
     try {
         // Toujours récupérer le nonce le plus récent depuis la blockchain
@@ -211,7 +317,20 @@ async function getNextNonce(wallet) {
 
 app.post('/api/monad-games-id/update-player', requireWallet, async (req, res) => {
     const startTime = Date.now();
+    const clientIP = req.ip || req.connection.remoteAddress;
+    const userAgent = req.get('User-Agent');
+    
     try {
+        // ANTI-BOT: Détection de comportement suspect
+        const botCheck = detectBotBehavior(clientIP, userAgent, req);
+        if (botCheck.isBot) {
+            console.error(`[ANTI-BOT] 🚫 Bot blocked: ${clientIP} - ${botCheck.reason}`);
+            return res.status(403).json({ 
+                error: "Bot detected", 
+                reason: botCheck.reason 
+            });
+        }
+        
         const { playerAddress, appKitWallet, scoreAmount, transactionAmount, actionType } = req.body;
         
         console.log(`[Monad Games ID] 🚀 NEW REQUEST - ${new Date().toISOString()}`);
@@ -264,7 +383,8 @@ app.post('/api/monad-games-id/update-player', requireWallet, async (req, res) =>
         
         const MONAD_GAMES_ID_CONTRACT = "0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0";
         const contractABI = [
-            "function updatePlayerData(address player, uint256 scoreAmount, uint256 transactionAmount)"
+            "function updatePlayerData(address player, uint256 scoreAmount, uint256 transactionAmount)",
+            "function batchUpdatePlayerData(address[] players, uint256[] scoreAmounts, uint256[] transactionAmounts)"
         ];
         
         const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
@@ -367,6 +487,108 @@ app.post('/api/validate-score', requireWallet, async (req, res) => {
         res.status(500).json({ 
             error: "Score validation failed", 
             details: error.message 
+        });
+    }
+});
+
+// BATCH UPDATE: Endpoint pour grouper plusieurs mises à jour (économie de gas)
+app.post('/api/monad-games-id/batch-update', requireWallet, async (req, res) => {
+    const startTime = Date.now();
+    const clientIP = req.ip || req.connection.remoteAddress;
+    const userAgent = req.get('User-Agent');
+    
+    try {
+        // ANTI-BOT: Détection de comportement suspect
+        const botCheck = detectBotBehavior(clientIP, userAgent, req);
+        if (botCheck.isBot) {
+            console.error(`[ANTI-BOT] 🚫 Bot blocked: ${clientIP} - ${botCheck.reason}`);
+            return res.status(403).json({ 
+                error: "Bot detected", 
+                reason: botCheck.reason 
+            });
+        }
+        
+        const { updates } = req.body; // Array of {playerAddress, appKitWallet, scoreAmount, transactionAmount, actionType}
+        
+        console.log(`[BATCH-UPDATE] 🚀 Processing ${updates.length} updates`);
+        
+        if (!updates || !Array.isArray(updates) || updates.length === 0) {
+            return res.status(400).json({ error: 'Updates array required' });
+        }
+        
+        if (updates.length > 50) { // Limite de sécurité
+            return res.status(400).json({ error: 'Too many updates (max 50)' });
+        }
+        
+        // Validation de tous les updates
+        const validUpdates = [];
+        for (const update of updates) {
+            const validation = validateScoreSubmission(update.playerAddress, update.scoreAmount, update.transactionAmount);
+            if (validation.valid) {
+                validUpdates.push(update);
+            } else {
+                console.warn(`[BATCH-UPDATE] ⚠️ Skipping invalid update: ${validation.reason}`);
+            }
+        }
+        
+        if (validUpdates.length === 0) {
+            return res.status(400).json({ error: 'No valid updates' });
+        }
+        
+        console.log(`[BATCH-UPDATE] ✅ ${validUpdates.length}/${updates.length} updates valid`);
+        
+        // Préparer les données pour le batch
+        const players = validUpdates.map(u => u.playerAddress);
+        const scoreAmounts = validUpdates.map(u => u.scoreAmount);
+        const transactionAmounts = validUpdates.map(u => u.transactionAmount);
+        
+        const provider = new ethers.providers.JsonRpcProvider('https://monad-testnet.g.alchemy.com/v2/JD1BgcAhWzSNu8vHiT1chCKaHUq3kH6-');
+        const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
+        
+        const MONAD_GAMES_ID_CONTRACT = "0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0";
+        const contractABI = [
+            "function batchUpdatePlayerData(address[] players, uint256[] scoreAmounts, uint256[] transactionAmounts)"
+        ];
+        
+        const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
+        
+        console.log(`[BATCH-UPDATE] Calling batchUpdatePlayerData with ${players.length} players`);
+        
+        const nonce = await getNextNonce(wallet);
+        
+        const tx = await contract.batchUpdatePlayerData(players, scoreAmounts, transactionAmounts, {
+            gasLimit: 500000, // Plus de gas pour le batch
+            maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
+            maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+            nonce: nonce
+        });
+        
+        console.log(`[BATCH-UPDATE] ✅ Transaction sent: ${tx.hash}`);
+        
+        const receipt = await tx.wait();
+        const duration = Date.now() - startTime;
+        
+        console.log(`[BATCH-UPDATE] ✅ Transaction confirmed in block ${receipt.blockNumber}`);
+        console.log(`[BATCH-UPDATE] Gas used: ${receipt.gasUsed.toString()}`);
+        console.log(`[BATCH-UPDATE] 🎉 SUCCESS - ${players.length} players updated in batch`);
+        
+        res.json({ 
+            success: true, 
+            transactionHash: tx.hash, 
+            blockNumber: receipt.blockNumber, 
+            gasUsed: receipt.gasUsed.toString(),
+            playersUpdated: players.length,
+            duration: duration,
+            message: "Batch update completed successfully"
+        });
+        
+    } catch (error) {
+        const duration = Date.now() - startTime;
+        console.error(`[BATCH-UPDATE] ❌ ERROR after ${duration}ms:`, error.message);
+        res.status(500).json({ 
+            error: "Batch update failed", 
+            details: error.message,
+            duration: duration
         });
     }
 });
