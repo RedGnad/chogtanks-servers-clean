@@ -687,6 +687,63 @@ app.post('/api/monad-games-id/batch-update', requireWallet, async (req, res) => 
     }
 });
 
+// ===== FIREBASE SCORE READ ENDPOINT =====
+// Endpoint sécurisé pour lire les scores Firebase
+app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res) => {
+  const startTime = Date.now();
+  try {
+    const { walletAddress } = req.params;
+    console.log(`[FIREBASE-READ] 📖 Score read request for ${walletAddress}`);
+    
+    // Validation de l'adresse wallet
+    if (!walletAddress || !/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
+      return res.status(400).json({ error: 'Invalid wallet address format' });
+    }
+    
+    const normalizedAddress = walletAddress.toLowerCase();
+    
+    // Vérifier si Firebase Admin est disponible
+    if (!admin.apps.length) {
+      console.error('[FIREBASE-READ] ❌ Firebase Admin not initialized');
+      return res.status(503).json({ error: 'Score read service unavailable' });
+    }
+    
+    // Lecture sécurisée depuis Firebase via Admin SDK
+    const db = admin.firestore();
+    const docRef = db.collection('WalletScores').doc(normalizedAddress);
+    const doc = await docRef.get();
+    
+    if (!doc.exists) {
+      console.log(`[FIREBASE-READ] 📝 New player: ${normalizedAddress}`);
+      res.json({ 
+        walletAddress: normalizedAddress, 
+        score: 0, 
+        nftLevel: 0,
+        isNew: true 
+      });
+    } else {
+      const data = doc.data();
+      const score = Number(data.score || 0);
+      const nftLevel = Number(data.nftLevel || 0);
+      
+      console.log(`[FIREBASE-READ] ✅ Score read: ${score} for ${normalizedAddress}`);
+      res.json({ 
+        walletAddress: normalizedAddress, 
+        score: score, 
+        nftLevel: nftLevel,
+        isNew: false 
+      });
+    }
+    
+    const duration = Date.now() - startTime;
+    console.log(`[FIREBASE-READ] 🎉 Score read completed in ${duration}ms`);
+    
+  } catch (error) {
+    console.error('[FIREBASE-READ] ❌ Error:', error);
+    res.status(500).json({ error: "Failed to read score", details: error.message });
+  }
+});
+
 // ===== FIREBASE SCORE VALIDATION ENDPOINT =====
 // Endpoint sécurisé pour valider et soumettre les scores Firebase
 app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
