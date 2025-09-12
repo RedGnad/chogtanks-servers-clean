@@ -4,6 +4,13 @@ const crypto = require('crypto');
 const cors = require('cors');
 require('dotenv').config();
 
+// Fonction utilitaire pour masquer les adresses sensibles dans les logs
+function maskAddress(address) {
+    if (!address || typeof address !== 'string') return 'N/A';
+    if (address.length < 8) return address;
+    return `${address.slice(0, 4)}...${address.slice(-4)}`;
+}
+
 const app = express();
 app.set('trust proxy', 1);
 
@@ -21,7 +28,7 @@ app.use(cors({
 
 // Rate limiting global pour éviter le spam
 const requestCounts = new Map();
-const GLOBAL_RATE_LIMIT = 100; // 100 req/min par IP
+const GLOBAL_RATE_LIMIT = 50; // 50 req/min par IP (réduit pour sécurité)
 const RATE_WINDOW = 60000; // 1 minute
 
 // ALCHEMY PROTECTION: Éviter de dépasser les limites gratuites
@@ -145,7 +152,7 @@ if (!process.env.GAME_SERVER_PRIVATE_KEY) {
     console.error("ERREUR: GAME_SERVER_PRIVATE_KEY non définie. Les endpoints signés seront désactivés tant que la clé n'est pas configurée.");
 } else {
     gameWallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY);
-    console.log("Game Server Signer Address:", gameWallet.address);
+    console.log("Game Server Signer Address:", maskAddress(gameWallet.address));
 }
 
 // Middleware: exige la présence du wallet pour les routes nécessitant une signature/tx
@@ -234,7 +241,7 @@ app.post('/api/evolve-authorization', requireWallet, async (req, res) => {
         
     const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
         
-        console.log(`Autorisation d'évolution générée pour ${playerAddress}, token ${tokenId} vers niveau ${targetLevel}`);
+        console.log(`Autorisation d'évolution générée pour ${maskAddress(playerAddress)}, token ${tokenId} vers niveau ${targetLevel}`);
         
         res.json({
             signature: signature,
@@ -337,7 +344,7 @@ function validateScoreSubmission(walletAddress, scoreAmount, transactionAmount) 
     
     lastScoreSubmission.set(walletAddress, now);
     
-    console.log(`[SECURITY] ✅ Score validation passed for ${walletAddress}: score=${scoreAmount}, tx=${transactionAmount}`);
+    console.log(`[SECURITY] ✅ Score validation passed for ${maskAddress(walletAddress)}: score=${scoreAmount}, tx=${transactionAmount}`);
     return { valid: true };
 }
 
@@ -693,7 +700,7 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
   const startTime = Date.now();
   try {
     const { walletAddress } = req.params;
-    console.log(`[FIREBASE-READ] 📖 Score read request for ${walletAddress}`);
+    console.log(`[FIREBASE-READ] 📖 Score read request for ${maskAddress(walletAddress)}`);
     
     // Validation de l'adresse wallet
     if (!walletAddress || !/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
@@ -755,7 +762,7 @@ app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
         const uid = await verifyFirebaseIdTokenFromRequest(req);
         if (!uid) return res.status(401).json({ error: 'Invalid or missing Firebase ID token' });
         
-        console.log(`[FIREBASE-SCORE] 📊 Score submission request from ${walletAddress}`);
+        console.log(`[FIREBASE-SCORE] 📊 Score submission request from ${maskAddress(walletAddress)}`);
         console.log(`[FIREBASE-SCORE] Score: ${score}, Bonus: ${bonus}, Match: ${matchId}`);
         
         // Validation des paramètres
@@ -798,9 +805,8 @@ app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
             matchTokens.delete(matchToken);
             return res.status(401).json({ error: 'Expired or used matchToken' });
         }
-        // Marquer comme utilisé (un submit par matchToken)
-        mt.used = true;
-        matchTokens.set(matchToken, mt);
+        // Marquer comme utilisé et SUPPRIMER (single-use strict)
+        matchTokens.delete(matchToken);
         
         // Rate limiting spécifique aux scores (par uid, pas par wallet)
         const scoreKey = `score_uid_${uid}`;
@@ -936,7 +942,7 @@ app.listen(port, () => {
     console.log(`🚀 CHOGTANKS SIGNATURE SERVER STARTED`);
     console.log(`🚀 ==========================================`);
     console.log(`🚀 Port: ${port}`);
-    console.log(`🚀 Game Server Address: ${gameWallet ? gameWallet.address : 'N/A (no private key)'}`);
+    console.log(`🚀 Game Server Address: ${gameWallet ? maskAddress(gameWallet.address) : 'N/A (no private key)'}`);
     console.log(`🚀 RPC: Alchemy Monad Testnet`);
     console.log(`🚀 Contract: 0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0`);
     console.log(`🚀 Anti-farming: ${walletBindings.size} bindings loaded`);
