@@ -4,6 +4,7 @@ const cors = require('cors');
 require('dotenv').config();
 
 const app = express();
+app.set('trust proxy', 1);
 
 app.use(express.json({ limit: '10mb' })); // Limite de taille pour éviter les attaques
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
@@ -663,7 +664,20 @@ app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
     const startTime = Date.now();
     
     try {
-        const { walletAddress, score, bonus, matchId, playerSignature } = req.body;
+        const { walletAddress, score, bonus, matchId } = req.body;
+        // Vérification Firebase ID token (Authorization: Bearer ...)
+        const authHeader = req.headers['authorization'] || '';
+        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+        let uid = null;
+        if (!token) {
+            return res.status(401).json({ error: 'Missing Authorization token' });
+        }
+        try {
+            const decoded = await admin.auth().verifyIdToken(token);
+            uid = decoded.uid;
+        } catch (e) {
+            return res.status(401).json({ error: 'Invalid Firebase ID token' });
+        }
         
         console.log(`[FIREBASE-SCORE] 📊 Score submission request from ${walletAddress}`);
         console.log(`[FIREBASE-SCORE] Score: ${score}, Bonus: ${bonus}, Match: ${matchId}`);
@@ -731,11 +745,17 @@ app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
             });
         }
         
-        // Écriture sécurisée dans Firebase via Admin SDK
+        // Écriture sécurisée dans Firebase via Admin SDK avec idempotence uid+matchId
         const db = admin.firestore();
         const docRef = db.collection('WalletScores').doc(normalizedAddress);
+        const markerId = `${uid}:${matchId}`;
+        const markerRef = db.collection('ProcessedSubmissions').doc(markerId);
         
         await db.runTransaction(async (transaction) => {
+            const marker = await transaction.get(markerRef);
+            if (marker.exists) {
+                throw Object.assign(new Error('Duplicate submission'), { code: 409 });
+            }
             const doc = await transaction.get(docRef);
             
             if (!doc.exists) {
@@ -744,6 +764,7 @@ app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
                     score: totalScore,
                     nftLevel: 0,
                     walletAddress: normalizedAddress,
+                    uid: uid,
                     lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
                     createdAt: admin.firestore.FieldValue.serverTimestamp(),
                     matchId: matchId,
@@ -768,6 +789,7 @@ app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
                 transaction.update(docRef, {
                     score: newScore,
                     walletAddress: normalizedAddress,
+                    uid: uid,
                     lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
                     matchId: matchId,
                     validatedBy: 'server',
@@ -783,6 +805,13 @@ app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
                 
                 console.log(`[FIREBASE-SCORE] ✅ Score mis à jour: ${currentScore} + ${totalScore} = ${newScore}`);
             }
+            transaction.set(markerRef, {
+                uid: uid,
+                walletAddress: normalizedAddress,
+                matchId: matchId,
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                scoreSubmitted: totalScore
+            });
         });
         
         const duration = Date.now() - startTime;
