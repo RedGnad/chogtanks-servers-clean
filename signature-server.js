@@ -1,5 +1,6 @@
 const express = require('express');
 const { ethers } = require('ethers');
+const crypto = require('crypto');
 const cors = require('cors');
 require('dotenv').config();
 
@@ -109,6 +110,34 @@ if (!admin.apps.length) {
 }
 
 const port = process.env.PORT || 3001;
+
+// Match tokens en mémoire: token -> { uid, expMs, used }
+const matchTokens = new Map();
+const MATCH_TOKEN_TTL_MS = 5 * 60 * 1000; // 5 minutes (matches last ~3-4 min)
+
+// Helper: vérifie ID token Firebase, renvoie uid ou null
+async function verifyFirebaseIdTokenFromRequest(req) {
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return null;
+    try {
+        const decoded = await admin.auth().verifyIdToken(token);
+        return decoded && decoded.uid ? decoded.uid : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+// Démarrage de match: génère un matchToken court-vivant lié au uid
+app.post('/api/match/start', async (req, res) => {
+    const uid = await verifyFirebaseIdTokenFromRequest(req);
+    if (!uid) return res.status(401).json({ error: 'Unauthorized' });
+
+    const token = crypto.randomBytes(32).toString('hex');
+    const expMs = Date.now() + MATCH_TOKEN_TTL_MS;
+    matchTokens.set(token, { uid, expMs, used: false });
+    return res.json({ matchToken: token, expiresInMs: MATCH_TOKEN_TTL_MS });
+});
 
 // Démarrage en mode dégradé si la clé n'est pas présente: ne pas quitter, garder /health up
 let gameWallet = null;
@@ -664,20 +693,10 @@ app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
     const startTime = Date.now();
     
     try {
-        const { walletAddress, score, bonus, matchId } = req.body;
+        const { walletAddress, score, bonus, matchId, matchToken } = req.body;
         // Vérification Firebase ID token (Authorization: Bearer ...)
-        const authHeader = req.headers['authorization'] || '';
-        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
-        let uid = null;
-        if (!token) {
-            return res.status(401).json({ error: 'Missing Authorization token' });
-        }
-        try {
-            const decoded = await admin.auth().verifyIdToken(token);
-            uid = decoded.uid;
-        } catch (e) {
-            return res.status(401).json({ error: 'Invalid Firebase ID token' });
-        }
+        const uid = await verifyFirebaseIdTokenFromRequest(req);
+        if (!uid) return res.status(401).json({ error: 'Invalid or missing Firebase ID token' });
         
         console.log(`[FIREBASE-SCORE] 📊 Score submission request from ${walletAddress}`);
         console.log(`[FIREBASE-SCORE] Score: ${score}, Bonus: ${bonus}, Match: ${matchId}`);
@@ -699,16 +718,35 @@ app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
         const normalizedAddress = walletAddress.toLowerCase();
         const totalScore = parseInt(score) + (parseInt(bonus) || 0);
         
-        // Validation du score (anti-triche)
+        // Validation du score (anti-triche de base)
         if (totalScore < 0 || totalScore > 1000) {
             console.warn(`[FIREBASE-SCORE] ⚠️ Score suspect: ${totalScore} from ${normalizedAddress}`);
             return res.status(403).json({ 
                 error: 'Score out of reasonable range (0-1000)' 
             });
         }
+
+        // Vérification matchToken (empêche soumissions hors gameplay)
+        if (!matchToken) {
+            return res.status(401).json({ error: 'Missing matchToken' });
+        }
+        const mt = matchTokens.get(matchToken);
+        if (!mt) {
+            return res.status(401).json({ error: 'Invalid matchToken' });
+        }
+        if (mt.uid !== uid) {
+            return res.status(401).json({ error: 'MatchToken uid mismatch' });
+        }
+        if (mt.used || Date.now() > mt.expMs) {
+            matchTokens.delete(matchToken);
+            return res.status(401).json({ error: 'Expired or used matchToken' });
+        }
+        // Marquer comme utilisé (un submit par matchToken)
+        mt.used = true;
+        matchTokens.set(matchToken, mt);
         
-        // Rate limiting spécifique aux scores
-        const scoreKey = `score_${normalizedAddress}`;
+        // Rate limiting spécifique aux scores (par uid, pas par wallet)
+        const scoreKey = `score_uid_${uid}`;
         const now = Date.now();
         
         if (!scoreRateLimit.has(scoreKey)) {
@@ -727,15 +765,15 @@ app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
             }
         }
         
-        // Vérifier l'intervalle minimum entre soumissions
-        const lastSubmission = lastScoreSubmission.get(normalizedAddress);
+        // Vérifier l'intervalle minimum entre soumissions (par uid)
+        const lastSubmission = lastScoreSubmission.get(uid);
         if (lastSubmission && (now - lastSubmission) < 5000) { // 5 secondes minimum
             return res.status(429).json({ 
                 error: 'Please wait before submitting another score' 
             });
         }
         
-        lastScoreSubmission.set(normalizedAddress, now);
+        lastScoreSubmission.set(uid, now);
         
         // Vérifier si Firebase Admin est disponible
         if (!admin.apps.length) {
