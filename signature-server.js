@@ -266,13 +266,13 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
         
         // Signature attendue par le contrat:
         // keccak256(abi.encodePacked(msg.sender, playerPoints, nonce, "MINT")).toEthSignedMessageHash()
-        const messageHash = ethers.utils.solidityKeccak256(
+        const packedData = ethers.utils.solidityPack(
             ['address', 'uint256', 'uint256', 'string'],
             [playerAddress, playerPoints, nonce, 'MINT']
         );
+        const messageHash = ethers.utils.keccak256(packedData);
         
-        // Convertir en format EIP-191 comme fait le contrat avec toEthSignedMessageHash()
-        const ethSignedMessageHash = ethers.utils.hashMessage(ethers.utils.arrayify(messageHash));
+        // Le contrat utilise .toEthSignedMessageHash() qui ajoute le préfixe EIP-191
         const signature = await gameWallet.signMessage(ethers.utils.arrayify(messageHash));
         
         console.log(`[MINT] ✅ Autorisation de mint générée pour ${playerAddress} avec un coût de ${mintCost}`);
