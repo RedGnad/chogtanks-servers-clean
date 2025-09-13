@@ -87,6 +87,28 @@ app.get('/health', (req, res) => {
 // Supporte aussi la méthode HEAD sur /health
 app.head('/health', (req, res) => res.sendStatus(200));
 
+// Endpoint pour démarrer un match (compatibilité ancien build)
+app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res) => {
+    try {
+        const { walletAddress } = req.body;
+        if (!walletAddress) {
+            return res.status(400).json({ error: 'Missing walletAddress' });
+        }
+        
+        const matchId = `match_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+        console.log(`[MATCH] Match started for ${walletAddress}: ${matchId}`);
+        
+        res.json({ 
+            success: true, 
+            matchId: matchId,
+            walletAddress: walletAddress.toLowerCase()
+        });
+    } catch (error) {
+        console.error('[MATCH] Error:', error);
+        res.status(500).json({ error: 'Failed to start match', details: error.message });
+    }
+});
+
 // Endpoint pour récupérer le score (compatibilité ancien build)
 app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res) => {
     try {
