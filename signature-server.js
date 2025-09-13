@@ -1,11 +1,38 @@
 const express = require('express');
 const { ethers } = require('ethers');
 const cors = require('cors');
+let helmet = null;
 require('dotenv').config();
 
 const app = express();
+app.disable('x-powered-by');
+try {
+    helmet = require('helmet');
+    app.use(helmet());
+} catch (_) {
+    console.warn('[BOOT] helmet non installé - en-têtes sécurité non appliqués');
+}
 app.use(express.json());
-app.use(cors());
+
+// CORS restrictif (configurable par ALLOWED_ORIGINS)
+const defaultAllowed = [
+    'https://redgnad.github.io',
+    'https://chogtanks.vercel.app',
+    'https://monadclip.io'
+];
+const allowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+const allowedOrigins = new Set(allowedFromEnv.length ? allowedFromEnv : defaultAllowed);
+app.use(cors({
+    origin: (origin, cb) => {
+        if (!origin) return cb(null, true); // allow non-browser tools
+        if (allowedOrigins.has(origin)) return cb(null, true);
+        return cb(new Error('Not allowed by CORS'));
+    },
+    credentials: true
+}));
 
 const port = process.env.PORT || 3001;
 
@@ -157,13 +184,24 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
 });
 
 // Endpoint pour démarrer un match (compatibilité ancien build)
+// Match tokens in-memory (TTL court, anti-replay)
+const matchTokens = new Map(); // token -> { uid, createdAt, expAt, used }
+
 app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         console.log(`[MATCH-START] Match start requested`);
         
         // Générer un token de match unique
         const matchToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
-        const expiresInMs = 5 * 60 * 1000; // 5 minutes
+        const expiresInMs = Number(process.env.MATCH_TOKEN_TTL_MS || (2 * 60 * 1000)); // défaut 2 minutes
+        const now = Date.now();
+        const uid = req.firebaseAuth?.uid || null;
+        matchTokens.set(matchToken, {
+            uid,
+            createdAt: now,
+            expAt: now + expiresInMs,
+            used: false
+        });
         
         console.log(`[MATCH-START] Generated match token: ${matchToken}`);
         
@@ -181,7 +219,7 @@ app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res
 // Endpoint pour soumettre les scores (compatibilité ancien build)
 app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
-        const { walletAddress, score, bonus, matchId } = req.body || {};
+        const { walletAddress, score, bonus, matchId, matchToken } = req.body || {};
         if (!walletAddress || typeof score === 'undefined') {
             return res.status(400).json({ error: 'Missing walletAddress or score' });
         }
@@ -191,6 +229,30 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
         
         const normalized = walletAddress.toLowerCase();
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
+
+        // Enforce match token usage si auth active
+        if (process.env.FIREBASE_REQUIRE_AUTH === '1') {
+            if (!matchToken || typeof matchToken !== 'string') {
+                return res.status(400).json({ error: 'Missing matchToken' });
+            }
+            const rec = matchTokens.get(matchToken);
+            if (!rec) {
+                return res.status(401).json({ error: 'Invalid matchToken' });
+            }
+            if (rec.used) {
+                return res.status(401).json({ error: 'Match token already used' });
+            }
+            if (rec.expAt < Date.now()) {
+                matchTokens.delete(matchToken);
+                return res.status(401).json({ error: 'Match token expired' });
+            }
+            const uid = req.firebaseAuth?.uid || null;
+            if (rec.uid && uid && rec.uid !== uid) {
+                return res.status(401).json({ error: 'Match token does not belong to this user' });
+            }
+            rec.used = true;
+            matchTokens.set(matchToken, rec);
+        }
         
         console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
         
@@ -494,4 +556,3 @@ process.on('unhandledRejection', (reason) => {
 process.on('uncaughtException', (err) => {
     console.error('[uncaughtException]', err);
 });
-
