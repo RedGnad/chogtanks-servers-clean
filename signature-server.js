@@ -186,36 +186,17 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
 
 app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
-        const playerAddress = req.body.playerAddress || req.body.walletAddress;
-        const { tokenId, targetLevel } = req.body;
-        
-        console.log(`[EVOLVE-AUTH] Request body:`, req.body);
-        console.log(`[EVOLVE-AUTH] Headers:`, req.headers);
+        const { playerAddress, tokenId, targetLevel } = req.body;
         
         if (!playerAddress || !tokenId || !targetLevel) {
             return res.status(400).json({ error: "Adresse du joueur, ID du token et niveau cible requis" });
-        }
-
-        // Auth Firebase déjà vérifiée par requireFirebaseAuth middleware
-        console.log(`[EVOLVE-AUTH] ✅ Firebase UID: ${req.uid}`);
-        
-        // Vérification ownership wallet
-        const ownership = await assertWalletBelongsToUid(playerAddress, req.uid);
-        if (!ownership.ok) {
-            return res.status(403).json({ error: 'Wallet not linked to user', reason: ownership.reason });
         }
         
         const evolutionCosts = {
             1: 50,   // Level 0 -> 1
             2: 100,  // Level 1 -> 2
             3: 150,  // Level 2 -> 3
-            4: 200,  // Level 3 -> 4
-            5: 300,  // Level 4 -> 5
-            6: 400,  // Level 5 -> 6
-            7: 500,  // Level 6 -> 7
-            8: 600,  // Level 7 -> 8
-            9: 700,  // Level 8 -> 9
-            10: 800  // Level 9 -> 10
+            4: 200   // Level 3 -> 4
         };
         
         const requiredPoints = evolutionCosts[targetLevel];
