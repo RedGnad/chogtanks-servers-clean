@@ -151,6 +151,38 @@ app.get('/health', (req, res) => {
 // Supporte aussi la méthode HEAD sur /health
 app.head('/health', (req, res) => res.sendStatus(200));
 
+// ===== FIREBASE SCORE READ ENDPOINT =====
+// Lecture sécurisée du score (serveur -> Firestore via Admin SDK)
+app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res) => {
+  try {
+    const { walletAddress } = req.params;
+    if (!walletAddress || !/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
+      return res.status(400).json({ error: 'Invalid wallet address format' });
+    }
+
+    if (!admin.apps.length) {
+      return res.status(503).json({ error: 'Score read service unavailable' });
+    }
+
+    const normalizedAddress = walletAddress.toLowerCase();
+    const db = admin.firestore();
+    const docRef = db.collection('WalletScores').doc(normalizedAddress);
+    const doc = await docRef.get();
+
+    if (!doc.exists) {
+      return res.json({ walletAddress: normalizedAddress, score: 0, nftLevel: 0, isNew: true });
+    }
+
+    const data = doc.data();
+    const score = Number(data.score || 0);
+    const nftLevel = Number(data.nftLevel || 0);
+    return res.json({ walletAddress: normalizedAddress, score, nftLevel, isNew: false });
+  } catch (error) {
+    console.error('[FIREBASE-READ] ❌ Error:', error);
+    res.status(500).json({ error: 'Failed to read score', details: error.message });
+  }
+});
+
 // Expose métriques légères
 app.get('/metrics-lite', (req, res) => {
     res.status(200).json({ metrics });
