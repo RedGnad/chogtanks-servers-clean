@@ -176,10 +176,70 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
     const data = doc.data();
     const score = Number(data.score || 0);
     const nftLevel = Number(data.nftLevel || 0);
+    // Metrics
+    if (typeof metrics !== 'undefined') { metrics.firebaseRead++; }
     return res.json({ walletAddress: normalizedAddress, score, nftLevel, isNew: false });
   } catch (error) {
     console.error('[FIREBASE-READ] ❌ Error:', error);
     res.status(500).json({ error: 'Failed to read score', details: error.message });
+  }
+});
+
+// ===== FIREBASE SCORE SUBMIT ENDPOINT =====
+// Soumission sécurisée du score depuis le client (auth Firebase requise)
+app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async (req, res) => {
+  try {
+    const { walletAddress, score, bonus, matchId } = req.body || {};
+    if (!walletAddress || typeof score === 'undefined' || !matchId) {
+      return res.status(400).json({ error: 'Missing required parameters: walletAddress, score, matchId' });
+    }
+    if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
+      return res.status(400).json({ error: 'Invalid wallet address format' });
+    }
+    const normalized = walletAddress.toLowerCase();
+    const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
+    if (totalScore < 0 || totalScore > 1000) {
+      return res.status(403).json({ error: 'Score out of reasonable range (0-1000)' });
+    }
+
+    if (!admin.apps.length) {
+      return res.status(503).json({ error: 'Score submit service unavailable' });
+    }
+
+    const db = admin.firestore();
+    const docRef = db.collection('WalletScores').doc(normalized);
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(docRef);
+      if (!snap.exists) {
+        tx.set(docRef, {
+          score: totalScore,
+          nftLevel: 0,
+          walletAddress: normalized,
+          uid: req.uid,
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          matchId: matchId,
+          validatedBy: 'server'
+        });
+      } else {
+        const data = snap.data() || {};
+        const currentScore = Number(data.score || 0);
+        tx.update(docRef, {
+          score: currentScore + totalScore,
+          walletAddress: normalized,
+          uid: req.uid,
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+          matchId: matchId,
+          validatedBy: 'server'
+        });
+      }
+    });
+
+    if (typeof metrics !== 'undefined') { metrics.firebaseSubmit++; }
+    return res.json({ success: true, walletAddress: normalized, score: totalScore, matchId });
+  } catch (error) {
+    console.error('[FIREBASE-SUBMIT] ❌ Error:', error);
+    res.status(500).json({ error: 'Failed to submit score', details: error.message });
   }
 });
 
