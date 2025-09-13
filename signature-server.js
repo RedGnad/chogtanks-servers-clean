@@ -251,13 +251,13 @@ app.get('/metrics-lite', (req, res) => {
 app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const playerAddress = req.body.playerAddress || req.body.walletAddress;
-        const { mintCost } = req.body;
+        let { mintCost } = req.body;
         
         console.log(`[MINT-AUTH] Request by uid=${req.uid}, player=${playerAddress}, cost=${mintCost}`);
         metrics.mintRequests++;
 
-        if (!playerAddress || !mintCost) {
-            return res.status(400).json({ error: "Adresse du joueur et coût de mint requis" });
+        if (!playerAddress) {
+            return res.status(400).json({ error: "Adresse du joueur requise" });
         }
 
         const ownership = await assertWalletBelongsToUid(playerAddress, req.uid);
@@ -265,6 +265,16 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
             return res.status(403).json({ error: 'Wallet not linked to user', reason: ownership.reason });
         }
         
+        // Déterminer le coût de mint côté serveur si non fourni
+        const defaultMintCostWei = process.env.DEFAULT_MINT_COST_WEI || '1000000000000000';
+        try {
+            mintCost = mintCost ?? defaultMintCostWei;
+            // Valider format (BigNumber parsable)
+            ethers.BigNumber.from(mintCost);
+        } catch {
+            return res.status(400).json({ error: 'Invalid mintCost format' });
+        }
+
         const message = ethers.utils.solidityKeccak256(
             ['address', 'uint256'],
             [playerAddress, mintCost]
