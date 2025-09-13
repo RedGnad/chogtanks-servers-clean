@@ -457,6 +457,81 @@ app.listen(port, () => {
     console.log(`Game Server Address: ${gameWallet ? gameWallet.address : 'N/A (no private key)'}`);
 });
 
+// Endpoint pour consommer les points après évolution réussie
+app.post('/api/consume-evolution-points', requireWallet, requireFirebaseAuth, async (req, res) => {
+    try {
+        const { walletAddress, pointsToConsume, tokenId, newLevel } = req.body || {};
+        
+        if (!walletAddress || !pointsToConsume || !tokenId || !newLevel) {
+            return res.status(400).json({ error: "Paramètres manquants" });
+        }
+        
+        const normalized = walletAddress.toLowerCase().trim();
+        
+        if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+            try {
+                const admin = require('firebase-admin');
+                if (!admin.apps.length) {
+                    admin.initializeApp({
+                        credential: admin.credential.cert({
+                            projectId: process.env.FIREBASE_PROJECT_ID,
+                            clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+                            privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
+                        })
+                    });
+                }
+                const db = admin.firestore();
+                
+                // Lire le score actuel
+                const docRef = db.collection('WalletScores').doc(normalized);
+                const doc = await docRef.get();
+                
+                if (!doc.exists) {
+                    return res.status(404).json({ error: "Joueur non trouvé" });
+                }
+                
+                const currentScore = Number(doc.data().score || 0);
+                const newScore = Math.max(0, currentScore - pointsToConsume);
+                
+                // Mettre à jour le score
+                await docRef.update({
+                    score: newScore,
+                    nftLevel: newLevel,
+                    tokenId: tokenId,
+                    lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+                    lastEvolutionTimestamp: admin.firestore.FieldValue.serverTimestamp()
+                });
+                
+                console.log(`[CONSUME-POINTS] Points consommés: ${currentScore} - ${pointsToConsume} = ${newScore}`);
+                console.log(`[MONITORING] 🔥 POINTS CONSUMED - Wallet: ${normalized}, Points: ${pointsToConsume}, New Score: ${newScore}, Token: ${tokenId}, Level: ${newLevel}, Timestamp: ${new Date().toISOString()}`);
+                
+                res.json({
+                    success: true,
+                    consumedPoints: pointsToConsume,
+                    newScore: newScore,
+                    walletAddress: normalized
+                });
+                
+            } catch (firebaseError) {
+                console.error('[CONSUME-POINTS] Erreur Firebase:', firebaseError);
+                res.status(500).json({ error: "Erreur Firebase" });
+            }
+        } else {
+            console.log('[CONSUME-POINTS] Firebase non configuré - simulation');
+            res.json({
+                success: true,
+                consumedPoints: pointsToConsume,
+                newScore: 1000, // Score simulé
+                walletAddress: normalized
+            });
+        }
+        
+    } catch (error) {
+        console.error('[CONSUME-POINTS] Erreur:', error);
+        res.status(500).json({ error: "Erreur serveur" });
+    }
+});
+
 // Garde-fous contre les crashs silencieux
 process.on('unhandledRejection', (reason) => {
     console.error('[unhandledRejection]', reason);
