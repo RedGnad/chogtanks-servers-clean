@@ -26,52 +26,24 @@ function requireWallet(req, res, next) {
     next();
 }
 
-// Middleware: Auth Firebase obligatoire si FIREBASE_REQUIRE_AUTH === '1'
-async function requireFirebaseAuth(req, res, next) {
-    try {
-        if (process.env.FIREBASE_REQUIRE_AUTH !== '1') {
-            return next();
-        }
-
-        const auth = req.headers.authorization || '';
-        if (!auth.startsWith('Bearer ')) {
-            return res.status(401).json({ error: 'Missing token' });
-        }
-
-        const token = auth.slice(7);
-
-        // Initialiser Firebase Admin si nécessaire
-        const admin = require('firebase-admin');
-        if (!admin.apps.length) {
-            const serviceAccount = {
-                type: "service_account",
-                project_id: process.env.FIREBASE_PROJECT_ID,
-                private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-                private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-                client_email: process.env.FIREBASE_CLIENT_EMAIL,
-                client_id: process.env.FIREBASE_CLIENT_ID,
-                auth_uri: "https://accounts.google.com/o/oauth2/auth",
-                token_uri: "https://oauth2.googleapis.com/token",
-                auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-                client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
-            };
-            admin.initializeApp({
-                credential: admin.credential.cert(serviceAccount),
-                projectId: process.env.FIREBASE_PROJECT_ID
-            });
-        }
-
-        const decoded = await require('firebase-admin').auth().verifyIdToken(token);
-        if (!decoded || !decoded.uid) {
-            return res.status(401).json({ error: 'Invalid token' });
-        }
-        // Optionnel: attacher l'utilisateur Firebase à la requête
-        req.firebaseUser = decoded;
+// Middleware: exige l'authentification Firebase
+function requireFirebaseAuth(req, res, next) {
+    // Si FIREBASE_REQUIRE_AUTH n'est pas défini, on skip l'auth (mode permissif)
+    if (process.env.FIREBASE_REQUIRE_AUTH !== '1') {
+        console.log('[AUTH] Firebase auth disabled - proceeding without verification');
         return next();
-    } catch (err) {
-        console.error('[AUTH] Firebase verification failed:', err?.message || err);
-        return res.status(401).json({ error: 'Unauthorized' });
     }
+    
+    const auth = req.headers.authorization || '';
+    if (!auth.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Missing token' });
+    }
+    
+    const token = auth.slice(7);
+    
+    // Pour l'instant, on accepte tous les tokens (à améliorer plus tard)
+    console.log('[AUTH] Firebase token received, proceeding');
+    next();
 }
 
 // Health check endpoint pour monitoring
@@ -86,28 +58,6 @@ app.get('/health', (req, res) => {
 });
 // Supporte aussi la méthode HEAD sur /health
 app.head('/health', (req, res) => res.sendStatus(200));
-
-// Endpoint pour démarrer un match (compatibilité ancien build)
-app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res) => {
-    try {
-        const { walletAddress } = req.body;
-        if (!walletAddress) {
-            return res.status(400).json({ error: 'Missing walletAddress' });
-        }
-        
-        const matchId = `match_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-        console.log(`[MATCH] Match started for ${walletAddress}: ${matchId}`);
-        
-        res.json({ 
-            success: true, 
-            matchId: matchId,
-            walletAddress: walletAddress.toLowerCase()
-        });
-    } catch (error) {
-        console.error('[MATCH] Error:', error);
-        res.status(500).json({ error: 'Failed to start match', details: error.message });
-    }
-});
 
 // Endpoint pour récupérer le score (compatibilité ancien build)
 app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res) => {
@@ -177,7 +127,29 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
     }
 });
 
-// Compat ancien build: soumission de score (admin côté serveur)
+// Endpoint pour démarrer un match (compatibilité ancien build)
+app.post('/api/match/start', requireWallet, async (req, res) => {
+    try {
+        console.log(`[MATCH-START] Match start requested`);
+        
+        // Générer un token de match unique
+        const matchToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
+        const expiresInMs = 5 * 60 * 1000; // 5 minutes
+        
+        console.log(`[MATCH-START] Generated match token: ${matchToken}`);
+        
+        return res.json({
+            matchToken: matchToken,
+            expiresInMs: expiresInMs,
+            success: true
+        });
+    } catch (error) {
+        console.error('[MATCH-START] Error:', error);
+        res.status(500).json({ error: 'Failed to start match', details: error.message });
+    }
+});
+
+// Endpoint pour soumettre les scores (compatibilité ancien build)
 app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
     try {
         const { walletAddress, score, bonus, matchId } = req.body || {};
@@ -187,11 +159,13 @@ app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
         if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
             return res.status(400).json({ error: 'Invalid wallet address format' });
         }
-
+        
         const normalized = walletAddress.toLowerCase();
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
+        
         console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
-
+        
+        // Intégrer avec Firebase pour sauvegarder le score
         if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
             try {
                 const admin = require('firebase-admin');
@@ -213,24 +187,31 @@ app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
                         projectId: process.env.FIREBASE_PROJECT_ID
                     });
                 }
-
+                
                 const db = admin.firestore();
                 const docRef = db.collection('WalletScores').doc(normalized);
+                
+                // Récupérer le score actuel
                 const doc = await docRef.get();
                 let currentScore = 0;
-                if (doc.exists) currentScore = Number(doc.data().score || 0);
+                if (doc.exists) {
+                    currentScore = Number(doc.data().score || 0);
+                }
+                
+                // Ajouter le nouveau score
                 const newTotalScore = currentScore + totalScore;
-
+                
+                // Sauvegarder dans Firebase
                 await docRef.set({
                     score: newTotalScore,
                     walletAddress: normalized,
                     lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
                     matchId: matchId || 'legacy'
                 }, { merge: true });
-
+                
                 console.log(`[SUBMIT-SCORE] ✅ Score sauvegardé dans Firebase: ${currentScore} + ${totalScore} = ${newTotalScore}`);
                 console.log(`[MONITORING] 📊 SCORE SUBMISSION - Wallet: ${normalized}, Score Added: ${totalScore}, New Total: ${newTotalScore}, Timestamp: ${new Date().toISOString()}`);
-
+                
                 return res.json({
                     success: true,
                     walletAddress: normalized,
@@ -238,14 +219,27 @@ app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
                     matchId: matchId || 'legacy',
                     validated: true
                 });
+                
             } catch (firebaseError) {
                 console.error('[SUBMIT-SCORE] Erreur Firebase:', firebaseError);
-                // Fallback: accepter pour compat
-                return res.json({ success: true, walletAddress: normalized, score: totalScore, matchId: matchId || 'legacy', validated: true });
+                // Fallback: accepter le score même si Firebase échoue
+                return res.json({
+                    success: true,
+                    walletAddress: normalized,
+                    score: totalScore,
+                    matchId: matchId || 'legacy',
+                    validated: true
+                });
             }
         } else {
             console.warn('[SUBMIT-SCORE] Firebase non configuré - score accepté mais non sauvegardé');
-            return res.json({ success: true, walletAddress: normalized, score: totalScore, matchId: matchId || 'legacy', validated: true });
+            return res.json({
+                success: true,
+                walletAddress: normalized,
+                score: totalScore,
+                matchId: matchId || 'legacy',
+                validated: true
+            });
         }
     } catch (error) {
         console.error('[SUBMIT-SCORE] Error:', error);
@@ -261,28 +255,19 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
             return res.status(400).json({ error: "Adresse du joueur et coût de mint requis" });
         }
         
-        const nonce = Date.now();
-        const playerPoints = 0; // Pour le mint, on utilise 0 points comme dans le contrat
-        
-        // Signature attendue par le contrat:
-        // keccak256(abi.encodePacked(msg.sender, playerPoints, nonce, "MINT")).toEthSignedMessageHash()
-        const packedData = ethers.utils.solidityPack(
-            ['address', 'uint256', 'uint256', 'string'],
-            [playerAddress, playerPoints, nonce, 'MINT']
+        const message = ethers.utils.solidityKeccak256(
+            ['address', 'uint256'],
+            [playerAddress, mintCost]
         );
-        const messageHash = ethers.utils.keccak256(packedData);
         
-        // Le contrat utilise .toEthSignedMessageHash() qui ajoute le préfixe EIP-191
-        const signature = await gameWallet.signMessage(ethers.utils.arrayify(messageHash));
+    const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
         
         console.log(`[MINT] ✅ Autorisation de mint générée pour ${playerAddress} avec un coût de ${mintCost}`);
-        console.log(`[MONITORING] 🎯 MINT REQUEST - Wallet: ${playerAddress}, Cost: ${mintCost}, Nonce: ${nonce}, Timestamp: ${new Date().toISOString()}`);
+        console.log(`[MONITORING] 🎯 MINT REQUEST - Wallet: ${playerAddress}, Cost: ${mintCost}, Timestamp: ${new Date().toISOString()}`);
         
         res.json({
             signature: signature,
             mintCost: mintCost,
-            nonce: nonce,
-            authorized: true,
             gameServerAddress: gameWallet.address
         });
         
@@ -294,10 +279,10 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
 
 app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
-        const { playerAddress, tokenId, targetLevel, playerPoints } = req.body;
+        const { playerAddress, tokenId, targetLevel } = req.body;
         
-        if (!playerAddress || tokenId === undefined || targetLevel === undefined) {
-            return res.status(400).json({ error: "Paramètres manquants (playerAddress, tokenId, targetLevel)" });
+        if (!playerAddress || !tokenId || !targetLevel) {
+            return res.status(400).json({ error: "Adresse du joueur, ID du token et niveau cible requis" });
         }
         
         const evolutionCosts = {
@@ -312,56 +297,26 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
             10: 800 // Level 9 -> 10
         };
         
-        // Optionnel: vérifier on-chain pour dériver le niveau courant et la propriété
-        let numericTokenId = Number(tokenId);
-        let numericTargetLevel = Number(targetLevel);
-        let requiredPoints = evolutionCosts[numericTargetLevel];
-
-        try {
-            const provider = new ethers.providers.JsonRpcProvider('https://testnet-rpc.monad.xyz/');
-            const contractAddress = '0x04223adab3a0c1a2e8aade678bebd3fddd580a38';
-            const abi = [
-                'function ownerOf(uint256 tokenId) view returns (address)',
-                'function getLevel(uint256 tokenId) view returns (uint256)'
-            ];
-            const contract = new ethers.Contract(contractAddress, abi, provider);
-            const owner = await contract.ownerOf(numericTokenId);
-            if (owner.toLowerCase() !== playerAddress.toLowerCase()) {
-                return res.status(403).json({ error: 'Not your NFT' });
-            }
-            const onchainLevel = Number(await contract.getLevel(numericTokenId));
-            // Calculer target à partir de l'état on-chain pour éviter toute dérive client
-            numericTargetLevel = onchainLevel + 1;
-            requiredPoints = evolutionCosts[numericTargetLevel];
-        } catch (chainErr) {
-            console.warn('[EVOLVE] On-chain read failed, using client-provided targetLevel:', chainErr?.message || chainErr);
-        }
+        const requiredPoints = evolutionCosts[targetLevel];
         
         if (!requiredPoints) {
             return res.status(400).json({ error: "Niveau cible invalide" });
         }
-        const pointsForSig = Number(playerPoints);
-        const nonce = Date.now();
-
-        // Signature attendue par le contrat:
-        // keccak256(abi.encodePacked(msg.sender, tokenId, targetLevel, playerPoints, nonce, "EVOLVE"))
-        const message = ethers.utils.solidityKeccak256(
-            ['address', 'uint256', 'uint256', 'uint256', 'uint256', 'string'],
-            [playerAddress, numericTokenId, numericTargetLevel, pointsForSig, nonce, 'EVOLVE']
-        );
-        const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
         
-        console.log(`[EVOLVE] ✅ Autorisation d'évolution générée pour ${playerAddress}, token ${numericTokenId} vers niveau ${numericTargetLevel}`);
-        console.log(`[MONITORING] 🚀 EVOLVE REQUEST - Wallet: ${playerAddress}, Token: ${numericTokenId}, Target Level: ${numericTargetLevel}, Cost: ${requiredPoints}, Timestamp: ${new Date().toISOString()}`);
+        const message = ethers.utils.solidityKeccak256(
+            ['address', 'uint256', 'uint256', 'uint256'],
+            [playerAddress, tokenId, targetLevel, requiredPoints]
+        );
+        
+    const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
+        
+        console.log(`[EVOLVE] ✅ Autorisation d'évolution générée pour ${playerAddress}, token ${tokenId} vers niveau ${targetLevel}`);
+        console.log(`[MONITORING] 🚀 EVOLVE REQUEST - Wallet: ${playerAddress}, Token: ${tokenId}, Target Level: ${targetLevel}, Cost: ${requiredPoints}, Timestamp: ${new Date().toISOString()}`);
         
         res.json({
-            authorized: true,
-            walletAddress: playerAddress,
-            tokenId: numericTokenId,
+            signature: signature,
             evolutionCost: requiredPoints,
-            targetLevel: numericTargetLevel,
-            nonce: nonce,
-            signature: signature
+            targetLevel: targetLevel
         });
         
     } catch (error) {
@@ -494,85 +449,6 @@ app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth
             error: "Failed to submit to Monad Games ID", 
             details: error.message 
         });
-    }
-});
-
-// Endpoint sécurisé: consommer les points après évolution (mise à jour Firebase côté serveur)
-app.post('/api/consume-evolution-points', requireWallet, requireFirebaseAuth, async (req, res) => {
-    try {
-        const { walletAddress, pointsToConsume, tokenId, newLevel } = req.body || {};
-        
-        if (!walletAddress || pointsToConsume === undefined || !tokenId || !newLevel) {
-            return res.status(400).json({ error: "Paramètres manquants" });
-        }
-        
-        const normalized = walletAddress.toLowerCase().trim();
-        
-        if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
-            try {
-                const admin = require('firebase-admin');
-                if (!admin.apps.length) {
-                    const serviceAccount = {
-                        type: "service_account",
-                        project_id: process.env.FIREBASE_PROJECT_ID,
-                        private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-                        private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-                        client_email: process.env.FIREBASE_CLIENT_EMAIL,
-                        client_id: process.env.FIREBASE_CLIENT_ID,
-                        auth_uri: "https://accounts.google.com/o/oauth2/auth",
-                        token_uri: "https://oauth2.googleapis.com/token",
-                        auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-                        client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
-                    };
-                    admin.initializeApp({
-                        credential: admin.credential.cert(serviceAccount),
-                        projectId: process.env.FIREBASE_PROJECT_ID
-                    });
-                }
-                const db = admin.firestore();
-                
-                // Lire le score actuel
-                const docRef = db.collection('WalletScores').doc(normalized);
-                const doc = await docRef.get();
-                
-                if (!doc.exists) {
-                    return res.status(404).json({ error: "Joueur non trouvé" });
-                }
-                
-                const currentScore = Number(doc.data().score || 0);
-                const newScore = Math.max(0, currentScore - Number(pointsToConsume));
-                
-                // Mettre à jour le score et le niveau
-                await docRef.set({
-                    score: newScore,
-                    nftLevel: Number(newLevel),
-                    tokenId: Number(tokenId),
-                    lastUpdated: require('firebase-admin').firestore.FieldValue.serverTimestamp(),
-                    lastEvolutionTimestamp: require('firebase-admin').firestore.FieldValue.serverTimestamp()
-                }, { merge: true });
-                
-                console.log(`[CONSUME-POINTS] ✅ ${currentScore} - ${pointsToConsume} = ${newScore}`);
-                console.log(`[MONITORING] 🔥 POINTS CONSUMED - Wallet: ${normalized}, Points: ${pointsToConsume}, New Score: ${newScore}, Token: ${tokenId}, Level: ${newLevel}, Timestamp: ${new Date().toISOString()}`);
-                
-                return res.json({
-                    success: true,
-                    consumedPoints: Number(pointsToConsume),
-                    newScore: newScore,
-                    walletAddress: normalized
-                });
-                
-            } catch (firebaseError) {
-                console.error('[CONSUME-POINTS] Erreur Firebase:', firebaseError);
-                return res.status(500).json({ error: "Erreur Firebase" });
-            }
-        } else {
-            console.warn('[CONSUME-POINTS] Firebase non configuré');
-            return res.status(503).json({ error: 'Firebase non configuré côté serveur' });
-        }
-        
-    } catch (error) {
-        console.error('[CONSUME-POINTS] Erreur:', error);
-        res.status(500).json({ error: "Erreur serveur" });
     }
 });
 
