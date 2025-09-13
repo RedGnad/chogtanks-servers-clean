@@ -190,6 +190,7 @@ app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
                 }, { merge: true });
                 
                 console.log(`[SUBMIT-SCORE] ✅ Score sauvegardé dans Firebase: ${currentScore} + ${totalScore} = ${newTotalScore}`);
+                console.log(`[MONITORING] 📊 SCORE SUBMISSION - Wallet: ${normalized}, Score Added: ${totalScore}, New Total: ${newTotalScore}, Timestamp: ${new Date().toISOString()}`);
                 
                 return res.json({
                     success: true,
@@ -241,7 +242,8 @@ app.post('/api/mint-authorization', requireWallet, async (req, res) => {
         
     const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
         
-        console.log(`Autorisation de mint générée pour ${playerAddress} avec un coût de ${mintCost}`);
+        console.log(`[MINT] ✅ Autorisation de mint générée pour ${playerAddress} avec un coût de ${mintCost}`);
+        console.log(`[MONITORING] 🎯 MINT REQUEST - Wallet: ${playerAddress}, Cost: ${mintCost}, Timestamp: ${new Date().toISOString()}`);
         
         res.json({
             signature: signature,
@@ -288,7 +290,8 @@ app.post('/api/evolve-authorization', requireWallet, async (req, res) => {
         
     const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
         
-        console.log(`Autorisation d'évolution générée pour ${playerAddress}, token ${tokenId} vers niveau ${targetLevel}`);
+        console.log(`[EVOLVE] ✅ Autorisation d'évolution générée pour ${playerAddress}, token ${tokenId} vers niveau ${targetLevel}`);
+        console.log(`[MONITORING] 🚀 EVOLVE REQUEST - Wallet: ${playerAddress}, Token: ${tokenId}, Target Level: ${targetLevel}, Cost: ${requiredPoints}, Timestamp: ${new Date().toISOString()}`);
         
         res.json({
             signature: signature,
