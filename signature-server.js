@@ -346,7 +346,7 @@ async function getNextNonce(wallet) {
     }
 }
 
-app.post('/api/monad-games-id/update-player', requireWallet, async (req, res) => {
+app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, appKitWallet, scoreAmount, transactionAmount, actionType } = req.body;
         
