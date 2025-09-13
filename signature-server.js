@@ -449,6 +449,97 @@ function saveWalletBindings(bindings) {
 const walletBindings = loadWalletBindings();
 console.log(`[ANTI-FARMING] ${walletBindings.size} liaisons chargées depuis ${WALLET_BINDINGS_FILE}`);
 
+// =====================
+// Monad Games ID - BATCH
+// =====================
+const ENABLE_MONAD_BATCH = process.env.ENABLE_MONAD_BATCH === '1';
+const BATCH_FLUSH_MS = Number(process.env.BATCH_FLUSH_MS || 1500); // 1.5s
+const BATCH_MAX = Number(process.env.BATCH_MAX || 100);
+const BATCH_MAX_WAIT_MS = Number(process.env.BATCH_MAX_WAIT_MS || 3000);
+
+// Queue en mémoire: agrégation par joueur
+// Structure: Map<address, { score: number, tx: number, firstAt: number }>
+const batchQueue = new Map();
+let isFlushing = false;
+let lastFlushAt = Date.now();
+
+function enqueuePlayerUpdate(player, scoreDelta, txDelta) {
+    const key = player.toLowerCase();
+    const prev = batchQueue.get(key) || { score: 0, tx: 0, firstAt: Date.now() };
+    prev.score = Number(prev.score) + Number(scoreDelta || 0);
+    prev.tx = Number(prev.tx) + Number(txDelta || 0);
+    batchQueue.set(key, prev);
+}
+
+async function flushBatchIfNeeded(force = false) {
+    const now = Date.now();
+    if (!ENABLE_MONAD_BATCH) return;
+    if (isFlushing) return;
+    if (!force && now - lastFlushAt < BATCH_FLUSH_MS) return;
+    if (batchQueue.size === 0) return;
+    
+    isFlushing = true;
+    try {
+        // Préparer tableaux
+        const entries = Array.from(batchQueue.entries());
+        // Partitionner en chunks de taille BATCH_MAX
+        for (let i = 0; i < entries.length; i += BATCH_MAX) {
+            const chunk = entries.slice(i, i + BATCH_MAX);
+            const players = [];
+            const scores = [];
+            const txs = [];
+            for (const [addr, agg] of chunk) {
+                players.push(addr);
+                scores.push(ethers.BigNumber.from(agg.score));
+                txs.push(ethers.BigNumber.from(agg.tx));
+            }
+
+            // Appel on-chain batch
+            const rpcUrl = process.env.MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz/';
+            const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+            const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
+            const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
+            const contractABI = [
+                'function batchUpdatePlayerData(address[] players, uint256[] scoreAmounts, uint256[] transactionAmounts)'
+            ];
+            const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
+
+            console.log(`[Monad Games ID][BATCH] Flushing ${players.length} updates...`);
+            const nonce = await getNextNonce(wallet);
+            const tx = await contract.batchUpdatePlayerData(players, scores, txs, {
+                gasLimit: 600000, // batch → plus de gas
+                maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
+                maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+                nonce
+            });
+            console.log(`[Monad Games ID][BATCH] Tx sent: ${tx.hash}`);
+            const receipt = await tx.wait();
+            console.log(`[Monad Games ID][BATCH] Confirmed in block ${receipt.blockNumber} (gasUsed=${receipt.gasUsed.toString()})`);
+
+            // Retirer du buffer les entrées confirmées
+            for (const [addr] of chunk) {
+                batchQueue.delete(addr);
+            }
+        }
+    } catch (err) {
+        console.error('[Monad Games ID][BATCH] Flush error:', err.message || err);
+        // on laisse les données dans la queue pour retry au prochain flush
+    } finally {
+        lastFlushAt = Date.now();
+        isFlushing = false;
+    }
+}
+
+if (ENABLE_MONAD_BATCH) {
+    setInterval(() => {
+        flushBatchIfNeeded();
+        // Sécurité: flush forcé si attente > BATCH_MAX_WAIT_MS
+        if (Date.now() - lastFlushAt > BATCH_MAX_WAIT_MS) {
+            flushBatchIfNeeded(true);
+        }
+    }, Math.min(BATCH_FLUSH_MS, 1000)).unref();
+}
+
 async function getNextNonce(wallet) {
     try {
         // Toujours récupérer le nonce le plus récent depuis la blockchain
@@ -496,44 +587,52 @@ app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth
             console.log(`[ANTI-FARMING] ✅ Wallet vérifié: ${appKitWallet}`);
         }
         
-        const provider = new ethers.providers.JsonRpcProvider('https://testnet-rpc.monad.xyz/');
-        const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
-        
-        const MONAD_GAMES_ID_CONTRACT = "0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0";
-        const contractABI = [
-            "function updatePlayerData(address player, uint256 scoreAmount, uint256 transactionAmount)"
-        ];
-        
-        const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
-        
-        console.log(`[Monad Games ID] Calling updatePlayerData(${playerAddress}, ${scoreAmount}, ${transactionAmount})`);
-        
-        const nonce = await getNextNonce(wallet);
-        
-        const tx = await contract.updatePlayerData(playerAddress, scoreAmount, transactionAmount, {
-            gasLimit: 150000, // Augmenté pour plus de sécurité
-            maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'), // 2 gwei priority fee
-            maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'), // 100 gwei pour être sûr d'être inclus
-            nonce: nonce
-        });
-        
-        console.log(`[Monad Games ID] Transaction sent: ${tx.hash}`);
-        
-        const receipt = await tx.wait();
-        console.log(`[Monad Games ID] Transaction confirmed in block ${receipt.blockNumber}`);
-        console.log(`[Monad Games ID] Gas used: ${receipt.gasUsed.toString()}`);
-        
-        res.json({ 
-            success: true, 
-            transactionHash: tx.hash, 
-            blockNumber: receipt.blockNumber, 
-            gasUsed: receipt.gasUsed.toString(),
-            playerAddress, 
-            scoreAmount, 
-            transactionAmount, 
-            actionType,
-            message: "Score submitted to Monad Games ID contract"
-        });
+        if (ENABLE_MONAD_BATCH) {
+            enqueuePlayerUpdate(playerAddress, scoreAmount, transactionAmount);
+            // Feedback immédiat pour l'UX
+            return res.json({ 
+                success: true, 
+                queued: true,
+                playerAddress,
+                scoreAmount,
+                transactionAmount,
+                actionType
+            });
+        } else {
+            const rpcUrl = process.env.MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz/';
+            const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+            const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
+            const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
+            const contractABI = [
+                'function updatePlayerData(address player, uint256 scoreAmount, uint256 transactionAmount)'
+            ];
+            const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
+
+            console.log(`[Monad Games ID] Calling updatePlayerData(${playerAddress}, ${scoreAmount}, ${transactionAmount})`);
+            const nonce = await getNextNonce(wallet);
+            const tx = await contract.updatePlayerData(playerAddress, scoreAmount, transactionAmount, {
+                gasLimit: 150000,
+                maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
+                maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+                nonce
+            });
+            console.log(`[Monad Games ID] Transaction sent: ${tx.hash}`);
+            const receipt = await tx.wait();
+            console.log(`[Monad Games ID] Transaction confirmed in block ${receipt.blockNumber}`);
+            console.log(`[Monad Games ID] Gas used: ${receipt.gasUsed.toString()}`);
+            
+            return res.json({ 
+                success: true, 
+                transactionHash: tx.hash, 
+                blockNumber: receipt.blockNumber, 
+                gasUsed: receipt.gasUsed.toString(),
+                playerAddress, 
+                scoreAmount, 
+                transactionAmount, 
+                actionType,
+                message: 'Score submitted to Monad Games ID contract'
+            });
+        }
         
     } catch (error) {
         console.error('[Monad Games ID] Error:', error);
