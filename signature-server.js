@@ -2,80 +2,53 @@ const express = require('express');
 const { ethers } = require('ethers');
 const cors = require('cors');
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
+const admin = require('firebase-admin');
 
 const app = express();
+app.use(express.json());
+app.use(cors());
 
-app.use(express.json({ limit: '10mb' })); // Limite de taille pour éviter les attaques
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use(cors({
-    origin: [
-        'https://chogtanks.vercel.app',
-        'https://redgnad.github.io', 
-        'https://monadclip.com', 
-        'https://*.monadclip.com'
-    ],
-    credentials: true
-}));
-
-// Rate limiting global pour éviter le spam
-const requestCounts = new Map();
-const GLOBAL_RATE_LIMIT = 100; // 100 req/min par IP
-const RATE_WINDOW = 60000; // 1 minute
-
-// ALCHEMY PROTECTION: Éviter de dépasser les limites gratuites
-const alchemyUsage = { count: 0, resetTime: Date.now() + 60000 }; // Reset chaque minute
-const ALCHEMY_FREE_LIMIT = 270; // 270 req/min (300 - 30 marge conservatrice)
-
-app.use((req, res, next) => {
-    const clientIP = req.ip || req.connection.remoteAddress;
-    const now = Date.now();
-    
-    if (!requestCounts.has(clientIP)) {
-        requestCounts.set(clientIP, { count: 1, resetTime: now + RATE_WINDOW });
-    } else {
-        const data = requestCounts.get(clientIP);
-        if (now < data.resetTime) {
-            if (data.count >= GLOBAL_RATE_LIMIT) {
-                return res.status(429).json({ error: 'Too many requests' });
-            }
-            data.count++;
-        } else {
-            requestCounts.set(clientIP, { count: 1, resetTime: now + RATE_WINDOW });
-        }
-    }
-    
-    next();
-});
-
-// ALCHEMY PROTECTION: Middleware pour éviter de dépasser les limites
-app.use((req, res, next) => {
-    // Seulement pour les endpoints qui utilisent Alchemy
-    if (req.path.includes('/api/monad-games-id/') || req.path.includes('/api/validate-score')) {
-        const now = Date.now();
-        
-        // Reset counter chaque minute
-        if (now > alchemyUsage.resetTime) {
-            alchemyUsage.count = 0;
-            alchemyUsage.resetTime = now + 60000;
-        }
-        
-        // Vérifier la limite
-        if (alchemyUsage.count >= ALCHEMY_FREE_LIMIT) {
-            console.warn(`[ALCHEMY] ⚠️ Approaching free tier limit: ${alchemyUsage.count}/${ALCHEMY_FREE_LIMIT}`);
-            return res.status(429).json({ 
-                error: 'Service temporarily unavailable',
-                message: 'Too many requests, please try again later',
-                retryAfter: Math.ceil((alchemyUsage.resetTime - now) / 1000)
-            });
-        }
-        
-        alchemyUsage.count++;
-    }
-    
-    next();
-});
+// ===== METRICS LÉGÈRES EN MÉMOIRE =====
+const metrics = {
+    authSuccess: 0,
+    authFailure: 0,
+    mintRequests: 0,
+    evolveRequests: 0,
+    onchainInternalCalls: 0,
+    onchainForbidden: 0,
+    onchainDryRuns: 0,
+    firebaseSubmit: 0,
+    firebaseRead: 0
+};
 
 const port = process.env.PORT || 3001;
+
+// ===== FIREBASE ADMIN SDK =====
+if (!admin.apps.length) {
+    try {
+        const serviceAccount = {
+            type: "service_account",
+            project_id: process.env.FIREBASE_PROJECT_ID,
+            private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+            private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+            client_email: process.env.FIREBASE_CLIENT_EMAIL,
+            client_id: process.env.FIREBASE_CLIENT_ID,
+            auth_uri: "https://accounts.google.com/o/oauth2/auth",
+            token_uri: "https://oauth2.googleapis.com/token",
+            auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+            client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
+        };
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount),
+            projectId: process.env.FIREBASE_PROJECT_ID
+        });
+        console.log('[FIREBASE] ✅ Admin SDK initialisé');
+    } catch (e) {
+        console.warn('[FIREBASE] ⚠️ Admin SDK non initialisé:', e.message);
+    }
+}
 
 // Démarrage en mode dégradé si la clé n'est pas présente: ne pas quitter, garder /health up
 let gameWallet = null;
@@ -94,35 +67,214 @@ function requireWallet(req, res, next) {
     next();
 }
 
-// Health check endpoint pour monitoring (optimisé pour cron-job)
-app.get('/health', (req, res) => {
-    // Log minimal seulement si problème
-    if (!gameWallet) {
-        console.error('[HEALTH] ❌ Game wallet not configured');
+// ===== Auth Firebase (ID token) =====
+async function verifyFirebaseIdTokenFromRequest(req) {
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!token) return null;
+    try {
+        const decoded = await admin.auth().verifyIdToken(token);
+        return decoded && decoded.uid ? decoded.uid : null;
+    } catch (e) {
+        return null;
     }
-    
+}
+
+async function requireFirebaseAuth(req, res, next) {
+    const hasAuth = Boolean((req.headers['authorization'] || '').startsWith('Bearer '));
+    console.log(`[AUTH] Authorization header present: ${hasAuth}`);
+    const uid = await verifyFirebaseIdTokenFromRequest(req);
+    if (!uid) {
+        console.warn('[AUTH] ❌ Firebase ID token invalid or missing');
+        metrics.authFailure++;
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    req.uid = uid;
+    console.log(`[AUTH] ✅ Firebase UID resolved: ${uid}`);
+    metrics.authSuccess++;
+    next();
+}
+
+// Vérifie que le wallet appartient au UID (Firestore WalletScores)
+async function assertWalletBelongsToUid(walletAddress, uid) {
+    if (!admin.apps.length) {
+        console.warn('[AUTH] ⚠️ Firebase Admin not initialized, cannot verify wallet ownership');
+        return { ok: false, reason: 'admin_not_initialized' };
+    }
+    if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress || '')) {
+        return { ok: false, reason: 'invalid_wallet' };
+    }
+    const db = admin.firestore();
+    const normalized = walletAddress.toLowerCase();
+    const docRef = db.collection('WalletScores').doc(normalized);
+    const doc = await docRef.get();
+    if (!doc.exists) {
+        console.warn(`[AUTH] ❌ Wallet not linked in WalletScores: ${walletAddress}`);
+        return { ok: false, reason: 'wallet_not_linked' };
+    }
+    const data = doc.data() || {};
+    if (data.uid !== uid) {
+        console.warn(`[AUTH] ❌ UID mismatch for wallet ${walletAddress} (expected ${data.uid}, got ${uid})`);
+        return { ok: false, reason: 'uid_mismatch' };
+    }
+    return { ok: true };
+}
+
+// ===== Header interne requis pour appels on-chain =====
+function requireInternalJob(req, res, next) {
+    const header = req.headers['x-internal-job'];
+    const secret = process.env.INTERNAL_JOB_SECRET;
+    if (!secret) {
+        console.error('[SECURITY] INTERNAL_JOB_SECRET non défini');
+        return res.status(503).json({ error: 'Server misconfigured' });
+    }
+    const ok = typeof header === 'string' && header === secret;
+    console.log(`[SECURITY] Internal job header valid: ${ok}`);
+    if (!ok) {
+        metrics.onchainForbidden++;
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    next();
+}
+
+// Health check endpoint pour monitoring
+app.get('/health', (req, res) => {
     res.status(200).json({ 
         status: 'OK', 
         timestamp: new Date().toISOString(),
         uptime: Math.floor(process.uptime()),
         version: '2.0.0',
         walletReady: Boolean(gameWallet),
-        rpc: 'Alchemy Monad Testnet',
-        contract: '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0'
+        dryRunOnchain: process.env.DRY_RUN_ONCHAIN === 'true'
     });
 });
-
-// Supporte aussi la méthode HEAD sur /health (pour cron-job)
+// Supporte aussi la méthode HEAD sur /health
 app.head('/health', (req, res) => res.sendStatus(200));
 
-app.post('/api/mint-authorization', requireWallet, async (req, res) => {
+// ===== FIREBASE SCORE READ ENDPOINT =====
+// Lecture sécurisée du score (serveur -> Firestore via Admin SDK)
+app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res) => {
+  try {
+    const { walletAddress } = req.params;
+    if (!walletAddress || !/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
+      return res.status(400).json({ error: 'Invalid wallet address format' });
+    }
+
+    if (!admin.apps.length) {
+      return res.status(503).json({ error: 'Score read service unavailable' });
+    }
+
+    const normalizedAddress = walletAddress.toLowerCase();
+    const db = admin.firestore();
+    const docRef = db.collection('WalletScores').doc(normalizedAddress);
+    const doc = await docRef.get();
+
+    if (!doc.exists) {
+      return res.json({ walletAddress: normalizedAddress, score: 0, nftLevel: 0, isNew: true });
+    }
+
+    const data = doc.data();
+    const score = Number(data.score || 0);
+    const nftLevel = Number(data.nftLevel || 0);
+    // Metrics
+    if (typeof metrics !== 'undefined') { metrics.firebaseRead++; }
+    return res.json({ walletAddress: normalizedAddress, score, nftLevel, isNew: false });
+  } catch (error) {
+    console.error('[FIREBASE-READ] ❌ Error:', error);
+    res.status(500).json({ error: 'Failed to read score', details: error.message });
+  }
+});
+
+// ===== FIREBASE SCORE SUBMIT ENDPOINT =====
+// Soumission sécurisée du score depuis le client (auth Firebase requise)
+app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async (req, res) => {
+  try {
+    const { walletAddress, score, bonus, matchId } = req.body || {};
+    if (!walletAddress || typeof score === 'undefined' || !matchId) {
+      return res.status(400).json({ error: 'Missing required parameters: walletAddress, score, matchId' });
+    }
+    if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
+      return res.status(400).json({ error: 'Invalid wallet address format' });
+    }
+    const normalized = walletAddress.toLowerCase();
+    const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
+    if (totalScore < 0 || totalScore > 1000) {
+      return res.status(403).json({ error: 'Score out of reasonable range (0-1000)' });
+    }
+
+    if (!admin.apps.length) {
+      return res.status(503).json({ error: 'Score submit service unavailable' });
+    }
+
+    const db = admin.firestore();
+    const docRef = db.collection('WalletScores').doc(normalized);
+    await db.runTransaction(async (tx) => {
+      const snap = await tx.get(docRef);
+      if (!snap.exists) {
+        tx.set(docRef, {
+          score: totalScore,
+          nftLevel: 0,
+          walletAddress: normalized,
+          uid: req.uid,
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          matchId: matchId,
+          validatedBy: 'server'
+        });
+      } else {
+        const data = snap.data() || {};
+        const currentScore = Number(data.score || 0);
+        tx.update(docRef, {
+          score: currentScore + totalScore,
+          walletAddress: normalized,
+          uid: req.uid,
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+          matchId: matchId,
+          validatedBy: 'server'
+        });
+      }
+    });
+
+    if (typeof metrics !== 'undefined') { metrics.firebaseSubmit++; }
+    return res.json({ success: true, walletAddress: normalized, score: totalScore, matchId });
+  } catch (error) {
+    console.error('[FIREBASE-SUBMIT] ❌ Error:', error);
+    res.status(500).json({ error: 'Failed to submit score', details: error.message });
+  }
+});
+
+// Expose métriques légères
+app.get('/metrics-lite', (req, res) => {
+    res.status(200).json({ metrics });
+});
+
+app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
-        const { playerAddress, mintCost } = req.body;
+        const playerAddress = req.body.playerAddress || req.body.walletAddress;
+        let { mintCost } = req.body;
         
-        if (!playerAddress || !mintCost) {
-            return res.status(400).json({ error: "Adresse du joueur et coût de mint requis" });
+        console.log(`[MINT-AUTH] Request by uid=${req.uid}, player=${playerAddress}, cost=${mintCost}`);
+        metrics.mintRequests++;
+
+        if (!playerAddress) {
+            return res.status(400).json({ error: "Adresse du joueur requise" });
+        }
+
+        const ownership = await assertWalletBelongsToUid(playerAddress, req.uid);
+        if (!ownership.ok) {
+            return res.status(403).json({ error: 'Wallet not linked to user', reason: ownership.reason });
         }
         
+        // Déterminer le coût de mint côté serveur si non fourni
+        const defaultMintCostWei = process.env.DEFAULT_MINT_COST_WEI || '1000000000000000';
+        try {
+            mintCost = mintCost ?? defaultMintCostWei;
+            // Valider format (BigNumber parsable)
+            ethers.BigNumber.from(mintCost);
+        } catch {
+            return res.status(400).json({ error: 'Invalid mintCost format' });
+        }
+
         const message = ethers.utils.solidityKeccak256(
             ['address', 'uint256'],
             [playerAddress, mintCost]
@@ -146,17 +298,43 @@ app.post('/api/mint-authorization', requireWallet, async (req, res) => {
 
 app.post('/api/evolve-authorization', requireWallet, async (req, res) => {
     try {
-        const { playerAddress, tokenId, targetLevel } = req.body;
+        // COMPATIBILITÉ: Accepter ancien format (walletAddress) ET nouveau (playerAddress)
+        const playerAddress = req.body.playerAddress || req.body.walletAddress;
+        const tokenId = Number(req.body.tokenId || req.body.tokenID || 0);
+        const targetLevel = Number(req.body.targetLevel || req.body.level || 0);
         
+        console.log(`[EVOLVE-AUTH] Request body:`, req.body);
+        console.log(`[EVOLVE-AUTH] Parsed -> player=${playerAddress}, tokenId=${tokenId}, targetLevel=${targetLevel}`);
+        metrics.evolveRequests++;
+
         if (!playerAddress || !tokenId || !targetLevel) {
             return res.status(400).json({ error: "Adresse du joueur, ID du token et niveau cible requis" });
         }
+
+        // AUTH FIREBASE OPTIONNELLE pour compatibilité ancien build
+        const authHeader = req.headers['authorization'] || '';
+        const hasFirebaseAuth = authHeader.startsWith('Bearer ');
+        console.log(`[EVOLVE-AUTH] Firebase auth present: ${hasFirebaseAuth}`);
         
+        if (hasFirebaseAuth) {
+            const uid = await verifyFirebaseIdTokenFromRequest(req);
+            if (uid) {
+                req.uid = uid;
+                const ownership = await assertWalletBelongsToUid(playerAddress, uid);
+                if (!ownership.ok) {
+                    console.warn(`[EVOLVE-AUTH] Wallet ownership check failed: ${ownership.reason}`);
+                    // Continue sans bloquer pour compatibilité
+                }
+            }
+        }
+        
+        // COÛTS ÉTENDUS (inclut niveau 5 = 300 points)
         const evolutionCosts = {
             1: 50,   // Level 0 -> 1
             2: 100,  // Level 1 -> 2
             3: 150,  // Level 2 -> 3
-            4: 200   // Level 3 -> 4
+            4: 200,  // Level 3 -> 4
+            5: 300   // Level 4 -> 5 (NOUVEAU)
         };
         
         const requiredPoints = evolutionCosts[targetLevel];
@@ -170,9 +348,9 @@ app.post('/api/evolve-authorization', requireWallet, async (req, res) => {
             [playerAddress, tokenId, targetLevel, requiredPoints]
         );
         
-    const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
+        const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
         
-        console.log(`Autorisation d'évolution générée pour ${playerAddress}, token ${tokenId} vers niveau ${targetLevel}`);
+        console.log(`Autorisation d'évolution générée pour ${playerAddress}, token ${tokenId} vers niveau ${targetLevel} (${requiredPoints} points)`);
         
         res.json({
             signature: signature,
@@ -187,8 +365,7 @@ app.post('/api/evolve-authorization', requireWallet, async (req, res) => {
 });
 
 // Anti-farming: Stockage persistant des liaisons wallet
-const fs = require('fs');
-const path = require('path');
+// (fs/path déjà importés en haut)
 
 const WALLET_BINDINGS_FILE = path.join(__dirname, 'wallet-bindings.json');
 
@@ -218,123 +395,6 @@ function saveWalletBindings(bindings) {
 const walletBindings = loadWalletBindings();
 console.log(`[ANTI-FARMING] ${walletBindings.size} liaisons chargées depuis ${WALLET_BINDINGS_FILE}`);
 
-// SECURITY: Rate limiting pour éviter le spam de scores
-const scoreRateLimit = new Map(); // wallet -> { count, resetTime }
-const SCORE_RATE_LIMIT = 10; // max 10 soumissions par minute
-const SCORE_RATE_WINDOW = 60000; // 1 minute
-
-// SECURITY: Validation des scores
-const MAX_REASONABLE_SCORE = 1000; // Score maximum raisonnable par match
-const MIN_SCORE_INTERVAL = 5000; // Minimum 5 secondes entre soumissions
-const lastScoreSubmission = new Map(); // wallet -> timestamp
-
-// ANTI-BOT: Détection de comportements suspects
-const botDetection = new Map(); // IP -> { count, lastActivity, suspicious }
-const BOT_THRESHOLD = 20; // 20 requêtes en 1 minute = suspect
-const BOT_BAN_DURATION = 300000; // 5 minutes de ban
-const suspiciousIPs = new Set(); // IPs bannies temporairement
-
-// SECURITY: Fonction de validation des scores
-function validateScoreSubmission(walletAddress, scoreAmount, transactionAmount) {
-    const now = Date.now();
-    
-    // 1. Rate limiting
-    const rateLimitData = scoreRateLimit.get(walletAddress);
-    if (rateLimitData) {
-        if (now < rateLimitData.resetTime) {
-            if (rateLimitData.count >= SCORE_RATE_LIMIT) {
-                console.error(`[SECURITY] 🚫 Rate limit exceeded for ${walletAddress}: ${rateLimitData.count}/${SCORE_RATE_LIMIT}`);
-                return { valid: false, reason: "Rate limit exceeded" };
-            }
-            rateLimitData.count++;
-        } else {
-            scoreRateLimit.set(walletAddress, { count: 1, resetTime: now + SCORE_RATE_WINDOW });
-        }
-    } else {
-        scoreRateLimit.set(walletAddress, { count: 1, resetTime: now + SCORE_RATE_WINDOW });
-    }
-    
-    // 2. Validation du score
-    if (scoreAmount < 0 || scoreAmount > MAX_REASONABLE_SCORE) {
-        console.error(`[SECURITY] 🚫 Invalid score amount: ${scoreAmount} for ${walletAddress}`);
-        return { valid: false, reason: "Invalid score amount" };
-    }
-    
-    // 3. Validation des transactions
-    if (transactionAmount < 0 || transactionAmount > 100) {
-        console.error(`[SECURITY] 🚫 Invalid transaction amount: ${transactionAmount} for ${walletAddress}`);
-        return { valid: false, reason: "Invalid transaction amount" };
-    }
-    
-    // 4. Intervalle minimum entre soumissions
-    const lastSubmission = lastScoreSubmission.get(walletAddress);
-    if (lastSubmission && (now - lastSubmission) < MIN_SCORE_INTERVAL) {
-        console.error(`[SECURITY] 🚫 Too frequent submissions for ${walletAddress}: ${now - lastSubmission}ms`);
-        return { valid: false, reason: "Too frequent submissions" };
-    }
-    
-    lastScoreSubmission.set(walletAddress, now);
-    
-    console.log(`[SECURITY] ✅ Score validation passed for ${walletAddress}: score=${scoreAmount}, tx=${transactionAmount}`);
-    return { valid: true };
-}
-
-// ANTI-BOT: Fonction de détection de bots
-function detectBotBehavior(clientIP, userAgent, req) {
-    const now = Date.now();
-    
-    // Vérifier si IP est bannie
-    if (suspiciousIPs.has(clientIP)) {
-        console.error(`[ANTI-BOT] 🚫 Banned IP attempting access: ${clientIP}`);
-        return { isBot: true, reason: "IP temporarily banned" };
-    }
-    
-    // Détecter patterns suspects
-    const suspiciousPatterns = [
-        /bot/i, /crawler/i, /spider/i, /scraper/i,
-        /curl/i, /wget/i, /python/i, /java/i,
-        /postman/i, /insomnia/i, /httpie/i
-    ];
-    
-    if (userAgent && suspiciousPatterns.some(pattern => pattern.test(userAgent))) {
-        console.error(`[ANTI-BOT] 🤖 Suspicious user agent: ${userAgent}`);
-        return { isBot: true, reason: "Suspicious user agent" };
-    }
-    
-    // Détecter requêtes trop rapides
-    if (!botDetection.has(clientIP)) {
-        botDetection.set(clientIP, { count: 1, lastActivity: now, suspicious: false });
-    } else {
-        const data = botDetection.get(clientIP);
-        const timeDiff = now - data.lastActivity;
-        
-        if (timeDiff < 1000) { // Moins d'1 seconde entre requêtes
-            data.count++;
-            if (data.count > BOT_THRESHOLD) {
-                data.suspicious = true;
-                suspiciousIPs.add(clientIP);
-                console.error(`[ANTI-BOT] 🚫 Bot detected: ${clientIP} - ${data.count} requests in ${timeDiff}ms`);
-                
-                // Auto-unban après 5 minutes
-                setTimeout(() => {
-                    suspiciousIPs.delete(clientIP);
-                    botDetection.delete(clientIP);
-                    console.log(`[ANTI-BOT] ✅ IP unbanned: ${clientIP}`);
-                }, BOT_BAN_DURATION);
-                
-                return { isBot: true, reason: "Too many requests too fast" };
-            }
-        } else {
-            // Reset counter si plus d'1 seconde
-            data.count = 1;
-        }
-        
-        data.lastActivity = now;
-    }
-    
-    return { isBot: false };
-}
-
 async function getNextNonce(wallet) {
     try {
         // Toujours récupérer le nonce le plus récent depuis la blockchain
@@ -347,44 +407,18 @@ async function getNextNonce(wallet) {
     }
 }
 
-app.post('/api/monad-games-id/update-player', requireWallet, async (req, res) => {
-    const startTime = Date.now();
-    const clientIP = req.ip || req.connection.remoteAddress;
-    const userAgent = req.get('User-Agent');
-    
+app.post('/api/monad-games-id/update-player', requireWallet, requireInternalJob, async (req, res) => {
     try {
-        // ANTI-BOT: Détection de comportement suspect
-        const botCheck = detectBotBehavior(clientIP, userAgent, req);
-        if (botCheck.isBot) {
-            console.error(`[ANTI-BOT] 🚫 Bot blocked: ${clientIP} - ${botCheck.reason}`);
-            return res.status(403).json({ 
-                error: "Bot detected", 
-                reason: botCheck.reason 
-            });
-        }
-        
         const { playerAddress, appKitWallet, scoreAmount, transactionAmount, actionType } = req.body;
         
-        console.log(`[Monad Games ID] 🚀 NEW REQUEST - ${new Date().toISOString()}`);
-        console.log(`[Monad Games ID] Action: ${actionType || 'unknown'}`);
-        console.log(`[Monad Games ID] Player: ${playerAddress}`);
-        console.log(`[Monad Games ID] AppKit Wallet: ${appKitWallet}`);
-        console.log(`[Monad Games ID] Score: ${scoreAmount}, Transactions: ${transactionAmount}`);
-        
         if (!playerAddress || !appKitWallet || scoreAmount === undefined || transactionAmount === undefined) {
-            console.error(`[Monad Games ID] ❌ Missing parameters - Player: ${!!playerAddress}, AppKit: ${!!appKitWallet}, Score: ${scoreAmount}, Tx: ${transactionAmount}`);
             return res.status(400).json({ error: 'Missing required parameters' });
         }
         
-        // SECURITY: Validation des scores avant traitement
-        const validation = validateScoreSubmission(playerAddress, scoreAmount, transactionAmount);
-        if (!validation.valid) {
-            console.error(`[SECURITY] 🚫 Score submission rejected: ${validation.reason}`);
-            return res.status(403).json({ 
-                error: "Score submission rejected", 
-                reason: validation.reason 
-            });
-        }
+        console.log(`[Monad Games ID] 🔐 Internal call received for ${playerAddress}`);
+        metrics.onchainInternalCalls++;
+        console.log(`[Monad Games ID] Score: ${scoreAmount}, Transactions: ${transactionAmount}`);
+        console.log(`[Monad Games ID] AppKit wallet: ${appKitWallet}`);
         
         // ANTI-FARMING: Vérifier la liaison des wallets
         const boundWallet = walletBindings.get(playerAddress);
@@ -393,56 +427,58 @@ app.post('/api/monad-games-id/update-player', requireWallet, async (req, res) =>
             // Premier mint/evolution: lier les wallets
             walletBindings.set(playerAddress, appKitWallet);
             saveWalletBindings(walletBindings);
-            console.log(`[ANTI-FARMING] 🔗 NEW BINDING: Privy ${playerAddress} → AppKit ${appKitWallet}`);
+            console.log(`[ANTI-FARMING] 🔗 Liaison créée et sauvegardée: Privy ${playerAddress} → AppKit ${appKitWallet}`);
         } else if (boundWallet !== appKitWallet) {
             // Tentative de farming détectée
-            console.error(`[ANTI-FARMING] 🚫 FARMING ATTEMPT DETECTED!`);
-            console.error(`[ANTI-FARMING] Privy Wallet: ${playerAddress}`);
-            console.error(`[ANTI-FARMING] Bound to: ${boundWallet}`);
-            console.error(`[ANTI-FARMING] Attempting with: ${appKitWallet}`);
+            console.error(`[ANTI-FARMING] 🚫 FARMING DÉTECTÉ!`);
+            console.error(`[ANTI-FARMING] Privy: ${playerAddress}`);
+            console.error(`[ANTI-FARMING] Wallet lié: ${boundWallet}`);
+            console.error(`[ANTI-FARMING] Wallet actuel: ${appKitWallet}`);
             
             return res.status(403).json({ 
                 error: "Wallet farming detected", 
                 details: "This Monad Games ID account is bound to a different AppKit wallet"
             });
         } else {
-            console.log(`[ANTI-FARMING] ✅ Wallet verified: ${appKitWallet}`);
+            console.log(`[ANTI-FARMING] ✅ Wallet vérifié: ${appKitWallet}`);
         }
         
-        console.log(`[RPC] Connecting to Alchemy RPC...`);
-        const provider = new ethers.providers.JsonRpcProvider('https://monad-testnet.g.alchemy.com/v2/JD1BgcAhWzSNu8vHiT1chCKaHUq3kH6-');
+        const rpcUrl = process.env.ALCHEMY_RPC_URL;
+        if (!rpcUrl) {
+            console.error('[RPC] ❌ ALCHEMY_RPC_URL manquante');
+        }
+        const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
         const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
         
         const MONAD_GAMES_ID_CONTRACT = "0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0";
         const contractABI = [
-            "function updatePlayerData(address player, uint256 scoreAmount, uint256 transactionAmount)",
-            "function batchUpdatePlayerData(address[] players, uint256[] scoreAmounts, uint256[] transactionAmounts)"
+            "function updatePlayerData(address player, uint256 scoreAmount, uint256 transactionAmount)"
         ];
         
         const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
         
-        console.log(`[BLOCKCHAIN] Calling updatePlayerData(${playerAddress}, ${scoreAmount}, ${transactionAmount})`);
+        console.log(`[Monad Games ID] Calling updatePlayerData(${playerAddress}, ${scoreAmount}, ${transactionAmount})`);
         
         const nonce = await getNextNonce(wallet);
-        console.log(`[BLOCKCHAIN] Using nonce: ${nonce}`);
-        
+
+        if (process.env.DRY_RUN_ONCHAIN === 'true') {
+            metrics.onchainDryRuns++;
+            console.log(`[BLOCKCHAIN-DRYRUN] updatePlayerData(${playerAddress}, ${scoreAmount}, ${transactionAmount})`);
+            return res.json({ success: true, dryRun: true, playerAddress, scoreAmount, transactionAmount });
+        }
+
         const tx = await contract.updatePlayerData(playerAddress, scoreAmount, transactionAmount, {
-            gasLimit: 150000,
-            maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
-            maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+            gasLimit: 150000, // Augmenté pour plus de sécurité
+            maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'), // 2 gwei priority fee
+            maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'), // 100 gwei pour être sûr d'être inclus
             nonce: nonce
         });
         
-        console.log(`[BLOCKCHAIN] ✅ Transaction sent: ${tx.hash}`);
-        console.log(`[BLOCKCHAIN] Waiting for confirmation...`);
+        console.log(`[Monad Games ID] Transaction sent: ${tx.hash}`);
         
         const receipt = await tx.wait();
-        const duration = Date.now() - startTime;
-        
-        console.log(`[BLOCKCHAIN] ✅ Transaction confirmed in block ${receipt.blockNumber}`);
-        console.log(`[BLOCKCHAIN] Gas used: ${receipt.gasUsed.toString()}`);
-        console.log(`[PERFORMANCE] Total request time: ${duration}ms`);
-        console.log(`[Monad Games ID] 🎉 SUCCESS - Score submitted for ${playerAddress}`);
+        console.log(`[Monad Games ID] Transaction confirmed in block ${receipt.blockNumber}`);
+        console.log(`[Monad Games ID] Gas used: ${receipt.gasUsed.toString()}`);
         
         res.json({ 
             success: true, 
@@ -453,189 +489,21 @@ app.post('/api/monad-games-id/update-player', requireWallet, async (req, res) =>
             scoreAmount, 
             transactionAmount, 
             actionType,
-            duration: duration,
             message: "Score submitted to Monad Games ID contract"
         });
         
     } catch (error) {
-        const duration = Date.now() - startTime;
-        console.error(`[Monad Games ID] ❌ ERROR after ${duration}ms:`, error.message);
-        console.error(`[Monad Games ID] Stack trace:`, error.stack);
-        
-        // Log spécifique pour les erreurs RPC
-        if (error.message.includes('RPC') || error.message.includes('network')) {
-            console.error(`[RPC] Network error detected - check Alchemy connection`);
-        }
-        
+        console.error('[Monad Games ID] Error:', error);
         res.status(500).json({ 
             error: "Failed to submit to Monad Games ID", 
-            details: error.message,
-            duration: duration
-        });
-    }
-});
-
-// SECURITY: Nouvel endpoint pour validation des scores
-app.post('/api/validate-score', requireWallet, async (req, res) => {
-    try {
-        const { playerAddress, scoreAmount, transactionAmount, matchId, timestamp } = req.body;
-        
-        console.log(`[SCORE-VALIDATION] 🔍 Validating score for ${playerAddress}: ${scoreAmount}`);
-        
-        if (!playerAddress || scoreAmount === undefined || transactionAmount === undefined) {
-            return res.status(400).json({ error: 'Missing required parameters' });
-        }
-        
-        // Validation de sécurité
-        const validation = validateScoreSubmission(playerAddress, scoreAmount, transactionAmount);
-        
-        if (!validation.valid) {
-            console.error(`[SCORE-VALIDATION] 🚫 Validation failed: ${validation.reason}`);
-            return res.status(403).json({ 
-                valid: false, 
-                reason: validation.reason 
-            });
-        }
-        
-        // Générer une signature pour valider le score
-        const message = ethers.utils.solidityKeccak256(
-            ['address', 'uint256', 'uint256', 'uint256', 'string'],
-            [playerAddress, scoreAmount, transactionAmount, timestamp || Date.now(), matchId || 'default']
-        );
-        
-        const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
-        
-        console.log(`[SCORE-VALIDATION] ✅ Score validated and signed for ${playerAddress}`);
-        
-        res.json({
-            valid: true,
-            signature: signature,
-            gameServerAddress: gameWallet.address,
-            timestamp: Date.now()
-        });
-        
-    } catch (error) {
-        console.error('[SCORE-VALIDATION] Error:', error);
-        res.status(500).json({ 
-            error: "Score validation failed", 
             details: error.message 
         });
     }
 });
 
-// BATCH UPDATE: Endpoint pour grouper plusieurs mises à jour (économie de gas)
-app.post('/api/monad-games-id/batch-update', requireWallet, async (req, res) => {
-    const startTime = Date.now();
-    const clientIP = req.ip || req.connection.remoteAddress;
-    const userAgent = req.get('User-Agent');
-    
-    try {
-        // ANTI-BOT: Détection de comportement suspect
-        const botCheck = detectBotBehavior(clientIP, userAgent, req);
-        if (botCheck.isBot) {
-            console.error(`[ANTI-BOT] 🚫 Bot blocked: ${clientIP} - ${botCheck.reason}`);
-            return res.status(403).json({ 
-                error: "Bot detected", 
-                reason: botCheck.reason 
-            });
-        }
-        
-        const { updates } = req.body; // Array of {playerAddress, appKitWallet, scoreAmount, transactionAmount, actionType}
-        
-        console.log(`[BATCH-UPDATE] 🚀 Processing ${updates.length} updates`);
-        
-        if (!updates || !Array.isArray(updates) || updates.length === 0) {
-            return res.status(400).json({ error: 'Updates array required' });
-        }
-        
-        if (updates.length > 50) { // Limite de sécurité
-            return res.status(400).json({ error: 'Too many updates (max 50)' });
-        }
-        
-        // Validation de tous les updates
-        const validUpdates = [];
-        for (const update of updates) {
-            const validation = validateScoreSubmission(update.playerAddress, update.scoreAmount, update.transactionAmount);
-            if (validation.valid) {
-                validUpdates.push(update);
-            } else {
-                console.warn(`[BATCH-UPDATE] ⚠️ Skipping invalid update: ${validation.reason}`);
-            }
-        }
-        
-        if (validUpdates.length === 0) {
-            return res.status(400).json({ error: 'No valid updates' });
-        }
-        
-        console.log(`[BATCH-UPDATE] ✅ ${validUpdates.length}/${updates.length} updates valid`);
-        
-        // Préparer les données pour le batch
-        const players = validUpdates.map(u => u.playerAddress);
-        const scoreAmounts = validUpdates.map(u => u.scoreAmount);
-        const transactionAmounts = validUpdates.map(u => u.transactionAmount);
-        
-        const provider = new ethers.providers.JsonRpcProvider('https://monad-testnet.g.alchemy.com/v2/JD1BgcAhWzSNu8vHiT1chCKaHUq3kH6-');
-        const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
-        
-        const MONAD_GAMES_ID_CONTRACT = "0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0";
-        const contractABI = [
-            "function batchUpdatePlayerData(address[] players, uint256[] scoreAmounts, uint256[] transactionAmounts)"
-        ];
-        
-        const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
-        
-        console.log(`[BATCH-UPDATE] Calling batchUpdatePlayerData with ${players.length} players`);
-        
-        const nonce = await getNextNonce(wallet);
-        
-        const tx = await contract.batchUpdatePlayerData(players, scoreAmounts, transactionAmounts, {
-            gasLimit: 500000, // Plus de gas pour le batch
-            maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
-            maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
-            nonce: nonce
-        });
-        
-        console.log(`[BATCH-UPDATE] ✅ Transaction sent: ${tx.hash}`);
-        
-        const receipt = await tx.wait();
-        const duration = Date.now() - startTime;
-        
-        console.log(`[BATCH-UPDATE] ✅ Transaction confirmed in block ${receipt.blockNumber}`);
-        console.log(`[BATCH-UPDATE] Gas used: ${receipt.gasUsed.toString()}`);
-        console.log(`[BATCH-UPDATE] 🎉 SUCCESS - ${players.length} players updated in batch`);
-        
-        res.json({ 
-            success: true, 
-            transactionHash: tx.hash, 
-            blockNumber: receipt.blockNumber, 
-            gasUsed: receipt.gasUsed.toString(),
-            playersUpdated: players.length,
-            duration: duration,
-            message: "Batch update completed successfully"
-        });
-        
-    } catch (error) {
-        const duration = Date.now() - startTime;
-        console.error(`[BATCH-UPDATE] ❌ ERROR after ${duration}ms:`, error.message);
-        res.status(500).json({ 
-            error: "Batch update failed", 
-            details: error.message,
-            duration: duration
-        });
-    }
-});
-
 app.listen(port, () => {
-    console.log(`🚀 ==========================================`);
-    console.log(`🚀 CHOGTANKS SIGNATURE SERVER STARTED`);
-    console.log(`🚀 ==========================================`);
-    console.log(`🚀 Port: ${port}`);
-    console.log(`🚀 Game Server Address: ${gameWallet ? gameWallet.address : 'N/A (no private key)'}`);
-    console.log(`🚀 RPC: Alchemy Monad Testnet`);
-    console.log(`🚀 Contract: 0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0`);
-    console.log(`🚀 Anti-farming: ${walletBindings.size} bindings loaded`);
-    console.log(`🚀 Uptime: ${new Date().toISOString()}`);
-    console.log(`🚀 ==========================================`);
+    console.log(`Signature server running on port ${port}`);
+    console.log(`Game Server Address: ${gameWallet ? gameWallet.address : 'N/A (no private key)'}`);
 });
 
 // Garde-fous contre les crashs silencieux
