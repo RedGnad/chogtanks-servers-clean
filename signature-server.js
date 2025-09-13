@@ -107,6 +107,60 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
     }
 });
 
+// Endpoint pour démarrer un match (compatibilité ancien build)
+app.post('/api/match/start', requireWallet, async (req, res) => {
+    try {
+        console.log(`[MATCH-START] Match start requested`);
+        
+        // Générer un token de match unique
+        const matchToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
+        const expiresInMs = 5 * 60 * 1000; // 5 minutes
+        
+        console.log(`[MATCH-START] Generated match token: ${matchToken}`);
+        
+        return res.json({
+            matchToken: matchToken,
+            expiresInMs: expiresInMs,
+            success: true
+        });
+    } catch (error) {
+        console.error('[MATCH-START] Error:', error);
+        res.status(500).json({ error: 'Failed to start match', details: error.message });
+    }
+});
+
+// Endpoint pour soumettre les scores (compatibilité ancien build)
+app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
+    try {
+        const { walletAddress, score, bonus, matchId } = req.body || {};
+        if (!walletAddress || typeof score === 'undefined') {
+            return res.status(400).json({ error: 'Missing walletAddress or score' });
+        }
+        if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
+            return res.status(400).json({ error: 'Invalid wallet address format' });
+        }
+        
+        const normalized = walletAddress.toLowerCase();
+        const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
+        
+        console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
+        
+        // TODO: Intégrer avec Firebase pour sauvegarder le score
+        // Pour l'instant, juste accepter le score
+        // Retourner success: false pour éviter le problème SendMessage
+        return res.json({
+            success: false,
+            error: 'Score submission temporarily disabled - server processing',
+            walletAddress: normalized,
+            score: totalScore,
+            matchId: matchId || 'legacy'
+        });
+    } catch (error) {
+        console.error('[SUBMIT-SCORE] Error:', error);
+        res.status(500).json({ error: 'Failed to submit score', details: error.message });
+    }
+});
+
 app.post('/api/mint-authorization', requireWallet, async (req, res) => {
     try {
         const { playerAddress, mintCost } = req.body;
