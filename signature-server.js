@@ -298,9 +298,13 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
         console.log(`[MONITORING] 🚀 EVOLVE REQUEST - Wallet: ${playerAddress}, Token: ${tokenId}, Target Level: ${targetLevel}, Cost: ${requiredPoints}, Timestamp: ${new Date().toISOString()}`);
         
         res.json({
-            signature: signature,
+            authorized: true,
+            walletAddress: playerAddress,
+            tokenId: Number(tokenId),
             evolutionCost: requiredPoints,
-            targetLevel: targetLevel
+            targetLevel: Number(targetLevel),
+            nonce: Date.now(),
+            signature: signature
         });
         
     } catch (error) {
