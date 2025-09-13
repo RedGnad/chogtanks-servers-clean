@@ -26,24 +26,53 @@ function requireWallet(req, res, next) {
     next();
 }
 
-// Middleware: exige l'authentification Firebase
+// Middleware: exige et vérifie l'authentification Firebase (côté serveur)
 function requireFirebaseAuth(req, res, next) {
-    // Si FIREBASE_REQUIRE_AUTH n'est pas défini, on skip l'auth (mode permissif)
+    // Mode permissif si non activé explicitement
     if (process.env.FIREBASE_REQUIRE_AUTH !== '1') {
-        console.log('[AUTH] Firebase auth disabled - proceeding without verification');
         return next();
     }
-    
+
     const auth = req.headers.authorization || '';
     if (!auth.startsWith('Bearer ')) {
         return res.status(401).json({ error: 'Missing token' });
     }
-    
-    const token = auth.slice(7);
-    
-    // Pour l'instant, on accepte tous les tokens (à améliorer plus tard)
-    console.log('[AUTH] Firebase token received, proceeding');
-    next();
+    const idToken = auth.slice(7);
+
+    try {
+        const admin = require('firebase-admin');
+        if (!admin.apps.length) {
+            const serviceAccount = {
+                type: "service_account",
+                project_id: process.env.FIREBASE_PROJECT_ID,
+                private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+                private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+                client_email: process.env.FIREBASE_CLIENT_EMAIL,
+                client_id: process.env.FIREBASE_CLIENT_ID,
+                auth_uri: "https://accounts.google.com/o/oauth2/auth",
+                token_uri: "https://oauth2.googleapis.com/token",
+                auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+                client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
+            };
+            admin.initializeApp({
+                credential: admin.credential.cert(serviceAccount),
+                projectId: process.env.FIREBASE_PROJECT_ID
+            });
+        }
+
+        admin.auth().verifyIdToken(idToken)
+            .then((decoded) => {
+                req.firebaseAuth = decoded; // uid, email, etc.
+                return next();
+            })
+            .catch((err) => {
+                console.error('[AUTH] verifyIdToken failed:', err.message || err);
+                return res.status(401).json({ error: 'Invalid token' });
+            });
+    } catch (e) {
+        console.error('[AUTH] Firebase admin init error:', e.message || e);
+        return res.status(500).json({ error: 'Auth service unavailable' });
+    }
 }
 
 // Health check endpoint pour monitoring
@@ -128,7 +157,7 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
 });
 
 // Endpoint pour démarrer un match (compatibilité ancien build)
-app.post('/api/match/start', requireWallet, async (req, res) => {
+app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         console.log(`[MATCH-START] Match start requested`);
         
@@ -150,7 +179,7 @@ app.post('/api/match/start', requireWallet, async (req, res) => {
 });
 
 // Endpoint pour soumettre les scores (compatibilité ancien build)
-app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
+app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { walletAddress, score, bonus, matchId } = req.body || {};
         if (!walletAddress || typeof score === 'undefined') {
