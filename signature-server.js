@@ -239,19 +239,28 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
             return res.status(400).json({ error: "Adresse du joueur et coût de mint requis" });
         }
         
-        const message = ethers.utils.solidityKeccak256(
-            ['address', 'uint256'],
-            [playerAddress, mintCost]
+        const nonce = Date.now();
+        const playerPoints = 0; // Pour le mint, on utilise 0 points comme dans le contrat
+        
+        // Signature attendue par le contrat:
+        // keccak256(abi.encodePacked(msg.sender, playerPoints, nonce, "MINT")).toEthSignedMessageHash()
+        const messageHash = ethers.utils.solidityKeccak256(
+            ['address', 'uint256', 'uint256', 'string'],
+            [playerAddress, playerPoints, nonce, 'MINT']
         );
         
-    const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
+        // Convertir en format EIP-191 comme fait le contrat avec toEthSignedMessageHash()
+        const ethSignedMessageHash = ethers.utils.hashMessage(ethers.utils.arrayify(messageHash));
+        const signature = await gameWallet.signMessage(ethers.utils.arrayify(messageHash));
         
         console.log(`[MINT] ✅ Autorisation de mint générée pour ${playerAddress} avec un coût de ${mintCost}`);
-        console.log(`[MONITORING] 🎯 MINT REQUEST - Wallet: ${playerAddress}, Cost: ${mintCost}, Timestamp: ${new Date().toISOString()}`);
+        console.log(`[MONITORING] 🎯 MINT REQUEST - Wallet: ${playerAddress}, Cost: ${mintCost}, Nonce: ${nonce}, Timestamp: ${new Date().toISOString()}`);
         
         res.json({
             signature: signature,
             mintCost: mintCost,
+            nonce: nonce,
+            authorized: true,
             gameServerAddress: gameWallet.address
         });
         
