@@ -1,5 +1,6 @@
 const express = require('express');
 const { ethers } = require('ethers');
+const { NonceManager } = require('@ethersproject/experimental');
 const cors = require('cors');
 const helmet = require('helmet');
 require('dotenv').config();
@@ -488,8 +489,9 @@ app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth
             console.log(`[ANTI-FARMING] ✅ Wallet vérifié: ${appKitWallet}`);
         }
         
-        const provider = new ethers.providers.JsonRpcProvider('https://testnet-rpc.monad.xyz/');
-        const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
+        const provider = new ethers.providers.JsonRpcProvider(process.env.MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz/');
+        const baseWallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
+        const wallet = new NonceManager(baseWallet);
         
         const MONAD_GAMES_ID_CONTRACT = "0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0";
         const contractABI = [
@@ -500,13 +502,11 @@ app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth
         
         console.log(`[Monad Games ID] Calling updatePlayerData(${playerAddress}, ${scoreAmount}, ${transactionAmount})`);
         
-        const nonce = await getNextNonce(wallet);
-        
         const tx = await contract.updatePlayerData(playerAddress, scoreAmount, transactionAmount, {
             gasLimit: 150000, // Augmenté pour plus de sécurité
             maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'), // 2 gwei priority fee
-            maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'), // 100 gwei pour être sûr d'être inclus
-            nonce: nonce
+            maxFeePerGas: ethers.utils.parseUnits('100', 'gwei') // 100 gwei pour être sûr d'être inclus
+            // Nonce géré automatiquement par NonceManager
         });
         
         console.log(`[Monad Games ID] Transaction sent: ${tx.hash}`);
