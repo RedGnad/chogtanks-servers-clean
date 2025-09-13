@@ -158,6 +158,28 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
     }
 });
 
+// Endpoint pour démarrer un match (compatibilité ancien build)
+app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res) => {
+    try {
+        console.log(`[MATCH-START] Match start requested by UID: ${req.uid}`);
+        
+        // Générer un token de match unique
+        const matchToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
+        const expiresInMs = 5 * 60 * 1000; // 5 minutes
+        
+        console.log(`[MATCH-START] Generated match token: ${matchToken}`);
+        
+        return res.json({
+            matchToken: matchToken,
+            expiresInMs: expiresInMs,
+            success: true
+        });
+    } catch (error) {
+        console.error('[MATCH-START] Error:', error);
+        res.status(500).json({ error: 'Failed to start match', details: error.message });
+    }
+});
+
 // Endpoint pour soumettre les scores (compatibilité ancien build)
 app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
