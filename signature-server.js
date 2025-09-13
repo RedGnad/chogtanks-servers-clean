@@ -26,57 +26,6 @@ function requireWallet(req, res, next) {
     next();
 }
 
-// Middleware: Auth Firebase optionnelle (pour compatibilité)
-async function requireFirebaseAuth(req, res, next) {
-    // Si FIREBASE_REQUIRE_AUTH n'est pas défini, on skip l'auth (mode permissif)
-    if (process.env.FIREBASE_REQUIRE_AUTH !== '1') {
-        console.log('[AUTH] Firebase auth disabled - proceeding without verification');
-        return next();
-    }
-    
-    // Si Firebase n'est pas configuré, on skip aussi
-    if (!process.env.FIREBASE_PROJECT_ID || !process.env.FIREBASE_CLIENT_EMAIL || !process.env.FIREBASE_PRIVATE_KEY) {
-        console.log('[AUTH] Firebase not configured - proceeding without verification');
-        return next();
-    }
-    
-    try {
-        const admin = require('firebase-admin');
-        if (!admin.apps.length) {
-            const serviceAccount = {
-                type: "service_account",
-                project_id: process.env.FIREBASE_PROJECT_ID,
-                private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-                private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-                client_email: process.env.FIREBASE_CLIENT_EMAIL,
-                client_id: process.env.FIREBASE_CLIENT_ID,
-                auth_uri: "https://accounts.google.com/o/oauth2/auth",
-                token_uri: "https://oauth2.googleapis.com/token",
-                auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-                client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
-            };
-            admin.initializeApp({
-                credential: admin.credential.cert(serviceAccount),
-                projectId: process.env.FIREBASE_PROJECT_ID
-            });
-        }
-        
-        const authHeader = req.headers['authorization'] || '';
-        if (!authHeader.startsWith('Bearer ')) {
-            return res.status(401).json({ error: 'Missing Firebase ID token' });
-        }
-        
-        const token = authHeader.slice(7);
-        const decoded = await admin.auth().verifyIdToken(token);
-        req.uid = decoded.uid;
-        console.log(`[AUTH] ✅ Firebase UID verified: ${req.uid}`);
-        next();
-    } catch (error) {
-        console.warn(`[AUTH] ❌ Firebase auth failed: ${error.message}`);
-        return res.status(401).json({ error: 'Invalid Firebase ID token' });
-    }
-}
-
 // Health check endpoint pour monitoring
 app.get('/health', (req, res) => {
     res.status(200).json({ 
@@ -159,9 +108,9 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
 });
 
 // Endpoint pour démarrer un match (compatibilité ancien build)
-app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/match/start', requireWallet, async (req, res) => {
     try {
-        console.log(`[MATCH-START] Match start requested by UID: ${req.uid}`);
+        console.log(`[MATCH-START] Match start requested`);
         
         // Générer un token de match unique
         const matchToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -181,7 +130,7 @@ app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res
 });
 
 // Endpoint pour soumettre les scores (compatibilité ancien build)
-app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
     try {
         const { walletAddress, score, bonus, matchId } = req.body || {};
         if (!walletAddress || typeof score === 'undefined') {
@@ -195,7 +144,6 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
         
         console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
-        console.log(`[SUBMIT-SCORE] Firebase UID: ${req.uid}`);
         
         // TODO: Intégrer avec Firebase pour sauvegarder le score
         // Pour l'instant, juste accepter le score
@@ -212,7 +160,7 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
     }
 });
 
-app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/mint-authorization', requireWallet, async (req, res) => {
     try {
         const { playerAddress, mintCost } = req.body;
         
@@ -241,7 +189,7 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
     }
 });
 
-app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/evolve-authorization', requireWallet, async (req, res) => {
     try {
         const { playerAddress, tokenId, targetLevel } = req.body;
         
@@ -332,7 +280,7 @@ async function getNextNonce(wallet) {
     }
 }
 
-app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/monad-games-id/update-player', requireWallet, async (req, res) => {
     try {
         const { playerAddress, appKitWallet, scoreAmount, transactionAmount, actionType } = req.body;
         
