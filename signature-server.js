@@ -281,14 +281,35 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
             10: 800 // Level 9 -> 10
         };
         
-        const requiredPoints = evolutionCosts[targetLevel];
+        // Optionnel: vérifier on-chain pour dériver le niveau courant et la propriété
+        let numericTokenId = Number(tokenId);
+        let numericTargetLevel = Number(targetLevel);
+        let requiredPoints = evolutionCosts[numericTargetLevel];
+
+        try {
+            const provider = new ethers.providers.JsonRpcProvider('https://testnet-rpc.monad.xyz/');
+            const contractAddress = '0x04223adab3a0c1a2e8aade678bebd3fddd580a38';
+            const abi = [
+                'function ownerOf(uint256 tokenId) view returns (address)',
+                'function getLevel(uint256 tokenId) view returns (uint256)'
+            ];
+            const contract = new ethers.Contract(contractAddress, abi, provider);
+            const owner = await contract.ownerOf(numericTokenId);
+            if (owner.toLowerCase() !== playerAddress.toLowerCase()) {
+                return res.status(403).json({ error: 'Not your NFT' });
+            }
+            const onchainLevel = Number(await contract.getLevel(numericTokenId));
+            // Calculer target à partir de l'état on-chain pour éviter toute dérive client
+            numericTargetLevel = onchainLevel + 1;
+            requiredPoints = evolutionCosts[numericTargetLevel];
+        } catch (chainErr) {
+            console.warn('[EVOLVE] On-chain read failed, using client-provided targetLevel:', chainErr?.message || chainErr);
+        }
         
         if (!requiredPoints) {
             return res.status(400).json({ error: "Niveau cible invalide" });
         }
         const pointsForSig = Number(playerPoints);
-        const numericTokenId = Number(tokenId);
-        const numericTargetLevel = Number(targetLevel);
         const nonce = Date.now();
 
         // Signature attendue par le contrat:
