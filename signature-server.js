@@ -47,9 +47,54 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
             return res.status(400).json({ error: 'Invalid wallet address format' });
         }
         
-        // Pour l'instant, retourner des valeurs par défaut
-        // TODO: Intégrer avec Firebase si nécessaire
         const normalizedAddress = walletAddress.toLowerCase();
+        
+        // Essayer de récupérer depuis Firebase si configuré
+        if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+            try {
+                const admin = require('firebase-admin');
+                if (!admin.apps.length) {
+                    const serviceAccount = {
+                        type: "service_account",
+                        project_id: process.env.FIREBASE_PROJECT_ID,
+                        private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+                        private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+                        client_email: process.env.FIREBASE_CLIENT_EMAIL,
+                        client_id: process.env.FIREBASE_CLIENT_ID,
+                        auth_uri: "https://accounts.google.com/o/oauth2/auth",
+                        token_uri: "https://oauth2.googleapis.com/token",
+                        auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+                        client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
+                    };
+                    admin.initializeApp({
+                        credential: admin.credential.cert(serviceAccount),
+                        projectId: process.env.FIREBASE_PROJECT_ID
+                    });
+                }
+                
+                const db = admin.firestore();
+                const docRef = db.collection('WalletScores').doc(normalizedAddress);
+                const doc = await docRef.get();
+                
+                if (doc.exists) {
+                    const data = doc.data();
+                    const score = Number(data.score || 0);
+                    const nftLevel = Number(data.nftLevel || 0);
+                    console.log(`[GET-SCORE] Firebase data found: score=${score}, level=${nftLevel}`);
+                    return res.json({ 
+                        walletAddress: normalizedAddress, 
+                        score: score, 
+                        nftLevel: nftLevel, 
+                        isNew: false 
+                    });
+                }
+            } catch (firebaseError) {
+                console.warn('[GET-SCORE] Firebase read failed:', firebaseError.message);
+            }
+        }
+        
+        // Fallback: valeurs par défaut si Firebase non configuré ou erreur
+        console.log(`[GET-SCORE] Using fallback values for ${normalizedAddress}`);
         return res.json({ 
             walletAddress: normalizedAddress, 
             score: 0, 
