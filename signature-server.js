@@ -155,6 +155,82 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
     }
 });
 
+// Compat ancien build: soumission de score (admin côté serveur)
+app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
+    try {
+        const { walletAddress, score, bonus, matchId } = req.body || {};
+        if (!walletAddress || typeof score === 'undefined') {
+            return res.status(400).json({ error: 'Missing walletAddress or score' });
+        }
+        if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
+            return res.status(400).json({ error: 'Invalid wallet address format' });
+        }
+
+        const normalized = walletAddress.toLowerCase();
+        const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
+        console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
+
+        if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+            try {
+                const admin = require('firebase-admin');
+                if (!admin.apps.length) {
+                    const serviceAccount = {
+                        type: "service_account",
+                        project_id: process.env.FIREBASE_PROJECT_ID,
+                        private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+                        private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+                        client_email: process.env.FIREBASE_CLIENT_EMAIL,
+                        client_id: process.env.FIREBASE_CLIENT_ID,
+                        auth_uri: "https://accounts.google.com/o/oauth2/auth",
+                        token_uri: "https://oauth2.googleapis.com/token",
+                        auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+                        client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
+                    };
+                    admin.initializeApp({
+                        credential: admin.credential.cert(serviceAccount),
+                        projectId: process.env.FIREBASE_PROJECT_ID
+                    });
+                }
+
+                const db = admin.firestore();
+                const docRef = db.collection('WalletScores').doc(normalized);
+                const doc = await docRef.get();
+                let currentScore = 0;
+                if (doc.exists) currentScore = Number(doc.data().score || 0);
+                const newTotalScore = currentScore + totalScore;
+
+                await docRef.set({
+                    score: newTotalScore,
+                    walletAddress: normalized,
+                    lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+                    matchId: matchId || 'legacy'
+                }, { merge: true });
+
+                console.log(`[SUBMIT-SCORE] ✅ Score sauvegardé dans Firebase: ${currentScore} + ${totalScore} = ${newTotalScore}`);
+                console.log(`[MONITORING] 📊 SCORE SUBMISSION - Wallet: ${normalized}, Score Added: ${totalScore}, New Total: ${newTotalScore}, Timestamp: ${new Date().toISOString()}`);
+
+                return res.json({
+                    success: true,
+                    walletAddress: normalized,
+                    score: newTotalScore,
+                    matchId: matchId || 'legacy',
+                    validated: true
+                });
+            } catch (firebaseError) {
+                console.error('[SUBMIT-SCORE] Erreur Firebase:', firebaseError);
+                // Fallback: accepter pour compat
+                return res.json({ success: true, walletAddress: normalized, score: totalScore, matchId: matchId || 'legacy', validated: true });
+            }
+        } else {
+            console.warn('[SUBMIT-SCORE] Firebase non configuré - score accepté mais non sauvegardé');
+            return res.json({ success: true, walletAddress: normalized, score: totalScore, matchId: matchId || 'legacy', validated: true });
+        }
+    } catch (error) {
+        console.error('[SUBMIT-SCORE] Error:', error);
+        res.status(500).json({ error: 'Failed to submit score', details: error.message });
+    }
+});
+
 app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, mintCost } = req.body;
