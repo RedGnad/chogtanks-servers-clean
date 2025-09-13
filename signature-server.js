@@ -39,6 +39,29 @@ app.get('/health', (req, res) => {
 // Supporte aussi la méthode HEAD sur /health
 app.head('/health', (req, res) => res.sendStatus(200));
 
+// Endpoint pour récupérer le score (compatibilité ancien build)
+app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res) => {
+    try {
+        const { walletAddress } = req.params;
+        if (!walletAddress || !/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
+            return res.status(400).json({ error: 'Invalid wallet address format' });
+        }
+        
+        // Pour l'instant, retourner des valeurs par défaut
+        // TODO: Intégrer avec Firebase si nécessaire
+        const normalizedAddress = walletAddress.toLowerCase();
+        return res.json({ 
+            walletAddress: normalizedAddress, 
+            score: 0, 
+            nftLevel: 0, 
+            isNew: true 
+        });
+    } catch (error) {
+        console.error('[GET-SCORE] Error:', error);
+        res.status(500).json({ error: 'Failed to read score', details: error.message });
+    }
+});
+
 app.post('/api/mint-authorization', requireWallet, async (req, res) => {
     try {
         const { playerAddress, mintCost } = req.body;
@@ -77,10 +100,15 @@ app.post('/api/evolve-authorization', requireWallet, async (req, res) => {
         }
         
         const evolutionCosts = {
-            1: 50,   // Level 0 -> 1
-            2: 100,  // Level 1 -> 2
-            3: 150,  // Level 2 -> 3
-            4: 200   // Level 3 -> 4
+            2: 2,   // Level 1 -> 2
+            3: 100, // Level 2 -> 3
+            4: 200, // Level 3 -> 4
+            5: 300, // Level 4 -> 5
+            6: 400, // Level 5 -> 6
+            7: 500, // Level 6 -> 7
+            8: 600, // Level 7 -> 8
+            9: 700, // Level 8 -> 9
+            10: 800 // Level 9 -> 10
         };
         
         const requiredPoints = evolutionCosts[targetLevel];
