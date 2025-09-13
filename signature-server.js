@@ -18,7 +18,7 @@ app.use(express.json());
 const defaultAllowed = [
     'https://redgnad.github.io',
     'https://chogtanks.vercel.app',
-    'https://monadclip.io'
+    'https://monadclip.vercel.app'
 ];
 const allowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
     .split(',')
