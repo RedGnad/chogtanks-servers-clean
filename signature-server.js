@@ -1,28 +1,11 @@
 const express = require('express');
 const { ethers } = require('ethers');
 const cors = require('cors');
-const helmet = require('helmet');
 require('dotenv').config();
 
 const app = express();
-app.disable('x-powered-by');
-app.use(helmet());
 app.use(express.json());
-
-// CORS strict sur les domaines autorisés
-const allowedOrigins = new Set([
-    'https://redgnad.github.io',
-    'https://chogtanks.vercel.app',
-    'https://monadclip.io',
-]);
-app.use(cors({
-    origin: (origin, cb) => {
-        if (!origin) return cb(null, true); // allow non-browser clients
-        if (allowedOrigins.has(origin)) return cb(null, true);
-        return cb(new Error('Not allowed by CORS'));
-    },
-    credentials: true
-}));
+app.use(cors());
 
 const port = process.env.PORT || 3001;
 
@@ -174,9 +157,6 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
 });
 
 // Endpoint pour démarrer un match (compatibilité ancien build)
-// Stockage in-memory des match tokens (TTL court)
-const matchTokens = new Map(); // token -> { uid, createdAt, expAt, used }
-
 app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         console.log(`[MATCH-START] Match start requested`);
@@ -184,14 +164,6 @@ app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res
         // Générer un token de match unique
         const matchToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
         const expiresInMs = 5 * 60 * 1000; // 5 minutes
-        const now = Date.now();
-        const uid = req.firebaseAuth?.uid || null;
-        matchTokens.set(matchToken, {
-            uid,
-            createdAt: now,
-            expAt: now + expiresInMs,
-            used: false
-        });
         
         console.log(`[MATCH-START] Generated match token: ${matchToken}`);
         
@@ -209,7 +181,7 @@ app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res
 // Endpoint pour soumettre les scores (compatibilité ancien build)
 app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
-        const { walletAddress, score, bonus, matchId, matchToken } = req.body || {};
+        const { walletAddress, score, bonus, matchId } = req.body || {};
         if (!walletAddress || typeof score === 'undefined') {
             return res.status(400).json({ error: 'Missing walletAddress or score' });
         }
@@ -219,33 +191,7 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
         
         const normalized = walletAddress.toLowerCase();
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
-
-        // Enforce matchToken si l'auth Firebase est active
-        if (process.env.FIREBASE_REQUIRE_AUTH === '1') {
-            if (!matchToken || typeof matchToken !== 'string') {
-                return res.status(400).json({ error: 'Missing matchToken' });
-            }
-            const record = matchTokens.get(matchToken);
-            if (!record) {
-                return res.status(401).json({ error: 'Invalid matchToken' });
-            }
-            if (record.used) {
-                return res.status(401).json({ error: 'Match token already used' });
-            }
-            if (record.expAt < Date.now()) {
-                matchTokens.delete(matchToken);
-                return res.status(401).json({ error: 'Match token expired' });
-            }
-            // Vérifier cohérence d'identité (UID si dispo)
-            const uid = req.firebaseAuth?.uid || null;
-            if (record.uid && uid && record.uid !== uid) {
-                return res.status(401).json({ error: 'Match token does not belong to this user' });
-            }
-            // Marquer consommé (anti-replay)
-            record.used = true;
-            matchTokens.set(matchToken, record);
-        }
-
+        
         console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
         
         // Intégrer avec Firebase pour sauvegarder le score
@@ -548,3 +494,4 @@ process.on('unhandledRejection', (reason) => {
 process.on('uncaughtException', (err) => {
     console.error('[uncaughtException]', err);
 });
+
