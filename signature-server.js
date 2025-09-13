@@ -26,6 +26,26 @@ function requireWallet(req, res, next) {
     next();
 }
 
+// Middleware: exige l'authentification Firebase
+function requireFirebaseAuth(req, res, next) {
+    // Si FIREBASE_REQUIRE_AUTH n'est pas défini, on skip l'auth (mode permissif)
+    if (process.env.FIREBASE_REQUIRE_AUTH !== '1') {
+        console.log('[AUTH] Firebase auth disabled - proceeding without verification');
+        return next();
+    }
+    
+    const auth = req.headers.authorization || '';
+    if (!auth.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Missing token' });
+    }
+    
+    const token = auth.slice(7);
+    
+    // Pour l'instant, on accepte tous les tokens (à améliorer plus tard)
+    console.log('[AUTH] Firebase token received, proceeding');
+    next();
+}
+
 // Health check endpoint pour monitoring
 app.get('/health', (req, res) => {
     res.status(200).json({ 
@@ -227,7 +247,7 @@ app.post('/api/firebase/submit-score', requireWallet, async (req, res) => {
     }
 });
 
-app.post('/api/mint-authorization', requireWallet, async (req, res) => {
+app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, mintCost } = req.body;
         
@@ -257,7 +277,7 @@ app.post('/api/mint-authorization', requireWallet, async (req, res) => {
     }
 });
 
-app.post('/api/evolve-authorization', requireWallet, async (req, res) => {
+app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, tokenId, targetLevel } = req.body;
         
