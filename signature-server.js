@@ -345,28 +345,49 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
 
 app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
-        const { playerAddress, mintCost } = req.body;
-        
-        if (!playerAddress || !mintCost) {
-            return res.status(400).json({ error: "Adresse du joueur et coût de mint requis" });
+        const { playerAddress, mintCost, playerPoints } = req.body || {};
+
+        if (!playerAddress) {
+            return res.status(400).json({ error: "Adresse du joueur requise" });
         }
-        
-        const message = ethers.utils.solidityKeccak256(
+
+        // Schéma robuste aligné contrat: (msg.sender, playerPoints, nonce, "MINT")
+        if (typeof playerPoints !== 'undefined') {
+            const nonce = Date.now();
+            const message = ethers.utils.solidityKeccak256(
+                ['address', 'uint256', 'uint256', 'string'],
+                [playerAddress, ethers.BigNumber.from(playerPoints), ethers.BigNumber.from(nonce), 'MINT']
+            );
+            const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
+
+            console.log(`[MINT] ✅ Autorisation (nouveau schéma) pour ${playerAddress}, points=${playerPoints}, nonce=${nonce}`);
+            return res.json({
+                authorized: true,
+                signature,
+                nonce,
+                playerPoints: Number(playerPoints),
+                gameServerAddress: gameWallet.address
+            });
+        }
+
+        // Fallback legacy pour compat: (address, mintCost)
+        if (typeof mintCost === 'undefined') {
+            return res.status(400).json({ error: "Paramètre requis: playerPoints (recommandé) ou mintCost (legacy)" });
+        }
+
+        const messageLegacy = ethers.utils.solidityKeccak256(
             ['address', 'uint256'],
-            [playerAddress, mintCost]
+            [playerAddress, ethers.BigNumber.from(mintCost)]
         );
-        
-    const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
-        
-        console.log(`[MINT] ✅ Autorisation de mint générée pour ${playerAddress} avec un coût de ${mintCost}`);
-        console.log(`[MONITORING] 🎯 MINT REQUEST - Wallet: ${playerAddress}, Cost: ${mintCost}, Timestamp: ${new Date().toISOString()}`);
-        
-        res.json({
-            signature: signature,
-            mintCost: mintCost,
+        const signatureLegacy = await gameWallet.signMessage(ethers.utils.arrayify(messageLegacy));
+
+        console.log(`[MINT] ✅ Autorisation (legacy) pour ${playerAddress}, mintCost=${mintCost}`);
+        return res.json({
+            signature: signatureLegacy,
+            mintCost: Number(mintCost),
             gameServerAddress: gameWallet.address
         });
-        
+
     } catch (error) {
         console.error('Erreur d\'autorisation de mint:', error);
         res.status(500).json({ error: "Erreur interne du serveur" });
@@ -398,48 +419,7 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
             return res.status(400).json({ error: "Niveau cible invalide" });
         }
 
-        // Contrôle serveur (optionnel mais actif si Firebase configuré): vérifier les points côté serveur
-        let serverSideScore = null;
-        if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
-            try {
-                const admin = require('firebase-admin');
-                if (!admin.apps.length) {
-                    const serviceAccount = {
-                        type: "service_account",
-                        project_id: process.env.FIREBASE_PROJECT_ID,
-                        private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-                        private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-                        client_email: process.env.FIREBASE_CLIENT_EMAIL,
-                        client_id: process.env.FIREBASE_CLIENT_ID,
-                        auth_uri: "https://accounts.google.com/o/oauth2/auth",
-                        token_uri: "https://oauth2.googleapis.com/token",
-                        auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-                        client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
-                    };
-                    admin.initializeApp({
-                        credential: admin.credential.cert(serviceAccount),
-                        projectId: process.env.FIREBASE_PROJECT_ID
-                    });
-                }
-                const normalized = String(playerAddress).toLowerCase();
-                const db = admin.firestore();
-                const docRef = db.collection('WalletScores').doc(normalized);
-                const doc = await docRef.get();
-                serverSideScore = doc.exists ? Number(doc.data().score || 0) : 0;
-                if (serverSideScore < requiredPoints) {
-                    return res.status(403).json({
-                        error: 'Insufficient points (server)',
-                        required: requiredPoints,
-                        currentScore: serverSideScore
-                    });
-                }
-            } catch (e) {
-                console.warn('[EVOLVE-AUTH] Server-side points check failed:', e.message || e);
-                // Par sécurité, on continue sans bloquer si Firebase n'est pas dispo
-            }
-        }
-
-        const pointsForSignature = Number(playerPoints ?? serverSideScore ?? requiredPoints);
+        const pointsForSignature = Number(playerPoints ?? requiredPoints);
         const nonce = Date.now();
 
         // Doit correspondre EXACTEMENT au contrat ChogTanks.sol:
@@ -609,68 +589,106 @@ async function getNextNonce(wallet) {
 
 app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
-        const { playerAddress, appKitWallet, scoreAmount, transactionAmount, actionType } = req.body;
-        
-        if (!playerAddress || !appKitWallet || scoreAmount === undefined || transactionAmount === undefined) {
-            return res.status(400).json({ error: 'Missing required parameters' });
+        const { playerAddress, appKitWallet, actionType, txHash } = req.body || {};
+
+        if (!playerAddress || !appKitWallet || !actionType || !txHash) {
+            return res.status(400).json({ error: 'Missing required parameters (playerAddress, appKitWallet, actionType, txHash)' });
         }
-        
-        console.log(`[Monad Games ID] Received request: ${actionType} for ${playerAddress}`);
-        console.log(`[Monad Games ID] Score: ${scoreAmount}, Transactions: ${transactionAmount}`);
-        console.log(`[Monad Games ID] AppKit wallet: ${appKitWallet}`);
-        
-        // ANTI-FARMING: Vérifier la liaison des wallets
-        const boundWallet = walletBindings.get(playerAddress);
-        
+
+        const pa = String(playerAddress).toLowerCase();
+        const ak = String(appKitWallet).toLowerCase();
+
+        console.log(`[Monad Games ID] Received request: ${actionType} for ${pa}`);
+        console.log(`[Monad Games ID] AppKit wallet: ${ak}`);
+        console.log(`[Monad Games ID] txHash: ${txHash}`);
+
+        // ANTI-FARMING: Vérifier/établir la liaison des wallets (normalisée)
+        const boundWallet = walletBindings.get(pa);
         if (!boundWallet) {
-            // Premier mint/evolution: lier les wallets
-            walletBindings.set(playerAddress, appKitWallet);
+            walletBindings.set(pa, ak);
             saveWalletBindings(walletBindings);
-            console.log(`[ANTI-FARMING] 🔗 Liaison créée et sauvegardée: Privy ${playerAddress} → AppKit ${appKitWallet}`);
-        } else if (boundWallet !== appKitWallet) {
-            // Tentative de farming détectée
-            console.error(`[ANTI-FARMING] 🚫 FARMING DÉTECTÉ!`);
-            console.error(`[ANTI-FARMING] Privy: ${playerAddress}`);
-            console.error(`[ANTI-FARMING] Wallet lié: ${boundWallet}`);
-            console.error(`[ANTI-FARMING] Wallet actuel: ${appKitWallet}`);
-            
+            console.log(`[ANTI-FARMING] 🔗 Liaison créée et sauvegardée: Privy ${pa} → AppKit ${ak}`);
+        } else if (String(boundWallet).toLowerCase() !== ak) {
+            console.error(`[ANTI-FARMING] 🚫 FARMING DÉTECTÉ! Privy=${pa}, Bound=${boundWallet}, Current=${ak}`);
             return res.status(403).json({ 
                 error: "Wallet farming detected", 
                 details: "This Monad Games ID account is bound to a different AppKit wallet"
             });
         } else {
-            console.log(`[ANTI-FARMING] ✅ Wallet vérifié: ${appKitWallet}`);
+            console.log(`[ANTI-FARMING] ✅ Wallet vérifié: ${ak}`);
         }
-        
-        if (ENABLE_MONAD_BATCH) {
-            // Ignorer les valeurs client et dériver des deltas sûrs selon l'action
-            let safeScoreDelta = 0;
-            let safeTxDelta = 0;
-            if (actionType === 'mint') {
-                safeScoreDelta = 100;
-                safeTxDelta = 1;
-            } else if (actionType === 'evolve') {
-                // Heuristique: si le client fournit targetLevel, on peut calculer un coût; sinon valeur par défaut raisonnable
-                const evolutionCosts = { 2: 2, 3: 100, 4: 200, 5: 300, 6: 400, 7: 500, 8: 600, 9: 700, 10: 800 };
-                // On ne change pas l'API: si targetLevel n'est pas fourni à cette route, on utilise 100 par défaut
-                const targetLevel = Number(req.body?.targetLevel || 3);
-                safeScoreDelta = Number(evolutionCosts[targetLevel] || 100);
-                safeTxDelta = 1;
-            }
 
-            enqueuePlayerUpdate(playerAddress, safeScoreDelta, safeTxDelta);
-            // Feedback immédiat pour l'UX
+        // Vérification onchain de la tx ChogTanks
+        const rpcUrl = process.env.MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz/';
+        const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+
+        const receipt = await provider.getTransactionReceipt(txHash);
+        if (!receipt) {
+            return res.status(404).json({ error: 'Transaction not found' });
+        }
+        if (receipt.status !== 1) {
+            return res.status(409).json({ error: 'Transaction failed on-chain' });
+        }
+        if (receipt.from && String(receipt.from).toLowerCase() !== ak) {
+            return res.status(403).json({ error: 'Tx signer does not match bound AppKit wallet' });
+        }
+
+        const CHOGTANKS_CONTRACT_ADDRESS = (process.env.CHOGTANKS_CONTRACT_ADDRESS || '').toLowerCase();
+        if (!CHOGTANKS_CONTRACT_ADDRESS) {
+            return res.status(500).json({ error: 'Server misconfigured: CHOGTANKS_CONTRACT_ADDRESS missing' });
+        }
+
+        const chogIface = new ethers.utils.Interface([
+            'event NFTMinted(address indexed owner, uint256 indexed tokenId)',
+            'event NFTEvolved(address indexed owner, uint256 indexed tokenId, uint256 newLevel, uint256 pointsConsumed)'
+        ]);
+
+        let derivedScore = 0;
+        let derivedTx = 0;
+
+        for (const log of receipt.logs || []) {
+            if (String(log.address).toLowerCase() !== CHOGTANKS_CONTRACT_ADDRESS) continue;
+            try {
+                const parsed = chogIface.parseLog(log);
+                if (actionType === 'mint' && parsed.name === 'NFTMinted') {
+                    const owner = String(parsed.args.owner).toLowerCase();
+                    if (owner !== ak) continue;
+                    derivedScore += 100; // politique: +100 par mint
+                    derivedTx += 1;
+                }
+                if (actionType === 'evolve' && parsed.name === 'NFTEvolved') {
+                    const owner = String(parsed.args.owner).toLowerCase();
+                    if (owner !== ak) continue;
+                    const newLevel = Number(parsed.args.newLevel || 0);
+                    const pointsConsumed = Number(parsed.args.pointsConsumed || 0);
+                    const evolutionCosts = { 2: 2, 3: 100, 4: 200, 5: 300, 6: 400, 7: 500, 8: 600, 9: 700, 10: 800 };
+                    const cost = pointsConsumed > 0 ? pointsConsumed : (evolutionCosts[newLevel] || 0);
+                    if (cost > 0) {
+                        derivedScore += cost;
+                        derivedTx += 1;
+                    }
+                }
+            } catch (_) {
+                // log non pertinent
+            }
+        }
+
+        if (derivedScore <= 0 && derivedTx <= 0) {
+            return res.status(422).json({ error: 'No matching on-chain event for provided actionType' });
+        }
+
+        if (ENABLE_MONAD_BATCH) {
+            enqueuePlayerUpdate(pa, derivedScore, derivedTx);
             return res.json({ 
                 success: true, 
                 queued: true,
-                playerAddress,
-                scoreAmount: safeScoreDelta,
-                transactionAmount: safeTxDelta,
-                actionType
+                playerAddress: pa,
+                scoreAmount: derivedScore,
+                transactionAmount: derivedTx,
+                actionType,
+                verified: true
             });
         } else {
-            const rpcUrl = process.env.MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz/';
-            const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
             const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
             const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
             const contractABI = [
@@ -678,45 +696,32 @@ app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth
             ];
             const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
-            // Ignorer les valeurs client et dériver des deltas sûrs selon l'action
-            let safeScoreDelta = 0;
-            let safeTxDelta = 0;
-            if (actionType === 'mint') {
-                safeScoreDelta = 100;
-                safeTxDelta = 1;
-            } else if (actionType === 'evolve') {
-                const evolutionCosts = { 2: 2, 3: 100, 4: 200, 5: 300, 6: 400, 7: 500, 8: 600, 9: 700, 10: 800 };
-                const targetLevel = Number(req.body?.targetLevel || 3);
-                safeScoreDelta = Number(evolutionCosts[targetLevel] || 100);
-                safeTxDelta = 1;
-            }
-
-            console.log(`[Monad Games ID] Calling updatePlayerData(${playerAddress}, ${safeScoreDelta}, ${safeTxDelta})`);
+            console.log(`[Monad Games ID] Calling updatePlayerData(${pa}, ${derivedScore}, ${derivedTx})`);
             const nonce = await getNextNonce(wallet);
-            const tx = await contract.updatePlayerData(playerAddress, safeScoreDelta, safeTxDelta, {
+            const tx = await contract.updatePlayerData(pa, derivedScore, derivedTx, {
                 gasLimit: 150000,
                 maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
                 maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
                 nonce
             });
             console.log(`[Monad Games ID] Transaction sent: ${tx.hash}`);
-            const receipt = await tx.wait();
-            console.log(`[Monad Games ID] Transaction confirmed in block ${receipt.blockNumber}`);
-            console.log(`[Monad Games ID] Gas used: ${receipt.gasUsed.toString()}`);
-            
+            const r = await tx.wait();
+            console.log(`[Monad Games ID] Transaction confirmed in block ${r.blockNumber}`);
+
             return res.json({ 
                 success: true, 
                 transactionHash: tx.hash, 
-                blockNumber: receipt.blockNumber, 
-                gasUsed: receipt.gasUsed.toString(),
-                playerAddress, 
-                scoreAmount: safeScoreDelta, 
-                transactionAmount: safeTxDelta, 
+                blockNumber: r.blockNumber, 
+                gasUsed: r.gasUsed.toString(),
+                playerAddress: pa, 
+                scoreAmount: derivedScore, 
+                transactionAmount: derivedTx, 
                 actionType,
+                verified: true,
                 message: 'Score submitted to Monad Games ID contract'
             });
         }
-        
+
     } catch (error) {
         console.error('[Monad Games ID] Error:', error);
         res.status(500).json({ 
