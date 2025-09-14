@@ -346,8 +346,9 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
 app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, mintCost, playerPoints } = req.body || {};
+        const pAddr = playerAddress || req.body?.walletAddress; // alias compat
 
-        if (!playerAddress) {
+        if (!pAddr) {
             return res.status(400).json({ error: "Adresse du joueur requise" });
         }
 
@@ -356,11 +357,11 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
             const nonce = Date.now();
             const message = ethers.utils.solidityKeccak256(
                 ['address', 'uint256', 'uint256', 'string'],
-                [playerAddress, ethers.BigNumber.from(playerPoints), ethers.BigNumber.from(nonce), 'MINT']
+                [pAddr, ethers.BigNumber.from(playerPoints), ethers.BigNumber.from(nonce), 'MINT']
             );
             const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
 
-            console.log(`[MINT] ✅ Autorisation (nouveau schéma) pour ${playerAddress}, points=${playerPoints}, nonce=${nonce}`);
+            console.log(`[MINT] ✅ Autorisation (nouveau schéma) pour ${pAddr}, points=${playerPoints}, nonce=${nonce}`);
             return res.json({
                 authorized: true,
                 signature,
@@ -377,11 +378,11 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
 
         const messageLegacy = ethers.utils.solidityKeccak256(
             ['address', 'uint256'],
-            [playerAddress, ethers.BigNumber.from(mintCost)]
+            [pAddr, ethers.BigNumber.from(mintCost)]
         );
         const signatureLegacy = await gameWallet.signMessage(ethers.utils.arrayify(messageLegacy));
 
-        console.log(`[MINT] ✅ Autorisation (legacy) pour ${playerAddress}, mintCost=${mintCost}`);
+        console.log(`[MINT] ✅ Autorisation (legacy) pour ${pAddr}, mintCost=${mintCost}`);
         return res.json({
             signature: signatureLegacy,
             mintCost: Number(mintCost),
