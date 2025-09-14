@@ -638,10 +638,10 @@ app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth
             return res.status(500).json({ error: 'Server misconfigured: CHOGTANKS_CONTRACT_ADDRESS missing' });
         }
 
-        const chogIface = new ethers.utils.Interface([
-            'event NFTMinted(address indexed owner, uint256 indexed tokenId)',
-            'event NFTEvolved(address indexed owner, uint256 indexed tokenId, uint256 newLevel, uint256 pointsConsumed)'
-        ]);
+const chogIface = new ethers.utils.Interface([
+    'event NFTMinted(address indexed owner, uint256 tokenId)',
+    'event NFTEvolved(address indexed owner, uint256 tokenId, uint256 newLevel, uint256 pointsConsumed)'
+]);
 
         let derivedScore = 0;
         let derivedTx = 0;
