@@ -674,10 +674,13 @@ if (ENABLE_MONAD_BATCH) {
     }, Math.min(BATCH_FLUSH_MS, 1000)).unref();
 }
 
+// Mutex pour sérialiser les tx du serveur (éviter collisions nonce)
+let serverTxMutex = false;
+
 async function getNextNonce(wallet) {
     try {
-        // Toujours récupérer le nonce le plus récent depuis la blockchain
-        const nonce = await wallet.getTransactionCount('latest');
+        // Utiliser 'pending' pour éviter les collisions de nonce
+        const nonce = await wallet.getTransactionCount('pending');
         console.log(`[NONCE] Nonce récupéré depuis blockchain: ${nonce}`);
         return nonce;
     } catch (error) {
@@ -804,28 +807,35 @@ const chogIface = new ethers.utils.Interface([
                 verified: true
             });
         } else {
-            const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
-            const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
-            const contractABI = [
-                'function updatePlayerData(address player, uint256 scoreAmount, uint256 transactionAmount)'
-            ];
-            const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
+            // Sérialiser les tx du serveur pour éviter les collisions de nonce
+            while (serverTxMutex) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            serverTxMutex = true;
+            
+            try {
+                const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
+                const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
+                const contractABI = [
+                    'function updatePlayerData(address player, uint256 scoreAmount, uint256 transactionAmount)'
+                ];
+                const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
-            console.log(`[Monad Games ID] Calling updatePlayerData(${pa}, ${derivedScore}, ${derivedTx})`);
-            const nonce = await getNextNonce(wallet);
-            const tx = await contract.updatePlayerData(pa, derivedScore, derivedTx, {
-                gasLimit: 150000,
-                maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
-                maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
-                nonce
-            });
-            console.log(`[Monad Games ID] Transaction sent: ${tx.hash}`);
-            const r = await tx.wait();
-            console.log(`[Monad Games ID] Transaction confirmed in block ${r.blockNumber}`);
+                console.log(`[Monad Games ID] Calling updatePlayerData(${pa}, ${derivedScore}, ${derivedTx})`);
+                const nonce = await getNextNonce(wallet);
+                const tx = await contract.updatePlayerData(pa, derivedScore, derivedTx, {
+                    gasLimit: 150000,
+                    maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
+                    maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+                    nonce
+                });
+                console.log(`[Monad Games ID] Transaction sent: ${tx.hash}`);
+                const r = await tx.wait();
+                console.log(`[Monad Games ID] Transaction confirmed in block ${r.blockNumber}`);
 
-            // Marquer immédiatement les events comme traités (single) et persister
-            for (const id of eventIds) processedEvents.add(id);
-            saveProcessedEvents(processedEvents);
+                // Marquer immédiatement les events comme traités (single) et persister
+                for (const id of eventIds) processedEvents.add(id);
+                saveProcessedEvents(processedEvents);
 
             // STRICT_POINTS: décrémenter les points côté serveur APRÈS confirmation on-chain
             if (STRICT_POINTS && derivedScore > 0 && process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
@@ -863,18 +873,21 @@ const chogIface = new ethers.utils.Interface([
                 }
             }
 
-            return res.json({ 
-                success: true, 
-                transactionHash: tx.hash, 
-                blockNumber: r.blockNumber, 
-                gasUsed: r.gasUsed.toString(),
-                playerAddress: pa, 
-                scoreAmount: derivedScore, 
-                transactionAmount: derivedTx, 
-                actionType,
-                verified: true,
-                message: 'Score submitted to Monad Games ID contract'
-            });
+                return res.json({ 
+                    success: true, 
+                    transactionHash: tx.hash, 
+                    blockNumber: r.blockNumber, 
+                    gasUsed: r.gasUsed.toString(),
+                    playerAddress: pa, 
+                    scoreAmount: derivedScore, 
+                    transactionAmount: derivedTx, 
+                    actionType,
+                    verified: true,
+                    message: 'Score submitted to Monad Games ID contract'
+                });
+            } finally {
+                serverTxMutex = false;
+            }
         }
 
     } catch (error) {
