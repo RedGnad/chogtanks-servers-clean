@@ -398,7 +398,48 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
             return res.status(400).json({ error: "Niveau cible invalide" });
         }
 
-        const pointsForSignature = Number(playerPoints ?? requiredPoints);
+        // Contrôle serveur (optionnel mais actif si Firebase configuré): vérifier les points côté serveur
+        let serverSideScore = null;
+        if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+            try {
+                const admin = require('firebase-admin');
+                if (!admin.apps.length) {
+                    const serviceAccount = {
+                        type: "service_account",
+                        project_id: process.env.FIREBASE_PROJECT_ID,
+                        private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+                        private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+                        client_email: process.env.FIREBASE_CLIENT_EMAIL,
+                        client_id: process.env.FIREBASE_CLIENT_ID,
+                        auth_uri: "https://accounts.google.com/o/oauth2/auth",
+                        token_uri: "https://oauth2.googleapis.com/token",
+                        auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+                        client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
+                    };
+                    admin.initializeApp({
+                        credential: admin.credential.cert(serviceAccount),
+                        projectId: process.env.FIREBASE_PROJECT_ID
+                    });
+                }
+                const normalized = String(playerAddress).toLowerCase();
+                const db = admin.firestore();
+                const docRef = db.collection('WalletScores').doc(normalized);
+                const doc = await docRef.get();
+                serverSideScore = doc.exists ? Number(doc.data().score || 0) : 0;
+                if (serverSideScore < requiredPoints) {
+                    return res.status(403).json({
+                        error: 'Insufficient points (server)',
+                        required: requiredPoints,
+                        currentScore: serverSideScore
+                    });
+                }
+            } catch (e) {
+                console.warn('[EVOLVE-AUTH] Server-side points check failed:', e.message || e);
+                // Par sécurité, on continue sans bloquer si Firebase n'est pas dispo
+            }
+        }
+
+        const pointsForSignature = Number(playerPoints ?? serverSideScore ?? requiredPoints);
         const nonce = Date.now();
 
         // Doit correspondre EXACTEMENT au contrat ChogTanks.sol:
@@ -602,14 +643,29 @@ app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth
         }
         
         if (ENABLE_MONAD_BATCH) {
-            enqueuePlayerUpdate(playerAddress, scoreAmount, transactionAmount);
+            // Ignorer les valeurs client et dériver des deltas sûrs selon l'action
+            let safeScoreDelta = 0;
+            let safeTxDelta = 0;
+            if (actionType === 'mint') {
+                safeScoreDelta = 100;
+                safeTxDelta = 1;
+            } else if (actionType === 'evolve') {
+                // Heuristique: si le client fournit targetLevel, on peut calculer un coût; sinon valeur par défaut raisonnable
+                const evolutionCosts = { 2: 2, 3: 100, 4: 200, 5: 300, 6: 400, 7: 500, 8: 600, 9: 700, 10: 800 };
+                // On ne change pas l'API: si targetLevel n'est pas fourni à cette route, on utilise 100 par défaut
+                const targetLevel = Number(req.body?.targetLevel || 3);
+                safeScoreDelta = Number(evolutionCosts[targetLevel] || 100);
+                safeTxDelta = 1;
+            }
+
+            enqueuePlayerUpdate(playerAddress, safeScoreDelta, safeTxDelta);
             // Feedback immédiat pour l'UX
             return res.json({ 
                 success: true, 
                 queued: true,
                 playerAddress,
-                scoreAmount,
-                transactionAmount,
+                scoreAmount: safeScoreDelta,
+                transactionAmount: safeTxDelta,
                 actionType
             });
         } else {
@@ -622,9 +678,22 @@ app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth
             ];
             const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
-            console.log(`[Monad Games ID] Calling updatePlayerData(${playerAddress}, ${scoreAmount}, ${transactionAmount})`);
+            // Ignorer les valeurs client et dériver des deltas sûrs selon l'action
+            let safeScoreDelta = 0;
+            let safeTxDelta = 0;
+            if (actionType === 'mint') {
+                safeScoreDelta = 100;
+                safeTxDelta = 1;
+            } else if (actionType === 'evolve') {
+                const evolutionCosts = { 2: 2, 3: 100, 4: 200, 5: 300, 6: 400, 7: 500, 8: 600, 9: 700, 10: 800 };
+                const targetLevel = Number(req.body?.targetLevel || 3);
+                safeScoreDelta = Number(evolutionCosts[targetLevel] || 100);
+                safeTxDelta = 1;
+            }
+
+            console.log(`[Monad Games ID] Calling updatePlayerData(${playerAddress}, ${safeScoreDelta}, ${safeTxDelta})`);
             const nonce = await getNextNonce(wallet);
-            const tx = await contract.updatePlayerData(playerAddress, scoreAmount, transactionAmount, {
+            const tx = await contract.updatePlayerData(playerAddress, safeScoreDelta, safeTxDelta, {
                 gasLimit: 150000,
                 maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
                 maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
@@ -641,8 +710,8 @@ app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth
                 blockNumber: receipt.blockNumber, 
                 gasUsed: receipt.gasUsed.toString(),
                 playerAddress, 
-                scoreAmount, 
-                transactionAmount, 
+                scoreAmount: safeScoreDelta, 
+                transactionAmount: safeTxDelta, 
                 actionType,
                 message: 'Score submitted to Monad Games ID contract'
             });
