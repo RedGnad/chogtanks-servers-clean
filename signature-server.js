@@ -13,6 +13,15 @@ try {
     console.warn('[BOOT] helmet non installé - en-têtes sécurité non appliqués');
 }
 app.use(express.json());
+// Rate limit simple (optionnel via RATE_LIMIT_WINDOW_MS/RATE_LIMIT_MAX)
+try {
+    const rateLimit = require('express-rate-limit');
+    const windowMs = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000); // 1 min
+    const max = Number(process.env.RATE_LIMIT_MAX || 300); // 300 req/min par IP
+    app.use(rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false }));
+} catch (_) {
+    console.warn('[BOOT] express-rate-limit non installé - pas de rate limit');
+}
 
 // CORS restrictif (configurable par ALLOWED_ORIGINS)
 const defaultAllowed = [
@@ -313,23 +322,19 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
                 
             } catch (firebaseError) {
                 console.error('[SUBMIT-SCORE] Erreur Firebase:', firebaseError);
-                // Fallback: accepter le score même si Firebase échoue
-                return res.json({
-                    success: true,
-                    walletAddress: normalized,
-                    score: totalScore,
-                    matchId: matchId || 'legacy',
-                    validated: true
+                // Strict: ne pas valider si la persistance échoue
+                return res.status(500).json({
+                    success: false,
+                    error: 'Failed to persist score',
+                    details: firebaseError.message || String(firebaseError)
                 });
             }
         } else {
-            console.warn('[SUBMIT-SCORE] Firebase non configuré - score accepté mais non sauvegardé');
-            return res.json({
-                success: true,
-                walletAddress: normalized,
-                score: totalScore,
-                matchId: matchId || 'legacy',
-                validated: true
+            console.warn('[SUBMIT-SCORE] Firebase non configuré - rejet strict en prod');
+            return res.status(503).json({
+                success: false,
+                error: 'Score service unavailable',
+                details: 'Firebase not configured'
             });
         }
     } catch (error) {
@@ -513,7 +518,12 @@ async function flushBatchIfNeeded(force = false) {
                 nonce
             });
             console.log(`[Monad Games ID][BATCH] Tx sent: ${tx.hash}`);
-            const receipt = await tx.wait();
+            // Backoff simple et attente confirmable
+            const receipt = await tx.wait().catch(async (e) => {
+                console.warn('[Monad Games ID][BATCH] wait() failed, retrying once in 1s:', e.message || e);
+                await new Promise(r => setTimeout(r, 1000));
+                return tx.wait();
+            });
             console.log(`[Monad Games ID][BATCH] Confirmed in block ${receipt.blockNumber} (gasUsed=${receipt.gasUsed.toString()})`);
 
             // Retirer du buffer les entrées confirmées
