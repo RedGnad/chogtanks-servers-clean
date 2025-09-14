@@ -375,12 +375,12 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
 
 app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
-        const { playerAddress, tokenId, targetLevel } = req.body;
-        
-        if (!playerAddress || !tokenId || !targetLevel) {
+        const { playerAddress, tokenId, targetLevel, playerPoints } = req.body || {};
+
+        if (!playerAddress || tokenId === undefined || targetLevel === undefined) {
             return res.status(400).json({ error: "Adresse du joueur, ID du token et niveau cible requis" });
         }
-        
+
         const evolutionCosts = {
             2: 2,   // Level 1 -> 2
             3: 100, // Level 2 -> 3
@@ -392,33 +392,37 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
             9: 700, // Level 8 -> 9
             10: 800 // Level 9 -> 10
         };
-        
+
         const requiredPoints = evolutionCosts[targetLevel];
-        
         if (!requiredPoints) {
             return res.status(400).json({ error: "Niveau cible invalide" });
         }
-        
+
+        const pointsForSignature = Number(playerPoints ?? requiredPoints);
+        const nonce = Date.now();
+
+        // Doit correspondre EXACTEMENT au contrat ChogTanks.sol:
+        // keccak256(abi.encodePacked(msg.sender, tokenId, targetLevel, playerPoints, nonce, "EVOLVE"))
         const message = ethers.utils.solidityKeccak256(
-            ['address', 'uint256', 'uint256', 'uint256'],
-            [playerAddress, tokenId, targetLevel, requiredPoints]
+            ['address', 'uint256', 'uint256', 'uint256', 'uint256', 'string'],
+            [playerAddress, tokenId, targetLevel, pointsForSignature, nonce, 'EVOLVE']
         );
-        
-    const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
-        
-        console.log(`[EVOLVE] ✅ Autorisation d'évolution générée pour ${playerAddress}, token ${tokenId} vers niveau ${targetLevel}`);
-        console.log(`[MONITORING] 🚀 EVOLVE REQUEST - Wallet: ${playerAddress}, Token: ${tokenId}, Target Level: ${targetLevel}, Cost: ${requiredPoints}, Timestamp: ${new Date().toISOString()}`);
-        
-        res.json({
+        const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
+
+        console.log(`[EVOLVE] ✅ Autorisation d'évolution générée pour ${playerAddress}, token ${tokenId} → niveau ${targetLevel}`);
+        console.log(`[MONITORING] 🚀 EVOLVE REQUEST - Wallet: ${playerAddress}, Token: ${tokenId}, Target Level: ${targetLevel}, Cost: ${requiredPoints}, PlayerPoints: ${pointsForSignature}, Nonce: ${nonce}`);
+
+        return res.json({
             authorized: true,
-            signature: signature,
+            signature,
             evolutionCost: requiredPoints,
-            targetLevel: targetLevel
+            targetLevel,
+            nonce
         });
-        
+
     } catch (error) {
         console.error('Evolve authorization error:', error);
-        res.status(500).json({ error: "Internal server error" });
+        return res.status(500).json({ error: "Internal server error" });
     }
 });
 
