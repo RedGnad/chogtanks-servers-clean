@@ -779,11 +779,13 @@ app.post('/photon/webhook', (req, res) => {
             case 'create':
             case 'gamecreated':
             case 'roomcreated':
+            case 'gamestarted':
                 sess.createdAt = now;
                 break;
             case 'join':
             case 'actorjoin':
             case 'playerjoined':
+            case 'joinrequest':
                 if (userId) {
                     sess.users[userId] = { lastSeen: now };
                 }
@@ -791,6 +793,7 @@ app.post('/photon/webhook', (req, res) => {
             case 'leave':
             case 'actorleave':
             case 'playerleft':
+            case 'leaverequest':
                 if (userId) {
                     sess.users[userId] = { lastSeen: now };
                 }
@@ -810,8 +813,17 @@ app.post('/photon/webhook', (req, res) => {
                 }
                 break;
             }
+            case 'gameproperties':
+                if (userId) {
+                    sess.users[userId] = { lastSeen: now };
+                }
+                break;
             default:
-                console.log(`[PHOTON][WEBHOOK] Unknown event type: ${type}`);
+                if (userId) {
+                    sess.users[userId] = { lastSeen: now };
+                } else {
+                    console.log(`[PHOTON][WEBHOOK] Unknown event type: ${type}`);
+                }
                 break;
         }
 
