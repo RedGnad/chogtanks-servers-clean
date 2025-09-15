@@ -438,8 +438,7 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
             return res.status(400).json({ error: "Niveau cible invalide" });
         }
 
-        // Pour éviter toute inflation client, signer avec le coût requis côté serveur
-        let pointsForSignature = requiredPoints;
+        let pointsForSignature = Number(playerPoints ?? requiredPoints);
         if (STRICT_POINTS) {
             if (!(process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY)) {
                 return res.status(503).json({ error: 'Score service unavailable for strict mode' });
@@ -509,17 +508,7 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
 const fs = require('fs');
 const path = require('path');
 
-// Répertoire de stockage persistant (Render Persistent Disk)
-const DATA_DIR = process.env.DATA_DIR || __dirname;
-try {
-    if (DATA_DIR !== __dirname && !fs.existsSync(DATA_DIR)) {
-        fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-} catch (e) {
-    console.error('[STORAGE] Failed to ensure DATA_DIR:', e.message || e);
-}
-
-const WALLET_BINDINGS_FILE = path.join(DATA_DIR, 'wallet-bindings.json');
+const WALLET_BINDINGS_FILE = path.join(__dirname, 'wallet-bindings.json');
 
 // Charger les liaisons existantes
 function loadWalletBindings() {
@@ -550,7 +539,7 @@ console.log(`[ANTI-FARMING] ${walletBindings.size} liaisons chargées depuis ${W
 // =====================
 // Idempotence événements traités (anti-replay)
 // =====================
-const PROCESSED_EVENTS_FILE = path.join(DATA_DIR, 'processed-events.json');
+const PROCESSED_EVENTS_FILE = path.join(__dirname, 'processed-events.json');
 function loadProcessedEvents() {
     try {
         if (fs.existsSync(PROCESSED_EVENTS_FILE)) {
@@ -576,7 +565,7 @@ const processedEvents = loadProcessedEvents();
 // =====================
 // Débits de points (après confirmation on-chain)
 // =====================
-const POINTS_DEBIT_EVENTS_FILE = path.join(DATA_DIR, 'points-debited-events.json');
+const POINTS_DEBIT_EVENTS_FILE = path.join(__dirname, 'points-debited-events.json');
 function loadPointsDebitedEvents() {
     try {
         if (fs.existsSync(POINTS_DEBIT_EVENTS_FILE)) {
