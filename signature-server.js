@@ -470,8 +470,15 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
                 if (serverScore < requiredPoints) {
                     return res.status(403).json({ error: 'Insufficient points', required: requiredPoints, available: serverScore });
                 }
-                // Signe avec le coût requis pour éviter l'inflation côté client
-                pointsForSignature = requiredPoints;
+                const clientPoints = Number(playerPoints ?? requiredPoints) || 0;
+                if (clientPoints < requiredPoints) {
+                    return res.status(403).json({ error: 'Client points below required', required: requiredPoints, provided: clientPoints });
+                }
+                if (clientPoints > serverScore) {
+                    return res.status(403).json({ error: 'Client points exceed server score', provided: clientPoints, available: serverScore });
+                }
+                // Signe avec la valeur que le client utilisera on-chain, validée côté serveur
+                pointsForSignature = clientPoints;
             } catch (firebaseError) {
                 console.error('[EVOLVE-AUTH][VERIFY] Firebase error:', firebaseError.message || firebaseError);
                 return res.status(500).json({ error: 'Failed to validate points' });
@@ -527,14 +534,15 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
         const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
 
         console.log(`[EVOLVE] ✅ Autorisation d'évolution générée pour ${playerAddress}, token ${tokenId} → niveau ${targetLevel}`);
-        console.log(`[MONITORING] 🚀 EVOLVE REQUEST - Wallet: ${playerAddress}, Token: ${tokenId}, Target Level: ${targetLevel}, Cost: ${requiredPoints}, PlayerPoints: ${pointsForSignature}, Nonce: ${nonce}`);
+        console.log(`[MONITORING] 🚀 EVOLVE REQUEST - Wallet: ${playerAddress}, Token: ${tokenId}, Target Level: ${targetLevel}, Cost: ${requiredPoints}, PlayerPointsSigned: ${pointsForSignature}, Nonce: ${nonce}`);
 
         return res.json({
             authorized: true,
             signature,
             evolutionCost: requiredPoints,
             targetLevel,
-            nonce
+            nonce,
+            playerPointsSigned: Number(pointsForSignature)
         });
 
     } catch (error) {
