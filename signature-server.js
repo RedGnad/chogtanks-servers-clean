@@ -1012,16 +1012,9 @@ app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth
         console.log(`[Monad Games ID] AppKit wallet: ${ak}`);
         console.log(`[Monad Games ID] txHash: ${txHash}`);
 
-        // Vérification ANTI-FARMING en amont: si une liaison existe déjà et ne correspond pas, rejeter immédiatement
-        {
-            const existing = walletBindings.get(pa);
-            if (existing && String(existing).toLowerCase() !== ak) {
-                return res.status(403).json({
-                    error: 'Wallet farming detected',
-                    details: 'This Monad Games ID account is bound to a different AppKit wallet'
-                });
-            }
-        }
+        // Évaluer l'état de liaison pour orienter la réponse finale, sans bloquer la consommation de points
+        const existingBinding = walletBindings.get(pa);
+        const mismatchBinding = !!(existingBinding && String(existingBinding).toLowerCase() !== ak);
 
         // (Déplacé) Liaison anti-farming après validations on-chain (création/validation de la liaison)
 
@@ -1110,18 +1103,57 @@ const chogIface = new ethers.utils.Interface([
             return res.status(422).json({ error: 'No matching on-chain event for provided actionType' });
         }
 
-        // ANTI-FARMING: Établir la liaison APRÈS validations on-chain et événements cohérents
+        // Consommation de points côté serveur APRÈS confirmation on-chain (indépendant du binding)
+        if (actionType === 'evolve' && derivedScore > 0 && process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+            try {
+                const admin = require('firebase-admin');
+                if (!admin.apps.length) {
+                    const serviceAccount = {
+                        type: "service_account",
+                        project_id: process.env.FIREBASE_PROJECT_ID,
+                        private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+                        private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+                        client_email: process.env.FIREBASE_CLIENT_EMAIL,
+                        client_id: process.env.FIREBASE_CLIENT_ID,
+                        auth_uri: "https://accounts.google.com/o/oauth2/auth",
+                        token_uri: "https://oauth2.googleapis.com/token",
+                        auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+                        client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
+                    };
+                    admin.initializeApp({
+                        credential: admin.credential.cert(serviceAccount),
+                        projectId: process.env.FIREBASE_PROJECT_ID
+                    });
+                }
+                const db = admin.firestore();
+                const docRef = db.collection('WalletScores').doc(pa);
+                await db.runTransaction(async (t) => {
+                    const snap = await t.get(docRef);
+                    const current = snap.exists ? Number(snap.data().score || 0) : 0;
+                    const next = Math.max(0, current - derivedScore);
+                    t.set(docRef, { score: next, walletAddress: pa, lastUpdated: admin.firestore.FieldValue.serverTimestamp(), lastEvolutionTimestamp: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+                });
+                console.log(`[POINTS] ✅ Décrément appliqué après evolve: -${derivedScore} pour ${pa}`);
+            } catch (debitErr) {
+                console.error('[POINTS] ❌ Échec décrément points:', debitErr.message || debitErr);
+            }
+        }
+
+        // En cas de mismatch de liaison, répondre 403 après consommation des points (pas d'update binding/monad)
+        if (mismatchBinding) {
+            return res.status(403).json({
+                error: "Wallet farming detected",
+                details: "This Monad Games ID account is bound to a different AppKit wallet"
+            });
+        }
+
+        // ANTI-FARMING: Établir/valider la liaison maintenant que tout est cohérent
         {
             const boundWallet = walletBindings.get(pa);
             if (!boundWallet) {
                 walletBindings.set(pa, ak);
                 saveWalletBindings(walletBindings);
                 console.log(`[ANTI-FARMING] 🔗 Liaison confirmée: Privy ${pa} → AppKit ${ak}`);
-            } else if (String(boundWallet).toLowerCase() !== ak) {
-                return res.status(403).json({ 
-                    error: "Wallet farming detected", 
-                    details: "This Monad Games ID account is bound to a different AppKit wallet"
-                });
             } else {
                 console.log(`[ANTI-FARMING] ✅ Wallet vérifié: ${ak}`);
             }
