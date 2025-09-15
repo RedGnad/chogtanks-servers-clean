@@ -320,8 +320,13 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
 
             // Accepte si présence fraîche OU dans la fenêtre de grâce après fermeture
             if (!userKey || !hasAcceptablePhotonPresence(room, userKey)) {
-                console.warn('[SUBMIT-SCORE][PHOTON-CHECK] Reject: room=%s userKey=%s ttl=%d grace=%d', room, userKey, PHOTON_PRESENCE_TTL_MS, PHOTON_GRACE_AFTER_CLOSE_MS);
-                return res.status(403).json({ error: 'Photon presence not verified for this match' });
+                // Fallback: si l'acteur est frais dans une autre room, accepte (certaines implémentations Photon envoient des close/leave tardifs)
+                const altRoom = findRecentRoomForActor(userKey);
+                if (!altRoom || !hasAcceptablePhotonPresence(altRoom, userKey)) {
+                    console.warn('[SUBMIT-SCORE][PHOTON-CHECK] Reject: room=%s userKey=%s ttl=%d grace=%d', room, userKey, PHOTON_PRESENCE_TTL_MS, PHOTON_GRACE_AFTER_CLOSE_MS);
+                    return res.status(403).json({ error: 'Photon presence not verified for this match' });
+                }
+                room = altRoom;
             }
         }
         
@@ -809,6 +814,7 @@ app.post('/photon/webhook', (req, res) => {
         if (!gameId) return res.status(400).json({ error: 'Missing GameId' });
 
         const sess = photonSessions[gameId] || { users: {}, createdAt: now, closed: false };
+        console.log(`[PHOTON][WEBHOOK] type=${type} gameId=${gameId} userId=${userId}`);
         switch (type) {
             case 'create':
             case 'gamecreated':
