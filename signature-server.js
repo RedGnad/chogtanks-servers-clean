@@ -309,6 +309,12 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
             }
 
             if (!room) {
+                // Fallback: déduire la room récente pour cet actor
+                const deduced = findRecentRoomForActor(userKey);
+                if (deduced) room = deduced;
+            }
+
+            if (!room) {
                 return res.status(400).json({ error: 'Missing gameId (Photon room)' });
             }
 
@@ -750,6 +756,34 @@ function hasAcceptablePhotonPresence(gameId, userId) {
     }
 }
 
+// Cherche la room la plus récente où cet utilisateur a été vu récemment
+function findRecentRoomForActor(userId) {
+    try {
+        if (!userId) return null;
+        const now = Date.now();
+        let bestRoom = null;
+        let bestLastSeen = 0;
+        for (const [gid, sess] of Object.entries(photonSessions || {})) {
+            const u = sess && sess.users ? sess.users[String(userId)] : null;
+            if (!u || typeof u.lastSeen !== 'number') continue;
+            const age = now - u.lastSeen;
+            const withinPresence = age <= PHOTON_PRESENCE_TTL_MS;
+            const withinGrace = sess && sess.closed && typeof sess.closedAt === 'number'
+                ? (now - sess.closedAt) <= PHOTON_GRACE_AFTER_CLOSE_MS
+                : false;
+            if (withinPresence || withinGrace) {
+                if (u.lastSeen > bestLastSeen) {
+                    bestLastSeen = u.lastSeen;
+                    bestRoom = gid;
+                }
+            }
+        }
+        return bestRoom;
+    } catch (_) {
+        return null;
+    }
+}
+
 // Webhook endpoint to receive Photon Realtime callbacks (Create/Join/Leave/Close/Event)
 app.post('/photon/webhook', (req, res) => {
     try {
@@ -769,7 +803,7 @@ app.post('/photon/webhook', (req, res) => {
         // Support Photon v1.2 and v2 field names
         const type = String(body.Type || body.type || body.eventType || '').toLowerCase();
         const gameId = String(body.GameId || body.gameId || body.roomName || body.room || '').trim();
-        const userId = String(body.UserId || body.userId || body.actorNr || body.actorNumber || '').trim();
+        const userId = String(body.UserId || body.userId || body.ActorNr || body.actorNr || body.ActorNumber || body.actorNumber || '').trim();
         const now = Date.now();
 
         if (!gameId) return res.status(400).json({ error: 'Missing GameId' });
