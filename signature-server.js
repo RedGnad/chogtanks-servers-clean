@@ -802,13 +802,12 @@ function findRecentRoomForActor(userId) {
 app.post('/photon/webhook', (req, res) => {
     try {
         if (PHOTON_WEBHOOK_SECRET) {
-            const q = req.query || {};
-            let providedSecret = q.secret || req.headers['x-webhook-secret'] || req.headers['x-photon-secret'];
+            // N'accepter le secret que via header, jamais via query string
+            let providedSecret = req.headers['x-photon-secret'] || req.headers['x-webhook-secret'];
             if (typeof providedSecret === 'string') {
-                // Nettoie les suffixes type '?' ou '&' éventuellement ajoutés par l'appelant
-                providedSecret = providedSecret.trim().replace(/[?#&]+$/g, '');
+                providedSecret = String(providedSecret).trim();
             }
-            if (providedSecret !== PHOTON_WEBHOOK_SECRET) {
+            if (!providedSecret || providedSecret !== PHOTON_WEBHOOK_SECRET) {
                 return res.status(401).json({ error: 'Unauthorized' });
             }
         }
@@ -947,13 +946,35 @@ async function flushBatchIfNeeded(force = false) {
             const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
             console.log(`[Monad Games ID][BATCH] Flushing ${players.length} updates...`);
-            const nonce = await getNextNonce(wallet);
-            const tx = await contract.batchUpdatePlayerData(players, scores, txs, {
-                gasLimit: 600000, // batch → plus de gas
-                maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
-                maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
-                nonce
-            });
+
+            // Préflight: callStatic + estimateGas pour éviter les reverts et calibrer le gas
+            try {
+                await contract.callStatic.batchUpdatePlayerData(players, scores, txs);
+            } catch (e) {
+                console.error('[Monad Games ID][BATCH][preflight] failed:', (e && (e.error && e.error.message)) || e.message || e);
+                // ne pas vider la queue; on réessaiera au prochain flush
+                continue;
+            }
+
+            // Sérialiser l'envoi pour éviter collisions de nonce avec d'autres TX serveur
+            while (serverTxMutex) {
+                await new Promise(r => setTimeout(r, 100));
+            }
+            serverTxMutex = true;
+            let tx;
+            try {
+                const estGas = await contract.estimateGas.batchUpdatePlayerData(players, scores, txs);
+                const gasLimit = estGas.mul(120).div(100); // +20% de marge
+                const nonce = await getNextNonce(wallet);
+                tx = await contract.batchUpdatePlayerData(players, scores, txs, {
+                    gasLimit,
+                    maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
+                    maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+                    nonce
+                });
+            } finally {
+                serverTxMutex = false;
+            }
             console.log(`[Monad Games ID][BATCH] Tx sent: ${tx.hash}`);
             // Backoff simple et attente confirmable
             const receipt = await tx.wait().catch(async (e) => {
@@ -1197,9 +1218,18 @@ const chogIface = new ethers.utils.Interface([
                 const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
                 console.log(`[Monad Games ID] Calling updatePlayerData(${pa}, ${derivedScore}, ${derivedTx})`);
+                // Préflight: callStatic + estimateGas
+                try {
+                    await contract.callStatic.updatePlayerData(pa, derivedScore, derivedTx);
+                } catch (e) {
+                    console.error('[Monad Games ID][preflight] failed:', (e && (e.error && e.error.message)) || e.message || e);
+                    return res.status(502).json({ error: 'Preflight failed' });
+                }
+                const estGas = await contract.estimateGas.updatePlayerData(pa, derivedScore, derivedTx);
+                const gasLimit = estGas.mul(120).div(100);
                 const nonce = await getNextNonce(wallet);
                 const tx = await contract.updatePlayerData(pa, derivedScore, derivedTx, {
-                    gasLimit: 150000,
+                    gasLimit,
                     maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
                     maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
                     nonce
