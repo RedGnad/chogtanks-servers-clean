@@ -1009,15 +1009,38 @@ app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth
         console.log(`[Monad Games ID] AppKit wallet: ${ak}`);
         console.log(`[Monad Games ID] txHash: ${txHash}`);
 
-        // (Déplacé) Liaison anti-farming après validations on-chain
+        // Vérification ANTI-FARMING en amont: si une liaison existe déjà et ne correspond pas, rejeter immédiatement
+        {
+            const existing = walletBindings.get(pa);
+            if (existing && String(existing).toLowerCase() !== ak) {
+                return res.status(403).json({
+                    error: 'Wallet farming detected',
+                    details: 'This Monad Games ID account is bound to a different AppKit wallet'
+                });
+            }
+        }
+
+        // (Déplacé) Liaison anti-farming après validations on-chain (création/validation de la liaison)
 
         // Vérification onchain de la tx ChogTanks
         const rpcUrl = process.env.MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz/';
         const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
 
-        const receipt = await provider.getTransactionReceipt(txHash);
+        // Attendre l'indexation du receipt avec retries pour éviter 404
+        const MAX_WAIT_MS = Number(process.env.TX_RECEIPT_MAX_WAIT_MS || 15000);
+        const RETRY_MS    = Number(process.env.TX_RECEIPT_RETRY_MS || 1000);
+        let receipt = null;
+        {
+            const startAt = Date.now();
+            while (Date.now() - startAt < MAX_WAIT_MS) {
+                receipt = await provider.getTransactionReceipt(txHash);
+                if (receipt) break;
+                await new Promise(r => setTimeout(r, RETRY_MS));
+            }
+        }
         if (!receipt) {
-            return res.status(404).json({ error: 'Transaction not found' });
+            res.set('Retry-After', Math.ceil((Number(process.env.TX_RECEIPT_RETRY_MS || 1000))/1000).toString());
+            return res.status(202).json({ pending: true, message: 'Awaiting transaction indexing' });
         }
         if (receipt.status !== 1) {
             return res.status(409).json({ error: 'Transaction failed on-chain' });
