@@ -438,44 +438,43 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
             return res.status(400).json({ error: "Niveau cible invalide" });
         }
 
-        let pointsForSignature = Number(playerPoints ?? requiredPoints);
-        if (STRICT_POINTS) {
-            if (!(process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY)) {
-                return res.status(503).json({ error: 'Score service unavailable for strict mode' });
+        // Vérifier le solde Firebase réel avant de signer (anti-triche)
+        if (!(process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY)) {
+            return res.status(503).json({ error: 'Score service unavailable' });
+        }
+        try {
+            const admin = require('firebase-admin');
+            if (!admin.apps.length) {
+                const serviceAccount = {
+                    type: "service_account",
+                    project_id: process.env.FIREBASE_PROJECT_ID,
+                    private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+                    private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+                    client_email: process.env.FIREBASE_CLIENT_EMAIL,
+                    client_id: process.env.FIREBASE_CLIENT_ID,
+                    auth_uri: "https://accounts.google.com/o/oauth2/auth",
+                    token_uri: "https://oauth2.googleapis.com/token",
+                    auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+                    client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
+                };
+                admin.initializeApp({
+                    credential: admin.credential.cert(serviceAccount),
+                    projectId: process.env.FIREBASE_PROJECT_ID
+                });
             }
-            try {
-                const admin = require('firebase-admin');
-                if (!admin.apps.length) {
-                    const serviceAccount = {
-                        type: "service_account",
-                        project_id: process.env.FIREBASE_PROJECT_ID,
-                        private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-                        private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-                        client_email: process.env.FIREBASE_CLIENT_EMAIL,
-                        client_id: process.env.FIREBASE_CLIENT_ID,
-                        auth_uri: "https://accounts.google.com/o/oauth2/auth",
-                        token_uri: "https://oauth2.googleapis.com/token",
-                        auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
-                        client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
-                    };
-                    admin.initializeApp({
-                        credential: admin.credential.cert(serviceAccount),
-                        projectId: process.env.FIREBASE_PROJECT_ID
-                    });
-                }
-                const db = admin.firestore();
-                const normalized = String(playerAddress).toLowerCase();
-                const docRef = db.collection('WalletScores').doc(normalized);
-                const doc = await docRef.get();
-                const serverScore = doc.exists ? Number(doc.data().score || 0) : 0;
-                if (serverScore < requiredPoints) {
-                    return res.status(403).json({ error: 'Insufficient server points', required: requiredPoints, available: serverScore });
-                }
-                pointsForSignature = serverScore;
-            } catch (firebaseError) {
-                console.error('[EVOLVE-AUTH][STRICT] Firebase error:', firebaseError.message || firebaseError);
-                return res.status(500).json({ error: 'Failed to validate server points' });
+            const db = admin.firestore();
+            const normalized = String(playerAddress).toLowerCase();
+            const docRef = db.collection('WalletScores').doc(normalized);
+            const doc = await docRef.get();
+            const serverScore = doc.exists ? Number(doc.data().score || 0) : 0;
+            if (serverScore < requiredPoints) {
+                return res.status(403).json({ error: 'Insufficient points', required: requiredPoints, available: serverScore });
             }
+            // Signer avec le coût requis (pas la valeur client)
+            let pointsForSignature = requiredPoints;
+        } catch (firebaseError) {
+            console.error('[EVOLVE-AUTH] Firebase error:', firebaseError.message || firebaseError);
+            return res.status(500).json({ error: 'Failed to validate points' });
         }
         const nonce = Date.now();
 
@@ -508,7 +507,17 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
 const fs = require('fs');
 const path = require('path');
 
-const WALLET_BINDINGS_FILE = path.join(__dirname, 'wallet-bindings.json');
+// Répertoire de stockage persistant (Render Persistent Disk)
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+try {
+    if (DATA_DIR !== __dirname && !fs.existsSync(DATA_DIR)) {
+        fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+} catch (e) {
+    console.error('[STORAGE] Failed to ensure DATA_DIR:', e.message || e);
+}
+
+const WALLET_BINDINGS_FILE = path.join(DATA_DIR, 'wallet-bindings.json');
 
 // Charger les liaisons existantes
 function loadWalletBindings() {
@@ -539,7 +548,7 @@ console.log(`[ANTI-FARMING] ${walletBindings.size} liaisons chargées depuis ${W
 // =====================
 // Idempotence événements traités (anti-replay)
 // =====================
-const PROCESSED_EVENTS_FILE = path.join(__dirname, 'processed-events.json');
+const PROCESSED_EVENTS_FILE = path.join(DATA_DIR, 'processed-events.json');
 function loadProcessedEvents() {
     try {
         if (fs.existsSync(PROCESSED_EVENTS_FILE)) {
@@ -565,7 +574,7 @@ const processedEvents = loadProcessedEvents();
 // =====================
 // Débits de points (après confirmation on-chain)
 // =====================
-const POINTS_DEBIT_EVENTS_FILE = path.join(__dirname, 'points-debited-events.json');
+const POINTS_DEBIT_EVENTS_FILE = path.join(DATA_DIR, 'points-debited-events.json');
 function loadPointsDebitedEvents() {
     try {
         if (fs.existsSync(POINTS_DEBIT_EVENTS_FILE)) {
