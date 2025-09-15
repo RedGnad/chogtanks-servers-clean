@@ -246,7 +246,7 @@ app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res
 // Endpoint pour soumettre les scores (compatibilité ancien build)
 app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
-        const { walletAddress, score, bonus, matchId, matchToken } = req.body || {};
+        const { walletAddress, score, bonus, matchId, matchToken, gameId } = req.body || {};
         if (!walletAddress || typeof score === 'undefined') {
             return res.status(400).json({ error: 'Missing walletAddress or score' });
         }
@@ -279,6 +279,16 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
             }
             rec.used = true;
             matchTokens.set(matchToken, rec);
+
+            // Vérification Photon: l'utilisateur doit être présent (trace fraîche) dans la room
+            const room = (typeof gameId === 'string' && gameId.trim()) ? gameId.trim() : ((typeof matchId === 'string' && matchId.trim()) ? matchId.trim() : null);
+            if (!room) {
+                return res.status(400).json({ error: 'Missing gameId (Photon room)' });
+            }
+            // Accepte si présence fraîche OU dans la fenêtre de grâce après fermeture
+            if (!uid || !hasAcceptablePhotonPresence(room, uid)) {
+                return res.status(403).json({ error: 'Photon presence not verified for this match' });
+            }
         }
         
         console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
@@ -644,6 +654,135 @@ function savePointsDebitedEvents(set) {
     }
 }
 const pointsDebitedEvents = loadPointsDebitedEvents();
+
+// =====================
+// Photon presence (anti-script farm via HTTP)
+// =====================
+const PHOTON_WEBHOOK_SECRET = process.env.PHOTON_WEBHOOK_SECRET || '';
+const PHOTON_PRESENCE_TTL_MS = Number(process.env.PHOTON_PRESENCE_TTL_MS || 60_000);
+const PHOTON_GRACE_AFTER_CLOSE_MS = Number(process.env.PHOTON_GRACE_AFTER_CLOSE_MS || 300_000);
+const PHOTON_SESSIONS_FILE = path.join(DATA_DIR, 'photon-sessions.json');
+
+function loadPhotonSessions() {
+    try {
+        if (fs.existsSync(PHOTON_SESSIONS_FILE)) {
+            return JSON.parse(fs.readFileSync(PHOTON_SESSIONS_FILE, 'utf8'));
+        }
+    } catch (e) {
+        console.warn('[PHOTON] load error:', e.message || e);
+    }
+    return {};
+}
+
+function savePhotonSessions(state) {
+    try {
+        fs.writeFileSync(PHOTON_SESSIONS_FILE, JSON.stringify(state, null, 2), 'utf8');
+    } catch (e) {
+        console.warn('[PHOTON] save error:', e.message || e);
+    }
+}
+
+// Structure: { [gameId]: { users: { [userId]: { lastSeen:number } }, createdAt:number, closed:boolean, closedAt:number|null } }
+const photonSessions = loadPhotonSessions();
+
+// Helper: verify a fresh presence for a user in a Photon room
+function hasFreshPhotonPresence(gameId, userId) {
+    try {
+        if (!gameId || !userId) return false;
+        const sess = photonSessions[String(gameId)];
+        if (!sess || !sess.users) return false;
+        const u = sess.users[String(userId)];
+        if (!u || typeof u.lastSeen !== 'number') return false;
+        return (Date.now() - u.lastSeen) <= PHOTON_PRESENCE_TTL_MS;
+    } catch (_) {
+        return false;
+    }
+}
+
+// Presence acceptable: soit fraîche, soit dans une fenêtre de grâce après fermeture/quit
+function hasAcceptablePhotonPresence(gameId, userId) {
+    try {
+        if (!gameId || !userId) return false;
+        const now = Date.now();
+        const sess = photonSessions[String(gameId)];
+        if (!sess || !sess.users) return false;
+        const u = sess.users[String(userId)];
+        if (!u || typeof u.lastSeen !== 'number') return false;
+        const age = now - u.lastSeen;
+        if (age <= PHOTON_PRESENCE_TTL_MS) return true;
+        if (sess.closed && typeof sess.closedAt === 'number') {
+            const sinceClose = now - sess.closedAt;
+            if (sinceClose <= PHOTON_GRACE_AFTER_CLOSE_MS && age <= PHOTON_GRACE_AFTER_CLOSE_MS) {
+                return true;
+            }
+        }
+        return false;
+    } catch (_) {
+        return false;
+    }
+}
+
+// Webhook endpoint to receive Photon Realtime callbacks (Create/Join/Leave/Close/Event)
+app.post('/photon/webhook', (req, res) => {
+    try {
+        if (PHOTON_WEBHOOK_SECRET) {
+            const q = req.query || {};
+            if (q.secret !== PHOTON_WEBHOOK_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+        }
+
+        const body = req.body || {};
+        const type = String(body.Type || body.type || '').toLowerCase();
+        const gameId = String(body.GameId || body.gameId || '').trim();
+        const userId = String(body.UserId || body.userId || '').trim();
+        const now = Date.now();
+
+        if (!gameId) return res.status(400).json({ error: 'Missing GameId' });
+
+        const sess = photonSessions[gameId] || { users: {}, createdAt: now, closed: false };
+        switch (type) {
+            case 'create':
+            case 'gamecreated':
+                sess.createdAt = now;
+                break;
+            case 'join':
+            case 'actorjoin':
+                if (userId) {
+                    sess.users[userId] = { lastSeen: now };
+                }
+                break;
+            case 'leave':
+            case 'actorleave':
+                if (userId) {
+                    sess.users[userId] = { lastSeen: now };
+                }
+                break;
+            case 'close':
+            case 'gameclosed':
+                sess.closed = true;
+                sess.closedAt = now;
+                break;
+            case 'event': {
+                const data = body.Data || body.data || {};
+                const uidFromData = String(data.userId || '').trim();
+                const effectiveUser = userId || uidFromData;
+                if (effectiveUser) {
+                    sess.users[effectiveUser] = { lastSeen: now };
+                }
+                break;
+            }
+            default:
+                // ignore
+                break;
+        }
+
+        photonSessions[gameId] = sess;
+        savePhotonSessions(photonSessions);
+        return res.json({ ok: true });
+    } catch (e) {
+        console.error('[PHOTON][WEBHOOK] error:', e.message || e);
+        return res.status(500).json({ error: 'Webhook error' });
+    }
+});
 
 // =====================
 // Monad Games ID - BATCH
