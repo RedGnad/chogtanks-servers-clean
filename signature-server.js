@@ -808,13 +808,14 @@ app.post('/photon/webhook', (req, res) => {
         // Support Photon v1.2 and v2 field names
         const type = String(body.Type || body.type || body.eventType || '').toLowerCase();
         const gameId = String(body.GameId || body.gameId || body.roomName || body.room || '').trim();
-        const userId = String(body.UserId || body.userId || body.ActorNr || body.actorNr || body.ActorNumber || body.actorNumber || '').trim();
+        const userId = String(body.UserId || body.userId || '').trim();
+        const actorKey = String(body.ActorNr || body.actorNr || body.ActorNumber || body.actorNumber || '').trim();
         const now = Date.now();
 
         if (!gameId) return res.status(400).json({ error: 'Missing GameId' });
 
         const sess = photonSessions[gameId] || { users: {}, createdAt: now, closed: false };
-        console.log(`[PHOTON][WEBHOOK] type=${type} gameId=${gameId} userId=${userId}`);
+        console.log(`[PHOTON][WEBHOOK] type=${type} gameId=${gameId} userId=${userId} actor=${actorKey}`);
         switch (type) {
             case 'create':
             case 'gamecreated':
@@ -826,17 +827,15 @@ app.post('/photon/webhook', (req, res) => {
             case 'actorjoin':
             case 'playerjoined':
             case 'joinrequest':
-                if (userId) {
-                    sess.users[userId] = { lastSeen: now };
-                }
+                if (userId) { sess.users[userId] = { lastSeen: now }; }
+                if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
                 break;
             case 'leave':
             case 'actorleave':
             case 'playerleft':
             case 'leaverequest':
-                if (userId) {
-                    sess.users[userId] = { lastSeen: now };
-                }
+                if (userId) { sess.users[userId] = { lastSeen: now }; }
+                if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
                 break;
             case 'close':
             case 'gameclosed':
@@ -848,19 +847,18 @@ app.post('/photon/webhook', (req, res) => {
                 const data = body.Data || body.data || {};
                 const uidFromData = String(data.userId || '').trim();
                 const effectiveUser = userId || uidFromData;
-                if (effectiveUser) {
-                    sess.users[effectiveUser] = { lastSeen: now };
-                }
+                if (effectiveUser) { sess.users[effectiveUser] = { lastSeen: now }; }
+                if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
                 break;
             }
             case 'gameproperties':
-                if (userId) {
-                    sess.users[userId] = { lastSeen: now };
-                }
+                if (userId) { sess.users[userId] = { lastSeen: now }; }
+                if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
                 break;
             default:
-                if (userId) {
-                    sess.users[userId] = { lastSeen: now };
+                if (userId || actorKey) {
+                    if (userId) { sess.users[userId] = { lastSeen: now }; }
+                    if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
                 } else {
                     console.log(`[PHOTON][WEBHOOK] Unknown event type: ${type}`);
                 }
