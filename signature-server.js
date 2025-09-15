@@ -124,6 +124,24 @@ app.get('/health', (req, res) => {
 // Supporte aussi la méthode HEAD sur /health
 app.head('/health', (req, res) => res.sendStatus(200));
 
+// Proxy: check username (évite CORS côté WebView)
+app.get('/api/check-username', async (req, res) => {
+    try {
+        const wallet = String(req.query.wallet || '').trim();
+        if (!wallet || !/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
+            return res.status(400).json({ error: 'Invalid wallet parameter' });
+        }
+        const fetch = require('node-fetch');
+        const url = `https://monadclip.fun/api/check-wallet?wallet=${wallet}`;
+        const r = await fetch(url, { method: 'GET', headers: { 'accept': 'application/json' } });
+        const data = await r.json().catch(() => ({}));
+        return res.status(r.ok ? 200 : 502).json(data);
+    } catch (e) {
+        console.error('[PROXY][check-username] Error:', e.message || e);
+        return res.status(500).json({ error: 'Proxy failed' });
+    }
+});
+
 // Endpoint pour récupérer le score (compatibilité ancien build)
 app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res) => {
     try {
