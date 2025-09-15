@@ -263,6 +263,12 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
         
         const normalized = walletAddress.toLowerCase();
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
+        // Cap doux par match (configurable)
+        const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
+        const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        if (cappedScore < totalScore) {
+            console.log(`[SCORE-CAP] Score plafonné pour ${normalized}: ${totalScore} -> ${cappedScore} (MAX=${MAX_SCORE_PER_MATCH})`);
+        }
 
         // Enforce match token usage si auth active
         if (process.env.FIREBASE_REQUIRE_AUTH === '1') {
@@ -331,6 +337,9 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
         }
         
         console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
+        if (cappedScore !== totalScore) {
+            console.log(`[SUBMIT-SCORE] Effective score after cap: ${cappedScore}`);
+        }
         
         // Intégrer avec Firebase pour sauvegarder le score
         if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
@@ -365,8 +374,8 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
                     currentScore = Number(doc.data().score || 0);
                 }
                 
-                // Ajouter le nouveau score
-                const newTotalScore = currentScore + totalScore;
+                // Ajouter le nouveau score (après cap)
+                const newTotalScore = currentScore + cappedScore;
                 
                 // Sauvegarder dans Firebase
                 await docRef.set({
@@ -376,8 +385,8 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
                     matchId: matchId || 'legacy'
                 }, { merge: true });
                 
-                console.log(`[SUBMIT-SCORE] ✅ Score sauvegardé dans Firebase: ${currentScore} + ${totalScore} = ${newTotalScore}`);
-                console.log(`[MONITORING] 📊 SCORE SUBMISSION - Wallet: ${normalized}, Score Added: ${totalScore}, New Total: ${newTotalScore}, Timestamp: ${new Date().toISOString()}`);
+                console.log(`[SUBMIT-SCORE] ✅ Score sauvegardé dans Firebase: ${currentScore} + ${cappedScore} = ${newTotalScore}`);
+                console.log(`[MONITORING] 📊 SCORE SUBMISSION - Wallet: ${normalized}, Score Added: ${cappedScore}, New Total: ${newTotalScore}, Timestamp: ${new Date().toISOString()}`);
                 
                 return res.json({
                     success: true,
