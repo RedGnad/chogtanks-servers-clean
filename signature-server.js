@@ -12,6 +12,13 @@ try {
 } catch (_) {
     console.warn('[BOOT] helmet non installé - en-têtes sécurité non appliqués');
 }
+// Normalise les doubles slashs dans l'URL (Photon v1.2 peut envoyer //path)
+app.use((req, res, next) => {
+    if (req.url.includes('//')) {
+        req.url = req.url.replace(/\/{2,}/g, '/');
+    }
+    next();
+});
 app.use(express.json());
 // Rate limit simple (optionnel via RATE_LIMIT_WINDOW_MS/RATE_LIMIT_MAX)
 try {
@@ -747,7 +754,8 @@ app.post('/photon/webhook', (req, res) => {
     try {
         if (PHOTON_WEBHOOK_SECRET) {
             const q = req.query || {};
-            if (q.secret !== PHOTON_WEBHOOK_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+            const providedSecret = q.secret || req.headers['x-webhook-secret'] || req.headers['x-photon-secret'];
+            if (providedSecret !== PHOTON_WEBHOOK_SECRET) return res.status(401).json({ error: 'Unauthorized' });
         }
 
         const body = req.body || {};
