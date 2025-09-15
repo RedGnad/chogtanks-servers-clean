@@ -731,9 +731,10 @@ app.post('/photon/webhook', (req, res) => {
         }
 
         const body = req.body || {};
-        const type = String(body.Type || body.type || '').toLowerCase();
-        const gameId = String(body.GameId || body.gameId || '').trim();
-        const userId = String(body.UserId || body.userId || '').trim();
+        // Support Photon v1.2 and v2 field names
+        const type = String(body.Type || body.type || body.eventType || '').toLowerCase();
+        const gameId = String(body.GameId || body.gameId || body.roomName || body.room || '').trim();
+        const userId = String(body.UserId || body.userId || body.actorNr || body.actorNumber || '').trim();
         const now = Date.now();
 
         if (!gameId) return res.status(400).json({ error: 'Missing GameId' });
@@ -742,22 +743,26 @@ app.post('/photon/webhook', (req, res) => {
         switch (type) {
             case 'create':
             case 'gamecreated':
+            case 'roomcreated':
                 sess.createdAt = now;
                 break;
             case 'join':
             case 'actorjoin':
+            case 'playerjoined':
                 if (userId) {
                     sess.users[userId] = { lastSeen: now };
                 }
                 break;
             case 'leave':
             case 'actorleave':
+            case 'playerleft':
                 if (userId) {
                     sess.users[userId] = { lastSeen: now };
                 }
                 break;
             case 'close':
             case 'gameclosed':
+            case 'roomclosed':
                 sess.closed = true;
                 sess.closedAt = now;
                 break;
@@ -771,7 +776,7 @@ app.post('/photon/webhook', (req, res) => {
                 break;
             }
             default:
-                // ignore
+                console.log(`[PHOTON][WEBHOOK] Unknown event type: ${type}`);
                 break;
         }
 
