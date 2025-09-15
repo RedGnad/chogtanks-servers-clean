@@ -281,12 +281,32 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
             matchTokens.set(matchToken, rec);
 
             // Vérification Photon: l'utilisateur doit être présent (trace fraîche) dans la room
-            const room = (typeof gameId === 'string' && gameId.trim()) ? gameId.trim() : ((typeof matchId === 'string' && matchId.trim()) ? matchId.trim() : null);
+            let room = (typeof gameId === 'string' && gameId.trim())
+              ? gameId.trim()
+              : ((typeof matchId === 'string' && matchId.trim()) ? matchId.trim() : null);
+
+            // Calcul de l'identifiant utilisateur pour la présence Photon
+            let userKey = req.firebaseAuth?.uid || null;
+
+            // Si matchId a la forme "<room>|<actorNr>", on en tire room + actorNr (prioritaire)
+            if (typeof matchId === 'string' && matchId.includes('|')) {
+              const parts = matchId.split('|');
+              if (parts[0]) room = parts[0].trim();
+              if (parts[1]) userKey = parts[1].trim();
+            } else if (typeof matchId === 'string') {
+              // Ancien format "match_<actorNr>_<timestamp>" : extraire actorNr
+              const m = /^match_(\d+)_/.exec(matchId);
+              if (m && m[1]) {
+                userKey = m[1];
+              }
+            }
+
             if (!room) {
                 return res.status(400).json({ error: 'Missing gameId (Photon room)' });
             }
+
             // Accepte si présence fraîche OU dans la fenêtre de grâce après fermeture
-            if (!uid || !hasAcceptablePhotonPresence(room, uid)) {
+            if (!userKey || !hasAcceptablePhotonPresence(room, userKey)) {
                 return res.status(403).json({ error: 'Photon presence not verified for this match' });
             }
         }
