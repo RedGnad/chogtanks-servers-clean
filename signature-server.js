@@ -314,6 +314,7 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
 
             // Accepte si présence fraîche OU dans la fenêtre de grâce après fermeture
             if (!userKey || !hasAcceptablePhotonPresence(room, userKey)) {
+                console.warn('[SUBMIT-SCORE][PHOTON-CHECK] Reject: room=%s userKey=%s ttl=%d grace=%d', room, userKey, PHOTON_PRESENCE_TTL_MS, PHOTON_GRACE_AFTER_CLOSE_MS);
                 return res.status(403).json({ error: 'Photon presence not verified for this match' });
             }
         }
@@ -754,8 +755,14 @@ app.post('/photon/webhook', (req, res) => {
     try {
         if (PHOTON_WEBHOOK_SECRET) {
             const q = req.query || {};
-            const providedSecret = q.secret || req.headers['x-webhook-secret'] || req.headers['x-photon-secret'];
-            if (providedSecret !== PHOTON_WEBHOOK_SECRET) return res.status(401).json({ error: 'Unauthorized' });
+            let providedSecret = q.secret || req.headers['x-webhook-secret'] || req.headers['x-photon-secret'];
+            if (typeof providedSecret === 'string') {
+                // Nettoie les suffixes type '?' ou '&' éventuellement ajoutés par l'appelant
+                providedSecret = providedSecret.trim().replace(/[?#&]+$/g, '');
+            }
+            if (providedSecret !== PHOTON_WEBHOOK_SECRET) {
+                return res.status(401).json({ error: 'Unauthorized' });
+            }
         }
 
         const body = req.body || {};
