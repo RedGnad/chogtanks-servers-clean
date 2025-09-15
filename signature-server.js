@@ -723,21 +723,7 @@ app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth
         console.log(`[Monad Games ID] AppKit wallet: ${ak}`);
         console.log(`[Monad Games ID] txHash: ${txHash}`);
 
-        // ANTI-FARMING: Vérifier/établir la liaison des wallets (normalisée)
-        const boundWallet = walletBindings.get(pa);
-        if (!boundWallet) {
-            walletBindings.set(pa, ak);
-            saveWalletBindings(walletBindings);
-            console.log(`[ANTI-FARMING] 🔗 Liaison créée et sauvegardée: Privy ${pa} → AppKit ${ak}`);
-        } else if (String(boundWallet).toLowerCase() !== ak) {
-            console.error(`[ANTI-FARMING] 🚫 FARMING DÉTECTÉ! Privy=${pa}, Bound=${boundWallet}, Current=${ak}`);
-            return res.status(403).json({ 
-                error: "Wallet farming detected", 
-                details: "This Monad Games ID account is bound to a different AppKit wallet"
-            });
-        } else {
-            console.log(`[ANTI-FARMING] ✅ Wallet vérifié: ${ak}`);
-        }
+        // (Déplacé) Liaison anti-farming après validations on-chain
 
         // Vérification onchain de la tx ChogTanks
         const rpcUrl = process.env.MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz/';
@@ -810,6 +796,23 @@ const chogIface = new ethers.utils.Interface([
 
         if (derivedScore <= 0 && derivedTx <= 0) {
             return res.status(422).json({ error: 'No matching on-chain event for provided actionType' });
+        }
+
+        // ANTI-FARMING: Établir la liaison APRÈS validations on-chain et événements cohérents
+        {
+            const boundWallet = walletBindings.get(pa);
+            if (!boundWallet) {
+                walletBindings.set(pa, ak);
+                saveWalletBindings(walletBindings);
+                console.log(`[ANTI-FARMING] 🔗 Liaison confirmée: Privy ${pa} → AppKit ${ak}`);
+            } else if (String(boundWallet).toLowerCase() !== ak) {
+                return res.status(403).json({ 
+                    error: "Wallet farming detected", 
+                    details: "This Monad Games ID account is bound to a different AppKit wallet"
+                });
+            } else {
+                console.log(`[ANTI-FARMING] ✅ Wallet vérifié: ${ak}`);
+            }
         }
 
         if (ENABLE_MONAD_BATCH) {
