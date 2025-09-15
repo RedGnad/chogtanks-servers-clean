@@ -822,6 +822,9 @@ app.post('/photon/webhook', (req, res) => {
             case 'roomcreated':
             case 'gamestarted':
                 sess.createdAt = now;
+                // Marquer présence immédiatement si des identifiants sont fournis
+                if (userId) { sess.users[userId] = { lastSeen: now }; }
+                if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
                 break;
             case 'join':
             case 'actorjoin':
