@@ -20,6 +20,27 @@ app.use((req, res, next) => {
     next();
 });
 app.use(express.json());
+
+// Logger avec niveaux et masquage basique (adresses/tx)
+const LOG_LEVEL = String(process.env.LOG_LEVEL || 'info'); // 'silent'|'error'|'warn'|'info'|'debug'
+function maskAddress(addr) {
+    if (!addr || typeof addr !== 'string') return addr;
+    const a = addr.toLowerCase();
+    if (!a.startsWith('0x') || a.length < 10) return a;
+    return a.slice(0, 6) + '...' + a.slice(-4);
+}
+function maskTx(hash) {
+    if (!hash || typeof hash !== 'string') return hash;
+    const h = hash.toLowerCase();
+    if (!h.startsWith('0x') || h.length < 18) return h;
+    return h.slice(0, 10) + '...' + h.slice(-6);
+}
+const log = {
+    error: (...args) => { if (['error','warn','info','debug'].includes(LOG_LEVEL)) console.error(...args); },
+    warn:  (...args) => { if (['warn','info','debug'].includes(LOG_LEVEL)) console.warn(...args); },
+    info:  (...args) => { if (['info','debug'].includes(LOG_LEVEL)) console.log(...args); },
+    debug: (...args) => { if (['debug'].includes(LOG_LEVEL)) console.log(...args); },
+};
 // Rate limit simple (optionnel via RATE_LIMIT_WINDOW_MS/RATE_LIMIT_MAX)
 try {
     const rateLimit = require('express-rate-limit');
@@ -58,7 +79,7 @@ if (!process.env.GAME_SERVER_PRIVATE_KEY) {
     console.error("ERREUR: GAME_SERVER_PRIVATE_KEY non définie. Les endpoints signés seront désactivés tant que la clé n'est pas configurée.");
 } else {
     gameWallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY);
-    console.log("Game Server Signer Address:", gameWallet.address);
+    log.info('Game Server Signer present:', maskAddress(gameWallet.address));
 }
 
 // Middleware: exige la présence du wallet pour les routes nécessitant une signature/tx
@@ -109,11 +130,11 @@ function requireFirebaseAuth(req, res, next) {
                 return next();
             })
             .catch((err) => {
-                console.error('[AUTH] verifyIdToken failed:', err.message || err);
+                log.warn('[AUTH] verifyIdToken failed');
                 return res.status(401).json({ error: 'Invalid token' });
             });
     } catch (e) {
-        console.error('[AUTH] Firebase admin init error:', e.message || e);
+        log.error('[AUTH] Firebase admin init error');
         return res.status(500).json({ error: 'Auth service unavailable' });
     }
 }
@@ -144,7 +165,7 @@ app.get('/api/check-username', async (req, res) => {
         const data = await r.json().catch(() => ({}));
         return res.status(r.ok ? 200 : 502).json(data);
     } catch (e) {
-        console.error('[PROXY][check-username] Error:', e.message || e);
+        log.error('[PROXY][check-username] Error');
         return res.status(500).json({ error: 'Proxy failed' });
     }
 });
@@ -204,7 +225,7 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
         }
         
         // Fallback: valeurs par défaut si Firebase non configuré ou erreur
-        console.log(`[GET-SCORE] Using fallback values for ${normalizedAddress}`);
+        log.info('[GET-SCORE] Using fallback values');
         return res.json({ 
             walletAddress: normalizedAddress, 
             score: 0, 
@@ -223,7 +244,7 @@ const matchTokens = new Map(); // token -> { uid, createdAt, expAt, used }
 
 app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
-        console.log(`[MATCH-START] Match start requested`);
+        log.info('[MATCH-START] requested');
         
         // Générer un token de match unique
         const matchToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -237,7 +258,7 @@ app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res
             used: false
         });
         
-        console.log(`[MATCH-START] Generated match token: ${matchToken}`);
+        log.debug('[MATCH-START] Generated match token');
         
         return res.json({
             matchToken: matchToken,
@@ -329,14 +350,14 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
                 // Fallback: si l'acteur est frais dans une autre room, accepte (certaines implémentations Photon envoient des close/leave tardifs)
                 const altRoom = findRecentRoomForActor(userKey);
                 if (!altRoom || !hasAcceptablePhotonPresence(altRoom, userKey)) {
-                    console.warn('[SUBMIT-SCORE][PHOTON-CHECK] Reject: room=%s userKey=%s ttl=%d grace=%d', room, userKey, PHOTON_PRESENCE_TTL_MS, PHOTON_GRACE_AFTER_CLOSE_MS);
+                    log.warn('[SUBMIT-SCORE][PHOTON-CHECK] Reject');
                     return res.status(403).json({ error: 'Photon presence not verified for this match' });
                 }
                 room = altRoom;
             }
         }
         
-        console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
+        log.info('[SUBMIT-SCORE] submitted');
         
         // Intégrer avec Firebase pour sauvegarder le score
         if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
@@ -382,8 +403,7 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
                     matchId: matchId || 'legacy'
                 }, { merge: true });
                 
-                console.log(`[SUBMIT-SCORE] ✅ Score sauvegardé dans Firebase: ${currentScore} + ${totalScore} = ${newTotalScore}`);
-                console.log(`[MONITORING] 📊 SCORE SUBMISSION - Wallet: ${normalized}, Score Added: ${totalScore}, New Total: ${newTotalScore}, Timestamp: ${new Date().toISOString()}`);
+                log.info('[SUBMIT-SCORE] ✅ Firebase updated');
                 
                 return res.json({
                     success: true,
@@ -394,7 +414,7 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
                 });
                 
             } catch (firebaseError) {
-                console.error('[SUBMIT-SCORE] Erreur Firebase:', firebaseError);
+                log.error('[SUBMIT-SCORE] Firebase error');
                 // Strict: ne pas valider si la persistance échoue
                 return res.status(500).json({
                     success: false,
@@ -403,7 +423,7 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
                 });
             }
         } else {
-            console.warn('[SUBMIT-SCORE] Firebase non configuré - rejet strict en prod');
+            log.warn('[SUBMIT-SCORE] Firebase non configuré - rejet strict en prod');
             return res.status(503).json({
                 success: false,
                 error: 'Score service unavailable',
@@ -411,7 +431,7 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
             });
         }
     } catch (error) {
-        console.error('[SUBMIT-SCORE] Error:', error);
+        log.error('[SUBMIT-SCORE] Error');
         res.status(500).json({ error: 'Failed to submit score', details: error.message });
     }
 });
@@ -434,7 +454,7 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
             );
             const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
 
-            console.log(`[MINT] ✅ Autorisation (nouveau schéma) pour ${pAddr}, points=${playerPoints}, nonce=${nonce}`);
+            log.info('[MINT] ✅ Autorisation (nouveau schéma) émise');
             return res.json({
                 authorized: true,
                 signature,
@@ -455,7 +475,7 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
         );
         const signatureLegacy = await gameWallet.signMessage(ethers.utils.arrayify(messageLegacy));
 
-        console.log(`[MINT] ✅ Autorisation (legacy) pour ${pAddr}, mintCost=${mintCost}`);
+        log.info('[MINT] ✅ Autorisation (legacy) émise');
         return res.json({
             signature: signatureLegacy,
             mintCost: Number(mintCost),
@@ -463,7 +483,7 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
         });
 
     } catch (error) {
-        console.error('Erreur d\'autorisation de mint:', error);
+        log.error('[MINT] Authorization error');
         res.status(500).json({ error: "Erreur interne du serveur" });
     }
 });
