@@ -704,6 +704,7 @@ const pointsDebitedEvents = loadPointsDebitedEvents();
 // Photon presence (anti-script farm via HTTP)
 // =====================
 const PHOTON_WEBHOOK_SECRET = process.env.PHOTON_WEBHOOK_SECRET || '';
+const PHOTON_SECRET_MODE = String(process.env.PHOTON_SECRET_MODE || 'both').toLowerCase(); // 'header' | 'query' | 'both'
 const PHOTON_PRESENCE_TTL_MS = Number(process.env.PHOTON_PRESENCE_TTL_MS || 60_000);
 const PHOTON_GRACE_AFTER_CLOSE_MS = Number(process.env.PHOTON_GRACE_AFTER_CLOSE_MS || 300_000);
 const PHOTON_SESSIONS_FILE = path.join(DATA_DIR, 'photon-sessions.json');
@@ -800,14 +801,20 @@ app.post('/photon/webhook', (req, res) => {
     try {
         if (PHOTON_WEBHOOK_SECRET) {
             const q = req.query || {};
-            let providedSecret = q.secret || req.headers['x-webhook-secret'] || req.headers['x-photon-secret'];
-            if (typeof providedSecret === 'string') {
-                // Nettoie les suffixes type '?' ou '&' éventuellement ajoutés par l'appelant
-                providedSecret = providedSecret.trim().replace(/[?#&]+$/g, '');
+            let providedHeader = req.headers['x-photon-secret'] || req.headers['x-webhook-secret'];
+            let providedQuery = q.secret;
+            if (typeof providedHeader === 'string') providedHeader = providedHeader.trim();
+            if (typeof providedQuery === 'string') providedQuery = providedQuery.trim().replace(/[?#&]+$/g, '');
+
+            let ok = false;
+            if (PHOTON_SECRET_MODE === 'header') {
+                ok = !!providedHeader && providedHeader === PHOTON_WEBHOOK_SECRET;
+            } else if (PHOTON_SECRET_MODE === 'query') {
+                ok = !!providedQuery && providedQuery === PHOTON_WEBHOOK_SECRET;
+            } else { // both (par défaut)
+                ok = (providedHeader === PHOTON_WEBHOOK_SECRET) || (providedQuery === PHOTON_WEBHOOK_SECRET);
             }
-            if (providedSecret !== PHOTON_WEBHOOK_SECRET) {
-                return res.status(401).json({ error: 'Unauthorized' });
-            }
+            if (!ok) return res.status(401).json({ error: 'Unauthorized' });
         }
 
         const body = req.body || {};
@@ -944,13 +951,52 @@ async function flushBatchIfNeeded(force = false) {
             const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
             console.log(`[Monad Games ID][BATCH] Flushing ${players.length} updates...`);
-            const nonce = await getNextNonce(wallet);
-            const tx = await contract.batchUpdatePlayerData(players, scores, txs, {
-                gasLimit: 600000, // batch → plus de gas
-                maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
-                maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
-                nonce
-            });
+            const MONAD_PREFLIGHT = process.env.MONAD_PREFLIGHT === '1';
+            const MONAD_PREFLIGHT_STRICT = process.env.MONAD_PREFLIGHT_STRICT === '1';
+
+            let tx;
+            try {
+                if (MONAD_PREFLIGHT) {
+                    try {
+                        await contract.callStatic.batchUpdatePlayerData(players, scores, txs);
+                    } catch (e) {
+                        const msg = (e && (e.error && e.error.message)) || e.message || String(e);
+                        console.error('[Monad Games ID][BATCH][preflight] failed:', msg);
+                        if (MONAD_PREFLIGHT_STRICT) {
+                            // En mode strict: on skip ce chunk, on réessaiera plus tard
+                            continue;
+                        }
+                    }
+                }
+
+                // Sérialiser optionnellement (utile si d'autres TX concurrentes existent)
+                while (serverTxMutex) { await new Promise(r => setTimeout(r, 50)); }
+                serverTxMutex = true;
+                try {
+                    let gasLimit = ethers.BigNumber.from(600000);
+                    if (MONAD_PREFLIGHT) {
+                        try {
+                            const est = await contract.estimateGas.batchUpdatePlayerData(players, scores, txs);
+                            gasLimit = est.mul(120).div(100);
+                        } catch (eg) {
+                            if (MONAD_PREFLIGHT_STRICT) throw eg;
+                            console.warn('[Monad Games ID][BATCH][estimateGas] fallback 600k:', (eg && eg.message) || eg);
+                        }
+                    }
+                    const nonce = await getNextNonce(wallet);
+                    tx = await contract.batchUpdatePlayerData(players, scores, txs, {
+                        gasLimit,
+                        maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
+                        maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+                        nonce
+                    });
+                } finally {
+                    serverTxMutex = false;
+                }
+            } catch (sendErr) {
+                console.error('[Monad Games ID][BATCH] send error:', sendErr.message || sendErr);
+                continue;
+            }
             console.log(`[Monad Games ID][BATCH] Tx sent: ${tx.hash}`);
             // Backoff simple et attente confirmable
             const receipt = await tx.wait().catch(async (e) => {
@@ -1194,9 +1240,35 @@ const chogIface = new ethers.utils.Interface([
                 const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
                 console.log(`[Monad Games ID] Calling updatePlayerData(${pa}, ${derivedScore}, ${derivedTx})`);
+                const MONAD_PREFLIGHT = process.env.MONAD_PREFLIGHT === '1';
+                const MONAD_PREFLIGHT_STRICT = process.env.MONAD_PREFLIGHT_STRICT === '1';
+
+                if (MONAD_PREFLIGHT) {
+                    try {
+                        await contract.callStatic.updatePlayerData(pa, derivedScore, derivedTx);
+                    } catch (e) {
+                        const msg = (e && (e.error && e.error.message)) || e.message || String(e);
+                        console.error('[Monad Games ID][preflight] failed:', msg);
+                        if (MONAD_PREFLIGHT_STRICT) {
+                            return res.status(502).json({ error: 'Preflight failed', details: msg });
+                        }
+                    }
+                }
+                let gasLimit = ethers.BigNumber.from(150000);
+                if (MONAD_PREFLIGHT) {
+                    try {
+                        const est = await contract.estimateGas.updatePlayerData(pa, derivedScore, derivedTx);
+                        gasLimit = est.mul(120).div(100);
+                    } catch (eg) {
+                        if (MONAD_PREFLIGHT_STRICT) {
+                            return res.status(502).json({ error: 'estimateGas failed', details: eg.message || String(eg) });
+                        }
+                        console.warn('[Monad Games ID][estimateGas] fallback 150k:', (eg && eg.message) || eg);
+                    }
+                }
                 const nonce = await getNextNonce(wallet);
                 const tx = await contract.updatePlayerData(pa, derivedScore, derivedTx, {
-                    gasLimit: 150000,
+                    gasLimit,
                     maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
                     maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
                     nonce
