@@ -977,13 +977,13 @@ async function flushBatchIfNeeded(force = false) {
         // Partitionner en chunks de taille BATCH_MAX
         for (let i = 0; i < entries.length; i += BATCH_MAX) {
             const chunk = entries.slice(i, i + BATCH_MAX);
-            const players = [];
-            const scores = [];
-            const txs = [];
+            const playerData = [];
             for (const [addr, agg] of chunk) {
-                players.push(addr);
-                scores.push(ethers.BigNumber.from(agg.score));
-                txs.push(ethers.BigNumber.from(agg.tx));
+                playerData.push({
+                    player: addr,
+                    score: ethers.BigNumber.from(agg.score),
+                    transactions: ethers.BigNumber.from(agg.tx)
+                });
             }
 
             // Appel on-chain batch
@@ -992,11 +992,11 @@ async function flushBatchIfNeeded(force = false) {
             const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
             const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
             const contractABI = [
-                'function batchUpdatePlayerData(address[] players, uint256[] scoreAmounts, uint256[] transactionAmounts)'
+                'function batchUpdatePlayerData((address player,uint256 score,uint256 transactions)[] _playerData)'
             ];
             const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
-            console.log(`[Monad Games ID][BATCH] Flushing ${players.length} updates...`);
+            console.log(`[Monad Games ID][BATCH] Flushing ${playerData.length} updates...`);
             const MONAD_PREFLIGHT = process.env.MONAD_PREFLIGHT === '1';
             const MONAD_PREFLIGHT_STRICT = process.env.MONAD_PREFLIGHT_STRICT === '1';
 
@@ -1004,7 +1004,7 @@ async function flushBatchIfNeeded(force = false) {
             try {
                 if (MONAD_PREFLIGHT) {
                     try {
-                        await contract.callStatic.batchUpdatePlayerData(players, scores, txs);
+                        await contract.callStatic.batchUpdatePlayerData(playerData);
                     } catch (e) {
                         const msg = (e && (e.error && e.error.message)) || e.message || String(e);
                         console.error('[Monad Games ID][BATCH][preflight] failed:', msg);
@@ -1022,7 +1022,7 @@ async function flushBatchIfNeeded(force = false) {
                     let gasLimit = ethers.BigNumber.from(600000);
                     if (MONAD_PREFLIGHT) {
                         try {
-                            const est = await contract.estimateGas.batchUpdatePlayerData(players, scores, txs);
+                            const est = await contract.estimateGas.batchUpdatePlayerData(playerData);
                             gasLimit = est.mul(120).div(100);
                         } catch (eg) {
                             if (MONAD_PREFLIGHT_STRICT) throw eg;
@@ -1030,7 +1030,7 @@ async function flushBatchIfNeeded(force = false) {
                         }
                     }
                     const nonce = await getNextNonce(wallet);
-                    tx = await contract.batchUpdatePlayerData(players, scores, txs, {
+                    tx = await contract.batchUpdatePlayerData(playerData, {
                         gasLimit,
                         maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
                         maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
@@ -1304,17 +1304,22 @@ const chogIface = new ethers.utils.Interface([
                 const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
                 const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
                 const contractABI = [
-                    'function updatePlayerData(address player, uint256 scoreAmount, uint256 transactionAmount)'
+                    'function updatePlayerData((address player,uint256 score,uint256 transactions) _playerData)'
                 ];
                 const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
+                const playerData = {
+                    player: pa,
+                    score: ethers.BigNumber.from(derivedScore),
+                    transactions: ethers.BigNumber.from(derivedTx)
+                };
                 console.log(`[Monad Games ID] Calling updatePlayerData(${pa}, ${derivedScore}, ${derivedTx})`);
                 const MONAD_PREFLIGHT = process.env.MONAD_PREFLIGHT === '1';
                 const MONAD_PREFLIGHT_STRICT = process.env.MONAD_PREFLIGHT_STRICT === '1';
 
                 if (MONAD_PREFLIGHT) {
                     try {
-                        await contract.callStatic.updatePlayerData(pa, derivedScore, derivedTx);
+                        await contract.callStatic.updatePlayerData(playerData);
                     } catch (e) {
                         const reason = (e && (e.error && e.error.message)) || e?.reason || e?.message || String(e);
                         const dataHex = (e && (e.error && e.error.data)) || e?.data || null;
@@ -1335,7 +1340,7 @@ const chogIface = new ethers.utils.Interface([
                 let gasLimit = ethers.BigNumber.from(150000);
                 if (MONAD_PREFLIGHT) {
                     try {
-                        const est = await contract.estimateGas.updatePlayerData(pa, derivedScore, derivedTx);
+                        const est = await contract.estimateGas.updatePlayerData(playerData);
                         gasLimit = est.mul(120).div(100);
                     } catch (eg) {
                         if (MONAD_PREFLIGHT_STRICT) {
@@ -1355,7 +1360,7 @@ const chogIface = new ethers.utils.Interface([
                     }
                 }
                 const nonce = await getNextNonce(wallet);
-                const tx = await contract.updatePlayerData(pa, derivedScore, derivedTx, {
+                const tx = await contract.updatePlayerData(playerData, {
                     gasLimit,
                     maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
                     maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
