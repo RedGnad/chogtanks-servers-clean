@@ -1316,10 +1316,19 @@ const chogIface = new ethers.utils.Interface([
                     try {
                         await contract.callStatic.updatePlayerData(pa, derivedScore, derivedTx);
                     } catch (e) {
-                        const msg = (e && (e.error && e.error.message)) || e.message || String(e);
-                        console.error('[Monad Games ID][preflight] failed:', msg);
+                        const reason = (e && (e.error && e.error.message)) || e?.reason || e?.message || String(e);
+                        const dataHex = (e && (e.error && e.error.data)) || e?.data || null;
+                        console.error('[Monad Games ID][preflight] failed:', reason, dataHex ? `data=${dataHex}` : '');
                         if (MONAD_PREFLIGHT_STRICT) {
-                            return res.status(502).json({ error: 'Preflight failed', details: msg });
+                            return res.status(502).json({
+                                error: 'Preflight failed',
+                                reason,
+                                data: dataHex,
+                                sender: wallet.address,
+                                contract: MONAD_GAMES_ID_CONTRACT,
+                                fn: 'updatePlayerData',
+                                args: { player: pa, scoreAmount: derivedScore, transactionAmount: derivedTx }
+                            });
                         }
                     }
                 }
@@ -1330,7 +1339,17 @@ const chogIface = new ethers.utils.Interface([
                         gasLimit = est.mul(120).div(100);
                     } catch (eg) {
                         if (MONAD_PREFLIGHT_STRICT) {
-                            return res.status(502).json({ error: 'estimateGas failed', details: eg.message || String(eg) });
+                            const reason = (eg && (eg.error && eg.error.message)) || eg?.reason || eg?.message || String(eg);
+                            const dataHex = (eg && (eg.error && eg.error.data)) || eg?.data || null;
+                            return res.status(502).json({
+                                error: 'estimateGas failed',
+                                reason,
+                                data: dataHex,
+                                sender: wallet.address,
+                                contract: MONAD_GAMES_ID_CONTRACT,
+                                fn: 'updatePlayerData',
+                                args: { player: pa, scoreAmount: derivedScore, transactionAmount: derivedTx }
+                            });
                         }
                         console.warn('[Monad Games ID][estimateGas] fallback 150k:', (eg && eg.message) || eg);
                     }
