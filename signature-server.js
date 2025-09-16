@@ -591,6 +591,14 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
         console.log(`[EVOLVE] ✅ Autorisation d'évolution générée pour ${playerAddress}, token ${tokenId} → niveau ${targetLevel}`);
         console.log(`[MONITORING] 🚀 EVOLVE REQUEST - Wallet: ${playerAddress}, Token: ${tokenId}, Target Level: ${targetLevel}, Cost: ${requiredPoints}, PlayerPointsSigned: ${pointsForSignature}, Nonce: ${nonce}`);
 
+        // Cache pour fallback consommation points si event absent côté receipt
+        putEvolveAuth(nonce, {
+            playerAddress: String(playerAddress).toLowerCase(),
+            tokenId: Number(tokenId),
+            targetLevel: Number(targetLevel),
+            cost: Number(requiredPoints)
+        });
+
         return res.json({
             authorized: true,
             signature,
@@ -699,6 +707,40 @@ function savePointsDebitedEvents(set) {
     }
 }
 const pointsDebitedEvents = loadPointsDebitedEvents();
+
+// =====================
+// EVOLVE AUTH CACHE (fallback consommation points)
+// =====================
+const EVOLVE_AUTH_TTL_MS = Number(process.env.EVOLVE_AUTH_TTL_MS || 5 * 60 * 1000);
+// nonce(string) -> { playerAddress, appKitWallet, tokenId, targetLevel, cost, createdAt }
+const evolveAuthCache = new Map();
+function putEvolveAuth(nonce, entry) {
+    try {
+        const key = String(nonce);
+        evolveAuthCache.set(key, { ...entry, createdAt: Date.now() });
+    } catch (_) {}
+}
+function takeEvolveAuth(nonce) {
+    try {
+        const key = String(nonce);
+        const v = evolveAuthCache.get(key);
+        if (!v) return null;
+        if (Date.now() - (v.createdAt || 0) > EVOLVE_AUTH_TTL_MS) {
+            evolveAuthCache.delete(key);
+            return null;
+        }
+        // Ne pas supprimer pour permettre plusieurs retries; laisser expirer par TTL
+        return v;
+    } catch (_) { return null; }
+}
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of evolveAuthCache.entries()) {
+        if (!v || typeof v.createdAt !== 'number' || now - v.createdAt > EVOLVE_AUTH_TTL_MS) {
+            evolveAuthCache.delete(k);
+        }
+    }
+}, Math.min(60_000, EVOLVE_AUTH_TTL_MS)).unref();
 
 // =====================
 // Photon presence (anti-script farm via HTTP)
@@ -1148,6 +1190,28 @@ const chogIface = new ethers.utils.Interface([
                 }
             } catch (_) {
                 // log non pertinent
+            }
+        }
+
+        if (derivedScore <= 0 && derivedTx <= 0) {
+            // Fallback: tenter de décoder la tx input pour EVOLVE et matcher le nonce avec le cache d'autorisation
+            try {
+                const tx = await provider.getTransaction(txHash);
+                if (tx && tx.data && actionType === 'evolve') {
+                    const evolveIface = new ethers.utils.Interface([
+                        'function evolveNFT(uint256 tokenId, uint256 playerPoints, uint256 nonce, bytes signature)'
+                    ]);
+                    const decoded = evolveIface.decodeFunctionData('evolveNFT', tx.data);
+                    const txNonce = Number(decoded.nonce || 0);
+                    const cached = takeEvolveAuth(txNonce);
+                    if (cached && typeof cached.cost === 'number' && cached.cost > 0) {
+                        derivedScore += Number(cached.cost);
+                        derivedTx += 1;
+                        console.log(`[EVOLVE][FALLBACK] Using cached authorization for nonce=${txNonce}, cost=${cached.cost}`);
+                    }
+                }
+            } catch (e) {
+                console.warn('[EVOLVE][FALLBACK] decode failed:', e.message || e);
             }
         }
 
