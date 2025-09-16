@@ -518,8 +518,11 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
                     });
                 }
                 const db = admin.firestore();
-                const normalized = String(playerAddress).toLowerCase();
-                const docRef = db.collection('WalletScores').doc(normalized);
+                const paLower = String(playerAddress).toLowerCase();
+                const bodyAk = (req.body && req.body.appKitWallet) ? String(req.body.appKitWallet).toLowerCase() : '';
+                const bindingAk = walletBindings.get(paLower);
+                const pointsDocKey = (bodyAk && /^0x[a-f0-9]{40}$/.test(bodyAk)) ? bodyAk : (bindingAk || paLower);
+                const docRef = db.collection('WalletScores').doc(pointsDocKey);
                 const doc = await docRef.get();
                 const serverScore = doc.exists ? Number(doc.data().score || 0) : 0;
                 if (serverScore < requiredPoints) {
@@ -1242,12 +1245,13 @@ const chogIface = new ethers.utils.Interface([
                     });
                 }
                 const db = admin.firestore();
-                const docRef = db.collection('WalletScores').doc(pa);
+                // IMPORTANT: la source de vérité des points est le wallet AppKit (ak)
+                const docRef = db.collection('WalletScores').doc(ak);
                 await db.runTransaction(async (t) => {
                     const snap = await t.get(docRef);
                     const current = snap.exists ? Number(snap.data().score || 0) : 0;
                     const next = Math.max(0, current - derivedScore);
-                    t.set(docRef, { score: next, walletAddress: pa, lastUpdated: admin.firestore.FieldValue.serverTimestamp(), lastEvolutionTimestamp: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+                    t.set(docRef, { score: next, walletAddress: ak, lastUpdated: admin.firestore.FieldValue.serverTimestamp(), lastEvolutionTimestamp: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
                 });
                 console.log(`[POINTS] ✅ Décrément appliqué après evolve: -${derivedScore} pour ${pa}`);
             } catch (debitErr) {
