@@ -470,10 +470,14 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
 
 app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
-        const { playerAddress, tokenId, targetLevel, playerPoints } = req.body || {};
+        const { playerAddress, appKitWallet, tokenId, targetLevel, playerPoints } = req.body || {};
 
-        if (!playerAddress || tokenId === undefined || targetLevel === undefined) {
-            return res.status(400).json({ error: "Adresse du joueur, ID du token et niveau cible requis" });
+        if (!playerAddress || !appKitWallet || tokenId === undefined || targetLevel === undefined) {
+            return res.status(400).json({ error: "Paramètres requis: playerAddress, appKitWallet, tokenId, targetLevel" });
+        }
+        const akLower = String(appKitWallet).toLowerCase();
+        if (!/^0x[a-f0-9]{40}$/.test(akLower)) {
+            return res.status(400).json({ error: "appKitWallet invalide" });
         }
 
         const evolutionCosts = {
@@ -518,11 +522,8 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
                     });
                 }
                 const db = admin.firestore();
-                const paLower = String(playerAddress).toLowerCase();
-                const bodyAk = (req.body && req.body.appKitWallet) ? String(req.body.appKitWallet).toLowerCase() : '';
-                const bindingAk = walletBindings.get(paLower);
-                const pointsDocKey = (bodyAk && /^0x[a-f0-9]{40}$/.test(bodyAk)) ? bodyAk : (bindingAk || paLower);
-                const docRef = db.collection('WalletScores').doc(pointsDocKey);
+                // Vérification UNIQUEMENT sur le wallet AppKit courant
+                const docRef = db.collection('WalletScores').doc(akLower);
                 const doc = await docRef.get();
                 const serverScore = doc.exists ? Number(doc.data().score || 0) : 0;
                 if (serverScore < requiredPoints) {
@@ -568,8 +569,8 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
                     });
                 }
                 const db = admin.firestore();
-                const normalized = String(playerAddress).toLowerCase();
-                const docRef = db.collection('WalletScores').doc(normalized);
+                // STRICT: utiliser le wallet AppKit courant
+                const docRef = db.collection('WalletScores').doc(akLower);
                 const doc = await docRef.get();
                 const serverScore = doc.exists ? Number(doc.data().score || 0) : 0;
                 if (serverScore < requiredPoints) {
