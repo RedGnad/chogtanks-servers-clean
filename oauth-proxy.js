@@ -9,9 +9,10 @@ const fs = require('fs');
 const path = require('path');
 
 const override = process.env.SIGNATURE_SERVER_PATH;
+// Préfère toujours la version dans chogtanks-servers-clean si présente
 const candidates = override ? [override] : [
-	'./signature-server.js',
-	'./chogtanks-servers-clean/signature-server.js'
+	'./chogtanks-servers-clean/signature-server.js',
+	'./signature-server.js'
 ];
 
 function resolveCandidate(candidate) {
@@ -21,6 +22,7 @@ function resolveCandidate(candidate) {
 }
 
 const found = candidates.map(resolveCandidate).find(Boolean);
+console.log('[BOOT] Candidats signature-server:', candidates.join(', '));
 
 if (!found) {
 	console.error('[BOOT] Aucun signature-server trouvé. Candidats testés:', candidates.join(', '));
