@@ -308,7 +308,7 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
             if (!rec) {
                 return res.status(401).json({ error: 'Invalid matchToken' });
             }
-            if (rec.used) {
+            if (rec.usedFirebase) {
                 return res.status(401).json({ error: 'Match token already used' });
             }
             if (rec.expAt < Date.now()) {
@@ -378,8 +378,8 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
             } else if (rec.gameId && room && rec.gameId !== room) {
                 return res.status(401).json({ error: 'Match token not for this room' });
             }
-            // Marquer le token utilisé seulement après validations de cohérence
-            rec.used = true;
+            // Marquer l'utilisation Firebase seulement après validations de cohérence
+            rec.usedFirebase = true;
             matchTokens.set(matchToken, rec);
         }
         
@@ -557,9 +557,7 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
             if (!rec) {
                 return res.status(401).json({ error: 'Invalid matchToken' });
             }
-            if (rec.used) {
-                return res.status(401).json({ error: 'Match token already used' });
-            }
+            // Le token peut avoir été consommé par la route Firebase; on l'autorise si même room/actor
             if (rec.expAt < Date.now()) {
                 matchTokens.delete(matchToken);
                 return res.status(401).json({ error: 'Match token expired' });
@@ -586,6 +584,7 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
             if (!room) {
                 return res.status(400).json({ error: 'Missing gameId (Photon room)' });
             }
+            // Idempotence: si déjà soumis via Firebase/Privy pour ce couple, on refuse
             if (room && userKey && hasRoomActorSubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Score already submitted for this match' });
             }
@@ -605,7 +604,10 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
             } else if (recRoom && room && recRoom !== room) {
                 return res.status(401).json({ error: 'Match token not for this room' });
             }
-            rec.used = true;
+            // Ne pas durcir: si already usedFirebase, on n'écrase pas, sinon marquer usedPrivy
+            if (!rec.usedFirebase) {
+                rec.usedPrivy = true;
+            }
             matchTokens.set(matchToken, rec);
         }
 
