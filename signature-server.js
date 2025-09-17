@@ -1368,8 +1368,12 @@ app.post('/photon/webhook', (req, res) => {
         }
 
         const body = req.body || {};
-        // Support Photon v1.2 and v2 field names
-        const type = String(body.Type || body.type || body.eventType || '').toLowerCase();
+        // Support Photon v1.2 and v2 field names + normalize property events
+        let type = String(body.Type || body.type || body.eventType || '').toLowerCase();
+        // Normaliser les alias d'événements de propriétés vers 'gameproperties'
+        if (['propertieschanged', 'roomproperties', 'propertyupdate', 'customproperties'].includes(type)) {
+            type = 'gameproperties';
+        }
         const gameId = String(body.GameId || body.gameId || body.roomName || body.room || '').trim();
         const userId = String(body.UserId || body.userId || '').trim();
         const actorKey = String(body.ActorNr || body.actorNr || body.ActorNumber || body.actorNumber || '').trim();
@@ -1429,6 +1433,7 @@ app.post('/photon/webhook', (req, res) => {
                         if (/^0x[a-f0-9]{40}$/.test(maybePrivyWallet)) {
                             if (!sess.privyWallets) sess.privyWallets = {};
                             sess.privyWallets[key] = maybePrivyWallet;
+                            console.log(`[PHOTON][WEBHOOK][EVENT] Stored Privy wallet for ${key}: ${maybePrivyWallet}`);
                         }
                     }
                 } catch (_) {}
@@ -1438,12 +1443,16 @@ app.post('/photon/webhook', (req, res) => {
                 if (userId) { sess.users[userId] = { lastSeen: now }; }
                 if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
                 try {
-                    const data = body.Data || body.data || {};
-                    const maybePrivyWallet = String(data.privyWallet || '').trim().toLowerCase();
+                    // Lire Properties (room custom properties) ET Data (fallback)
+                    const props = body.Properties || body.properties || body.Data || body.data || {};
+                    const maybePrivyWallet = String(props.privyWallet || '').trim().toLowerCase();
                     if (/^0x[a-f0-9]{40}$/.test(maybePrivyWallet)) {
                         if (!sess.privyWallets) sess.privyWallets = {};
                         const key = actorKey || userId;
-                        if (key) sess.privyWallets[key] = maybePrivyWallet;
+                        if (key) {
+                            sess.privyWallets[key] = maybePrivyWallet;
+                            console.log(`[PHOTON][WEBHOOK][GAMEPROPS] Stored Privy wallet for ${key}: ${maybePrivyWallet}`);
+                        }
                     }
                 } catch (_) {}
                 break;
