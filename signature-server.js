@@ -5,6 +5,7 @@ let helmet = null;
 require('dotenv').config();
 
 const app = express();
+const crypto = require('crypto');
 app.disable('x-powered-by');
 // Render (proxy) – nécessaire pour que express-rate-limit lise X-Forwarded-For correctement
 app.set('trust proxy', 1);
@@ -43,6 +44,20 @@ function buildRouteLimiter(options) {
         });
     } catch (_) {
         return (req, res, next) => next();
+    }
+}
+// HMAC par match (défense supplémentaire contre requêtes falsifiées)
+const MATCH_SECRET = process.env.MATCH_SECRET || '';
+function computeMatchSig(token, uid) {
+    try {
+        if (!MATCH_SECRET) return null;
+        const h = crypto.createHmac('sha256', MATCH_SECRET);
+        h.update(String(token || ''));
+        h.update('|');
+        h.update(String(uid || ''));
+        return h.digest('hex');
+    } catch (_) {
+        return null;
     }
 }
 
@@ -258,19 +273,24 @@ app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAu
         const uid = req.firebaseAuth?.uid || null;
         // Optionnellement lier immédiatement à un gameId si fourni
         const providedGameId = typeof req.body?.gameId === 'string' ? req.body.gameId.trim() : null;
-        matchTokens.set(matchToken, {
+        const rec = {
             uid,
             createdAt: now,
             expAt: now + expiresInMs,
             used: false,
             gameId: providedGameId || null
-        });
+        };
+        // Calculer une signature serveur si MATCH_SECRET défini
+        const sig = computeMatchSig(matchToken, uid);
+        if (sig) rec.sig = sig;
+        matchTokens.set(matchToken, rec);
         
         console.log(`[MATCH-START] Generated match token: ${matchToken}`);
         
         return res.json({
             matchToken: matchToken,
             expiresInMs: expiresInMs,
+            matchSig: sig || null,
             success: true
         });
     } catch (error) {
@@ -292,6 +312,9 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
         
         const normalized = walletAddress.toLowerCase();
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
+        if (totalScore <= 0) {
+            return res.status(204).end();
+        }
         // Cap doux par match (configurable)
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
         const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
@@ -310,6 +333,14 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
             }
             if (rec.usedFirebase) {
                 return res.status(401).json({ error: 'Match token already used' });
+            }
+            // HMAC check (si activé)
+            if (MATCH_SECRET) {
+                const providedSig = req.headers['x-match-sig'] || req.headers['x_match_sig'] || req.headers['x-matchsig'];
+                const expected = computeMatchSig(matchToken, req.firebaseAuth?.uid || '');
+                if (!providedSig || String(providedSig) !== expected) {
+                    return res.status(401).json({ error: 'Invalid match signature' });
+                }
             }
             if (rec.expAt < Date.now()) {
                 matchTokens.delete(matchToken);
@@ -555,6 +586,9 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
         const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        if (cappedScore <= 0) {
+            return res.status(204).end();
+        }
 
         // Enforce match token usage si auth active
         if (process.env.FIREBASE_REQUIRE_AUTH === '1') {
@@ -564,6 +598,14 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
             const rec = matchTokens.get(matchToken);
             if (!rec) {
                 return res.status(401).json({ error: 'Invalid matchToken' });
+            }
+            // HMAC check (si activé)
+            if (MATCH_SECRET) {
+                const providedSig = req.headers['x-match-sig'] || req.headers['x_match_sig'] || req.headers['x-matchsig'];
+                const expected = computeMatchSig(matchToken, req.firebaseAuth?.uid || '');
+                if (!providedSig || String(providedSig) !== expected) {
+                    return res.status(401).json({ error: 'Invalid match signature' });
+                }
             }
             // Le token peut avoir été consommé par la route Firebase; on l'autorise si même room/actor
             if (rec.expAt < Date.now()) {
@@ -1192,11 +1234,14 @@ async function flushBatchIfNeeded(force = false) {
             // Partitionner en chunks de taille BATCH_MAX
             for (let i = 0; i < entries.length; i += BATCH_MAX) {
                 const chunk = entries.slice(i, i + BATCH_MAX);
-                const dataTuples = chunk.map(([addr, agg]) => ({
-                    player: addr,
-                    score: ethers.BigNumber.from(agg.score),
-                    transactions: ethers.BigNumber.from(agg.tx)
-                }));
+                const dataTuples = chunk
+                    .map(([addr, agg]) => ({ addr, agg }))
+                    .filter(({ agg }) => Number(agg.score || 0) > 0)
+                    .map(({ addr, agg }) => ({
+                        player: addr,
+                        score: ethers.BigNumber.from(agg.score),
+                        transactions: ethers.BigNumber.from(agg.tx)
+                    }));
 
                 // Appel on-chain batch (tuple[])
                 const rpcUrl = process.env.MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz/';
@@ -1208,6 +1253,9 @@ async function flushBatchIfNeeded(force = false) {
                 ];
                 const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
+                if (dataTuples.length === 0) {
+                    continue; // rien à envoyer dans ce chunk
+                }
                 console.log(`[Monad Games ID][BATCH] Flushing ${dataTuples.length} updates...`);
 
                 // Preflight
