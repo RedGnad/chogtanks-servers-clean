@@ -341,8 +341,13 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
               }
             }
 
+            // Mode strict: exiger un room explicite, pas de fallback global par actor
+            const REQUIRE_EXPLICIT_ROOM = process.env.REQUIRE_EXPLICIT_ROOM === '1';
+            const DISALLOW_ACTOR_ONLY = process.env.DISALLOW_ACTOR_ONLY === '1';
             if (!room) {
-                // Fallback: déduire la room récente pour cet actor
+                if (REQUIRE_EXPLICIT_ROOM) {
+                    return res.status(400).json({ error: 'Missing gameId (explicit room required)' });
+                }
                 const deduced = findRecentRoomForActor(userKey);
                 if (deduced) room = deduced;
             }
@@ -358,7 +363,10 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
 
             // Accepte si présence fraîche OU dans la fenêtre de grâce après fermeture
             if (!userKey || !hasAcceptablePhotonPresence(room, userKey)) {
-                // Fallback: si l'acteur est frais dans une autre room, accepte (certaines implémentations Photon envoient des close/leave tardifs)
+                if (REQUIRE_EXPLICIT_ROOM) {
+                    console.warn('[SUBMIT-SCORE][PHOTON-CHECK][STRICT] Reject explicit room presence: room=%s userKey=%s', room, userKey);
+                    return res.status(403).json({ error: 'Photon presence not verified (explicit room required)' });
+                }
                 const altRoom = findRecentRoomForActor(userKey);
                 if (!altRoom || !hasAcceptablePhotonPresence(altRoom, userKey)) {
                     console.warn('[SUBMIT-SCORE][PHOTON-CHECK] Reject: room=%s userKey=%s ttl=%d grace=%d', room, userKey, PHOTON_PRESENCE_TTL_MS, PHOTON_GRACE_AFTER_CLOSE_MS);
@@ -577,7 +585,12 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
                 if (m && m[1]) userKey = m[1];
             }
 
+            const REQUIRE_EXPLICIT_ROOM = process.env.REQUIRE_EXPLICIT_ROOM === '1';
+            const DISALLOW_ACTOR_ONLY = process.env.DISALLOW_ACTOR_ONLY === '1';
             if (!room) {
+                if (REQUIRE_EXPLICIT_ROOM) {
+                    return res.status(400).json({ error: 'Missing gameId (explicit room required)' });
+                }
                 const deduced = findRecentRoomForActor(userKey);
                 if (deduced) room = deduced;
             }
@@ -589,6 +602,9 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
                 return res.status(409).json({ error: 'Score already submitted for this match' });
             }
             if (!userKey || !hasAcceptablePhotonPresence(room, userKey)) {
+                if (REQUIRE_EXPLICIT_ROOM) {
+                    return res.status(403).json({ error: 'Photon presence not verified (explicit room required)' });
+                }
                 const altRoom = findRecentRoomForActor(userKey);
                 if (!altRoom || !hasAcceptablePhotonPresence(altRoom, userKey)) {
                     return res.status(403).json({ error: 'Photon presence not verified for this match' });
@@ -603,6 +619,18 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
                 rec.gameId = room;
             } else if (recRoom && room && recRoom !== room) {
                 return res.status(401).json({ error: 'Match token not for this room' });
+            }
+            if (DISALLOW_ACTOR_ONLY) {
+                const isNumericActor = typeof userKey === 'string' && /^\d+$/.test(userKey);
+                if (isNumericActor && (!req.firebaseAuth?.uid || String(req.firebaseAuth.uid).length < 10)) {
+                    return res.status(401).json({ error: 'Actor-only user key not allowed in strict mode' });
+                }
+            }
+            if (DISALLOW_ACTOR_ONLY) {
+                const isNumericActor = typeof userKey === 'string' && /^\d+$/.test(userKey);
+                if (isNumericActor && (!req.firebaseAuth?.uid || String(req.firebaseAuth.uid).length < 10)) {
+                    return res.status(401).json({ error: 'Actor-only user key not allowed in strict mode' });
+                }
             }
             // Ne pas durcir: si already usedFirebase, on n'écrase pas, sinon marquer usedPrivy
             if (!rec.usedFirebase) {
