@@ -512,8 +512,8 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
             // Marquer l'utilisation Firebase seulement après validations de cohérence
             rec.usedFirebase = true;
             matchTokens.set(matchToken, rec);
-            // Marquer le couple room|actor comme utilisé pour le canal Privy
-            if (room && userKey) markRoomActorPrivySubmitted(room, userKey);
+            // Marquer le couple room|actor comme utilisé pour le canal Firebase (PAS Privy)
+            if (room && userKey) markRoomActorSubmitted(room, userKey);
         }
         
         console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
