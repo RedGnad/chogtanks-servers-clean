@@ -392,6 +392,30 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
                 return res.status(409).json({ error: 'Score already submitted for this match' });
             }
 
+            // Option: imposer que le score Privy corresponde au wallet vu côté Photon pour cet acteur
+            const ENFORCE_PRIVY_FROM_PRESENCE = process.env.ENFORCE_WALLET_FROM_PRESENCE_PRIVY === '1';
+            if (ENFORCE_PRIVY_FROM_PRESENCE) {
+                try {
+                    const sess = photonSessions[String(room)] || {};
+                    const expected = sess.wallets ? sess.wallets[String(userKey)] : null;
+                    if (expected && expected !== player) {
+                        return res.status(403).json({ error: 'Privy wallet mismatch with Photon presence' });
+                    }
+                } catch (_) {}
+            }
+
+            // Option: imposer que le wallet AppKit soumis corresponde à celui observé via Photon pour cet acteur
+            const ENFORCE_APPKIT_FROM_PRESENCE = process.env.ENFORCE_WALLET_FROM_PRESENCE_APPKIT === '1';
+            if (ENFORCE_APPKIT_FROM_PRESENCE) {
+                try {
+                    const sess = photonSessions[String(room)] || {};
+                    const expected = sess.wallets ? sess.wallets[String(userKey)] : null;
+                    if (expected && expected !== normalized) {
+                        return res.status(403).json({ error: 'Wallet mismatch with Photon presence' });
+                    }
+                } catch (_) {}
+            }
+
             // Accepte si présence fraîche OU dans la fenêtre de grâce après fermeture
             if (!userKey || !hasAcceptablePhotonPresence(room, userKey)) {
                 if (REQUIRE_EXPLICIT_ROOM) {
@@ -467,6 +491,24 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
                     lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
                     matchId: matchId || 'legacy'
                 }, { merge: true });
+
+                // Enregistrer le delta de match par uid pour validation Privy ultérieure
+                try {
+                    const uid = req.firebaseAuth?.uid;
+                    if (uid) {
+                        const stateRef = db.collection('UserMatchState').doc(String(uid));
+                        await stateRef.set({
+                            lastMatchId: matchId || null,
+                            lastMatchToken: matchToken || null,
+                            lastMatchDelta: cappedScore,
+                            lastMatchSig: (matchToken && MATCH_SECRET) ? computeMatchSig(matchToken, uid) : null,
+                            lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+                            usedByPrivy: false
+                        }, { merge: true });
+                    }
+                } catch (e) {
+                    console.warn('[MATCH-DELTA] failed to write UserMatchState:', e.message || e);
+                }
                 
                 // Marquer le couple room|actor comme utilisé (idempotence per-match)
                 try {
@@ -679,6 +721,61 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
                 rec.usedPrivy = true;
             }
             matchTokens.set(matchToken, rec);
+        }
+
+        // Si exigence stricte du delta: vérifier la cohérence avec Firebase
+        const MANDATE_MATCH_DELTA = process.env.MANDATE_MATCH_DELTA === '1';
+        if (MANDATE_MATCH_DELTA && process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
+            try {
+                const admin = require('firebase-admin');
+                if (!admin.apps.length) {
+                    const serviceAccount = {
+                        type: "service_account",
+                        project_id: process.env.FIREBASE_PROJECT_ID,
+                        private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+                        private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+                        client_email: process.env.FIREBASE_CLIENT_EMAIL,
+                        client_id: process.env.FIREBASE_CLIENT_ID,
+                        auth_uri: "https://accounts.google.com/o/oauth2/auth",
+                        token_uri: "https://oauth2.googleapis.com/token",
+                        auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+                        client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
+                    };
+                    admin.initializeApp({
+                        credential: admin.credential.cert(serviceAccount),
+                        projectId: process.env.FIREBASE_PROJECT_ID
+                    });
+                }
+                const db = admin.firestore();
+                const uid = req.firebaseAuth?.uid || null;
+                if (uid) {
+                    const stateRef = db.collection('UserMatchState').doc(String(uid));
+                    const snap = await stateRef.get();
+                    const st = snap.exists ? (snap.data() || {}) : {};
+                    // Vérifie token, matchId, signature et delta
+                    if (st.lastMatchToken !== matchToken) {
+                        return res.status(409).json({ error: 'Mismatch match token' });
+                    }
+                    if (typeof matchId === 'string' && st.lastMatchId && st.lastMatchId !== matchId) {
+                        return res.status(409).json({ error: 'Mismatch match id' });
+                    }
+                    const expectedSig = (matchToken && MATCH_SECRET) ? computeMatchSig(matchToken, uid) : null;
+                    if (expectedSig && st.lastMatchSig && st.lastMatchSig !== expectedSig) {
+                        return res.status(409).json({ error: 'Mismatch match signature' });
+                    }
+                    const delta = Number(st.lastMatchDelta || 0);
+                    if (delta !== Number(cappedScore)) {
+                        return res.status(409).json({ error: 'Score tamper detected' });
+                    }
+                    if (st.usedByPrivy === true) {
+                        return res.status(409).json({ error: 'Match delta already consumed' });
+                    }
+                    await stateRef.set({ usedByPrivy: true }, { merge: true });
+                }
+            } catch (e) {
+                console.warn('[MATCH-DELTA][Privy] validation failed:', e.message || e);
+                return res.status(503).json({ error: 'Match delta validation unavailable' });
+            }
         }
 
         // Si batch activé: on queue le score avec tx=0
@@ -1037,7 +1134,7 @@ function savePhotonSessions(state) {
     }
 }
 
-// Structure: { [gameId]: { users: { [userId]: { lastSeen:number } }, createdAt:number, closed:boolean, closedAt:number|null } }
+// Structure: { [gameId]: { users: { [userId]: { lastSeen:number } }, wallets: { [actorOrUser]: address }, createdAt:number, closed:boolean, closedAt:number|null } }
 const photonSessions = loadPhotonSessions();
 
 // Helper: verify a fresh presence for a user in a Photon room
@@ -1130,7 +1227,7 @@ app.post('/photon/webhook', (req, res) => {
 
         if (!gameId) return res.status(400).json({ error: 'Missing GameId' });
 
-        const sess = photonSessions[gameId] || { users: {}, createdAt: now, closed: false };
+        const sess = photonSessions[gameId] || { users: {}, wallets: {}, createdAt: now, closed: false };
         console.log(`[PHOTON][WEBHOOK] type=${type} gameId=${gameId} userId=${userId} actor=${actorKey}`);
         switch (type) {
             case 'create':
@@ -1168,6 +1265,14 @@ app.post('/photon/webhook', (req, res) => {
                 const effectiveUser = userId || uidFromData;
                 if (effectiveUser) { sess.users[effectiveUser] = { lastSeen: now }; }
                 if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
+                // Capture éventuelle du wallet AppKit envoyé dans l'event
+                try {
+                    const maybeWallet = String(data.wallet || data.appKitWallet || '').trim().toLowerCase();
+                    if (/^0x[a-f0-9]{40}$/.test(maybeWallet)) {
+                        const key = actorKey || effectiveUser;
+                        if (key) { sess.wallets[key] = maybeWallet; }
+                    }
+                } catch (_) {}
                 break;
             }
             case 'gameproperties':
