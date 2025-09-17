@@ -61,6 +61,21 @@ function computeMatchSig(token, uid) {
     }
 }
 
+function computeScoreSig(token, uid, score) {
+    try {
+        if (!MATCH_SECRET) return null;
+        const h = crypto.createHmac('sha256', MATCH_SECRET);
+        h.update(String(token || ''));
+        h.update('|');
+        h.update(String(uid || ''));
+        h.update('|');
+        h.update(String(Number(score || 0)));
+        return h.digest('hex');
+    } catch (_) {
+        return null;
+    }
+}
+
 // Route-specific rate limiters (no-op if lib missing)
 const matchStartLimiter = buildRouteLimiter({
     windowMs: Number(process.env.MATCH_START_WINDOW_MS || 60_000),
@@ -296,6 +311,32 @@ app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAu
     } catch (error) {
         console.error('[MATCH-START] Error:', error);
         res.status(500).json({ error: 'Failed to start match', details: error.message });
+    }
+});
+
+// Signature de score (anti "copy as fetch" sans Firebase delta)
+app.post('/api/match/sign-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+    try {
+        if (!MATCH_SECRET) return res.status(503).json({ error: 'Score signing disabled' });
+        const { matchToken, score } = req.body || {};
+        if (!matchToken || typeof matchToken !== 'string') {
+            return res.status(400).json({ error: 'Missing matchToken' });
+        }
+        const rec = matchTokens.get(matchToken);
+        if (!rec) return res.status(401).json({ error: 'Invalid matchToken' });
+        if (rec.expAt < Date.now()) {
+            matchTokens.delete(matchToken);
+            return res.status(401).json({ error: 'Match token expired' });
+        }
+        const uid = req.firebaseAuth?.uid || null;
+        if (rec.uid && uid && rec.uid !== uid) {
+            return res.status(401).json({ error: 'Match token does not belong to this user' });
+        }
+        const sig = computeScoreSig(matchToken, uid, Number(score || 0));
+        return res.json({ scoreSig: sig, success: true });
+    } catch (e) {
+        console.error('[MATCH][sign-score] error:', e.message || e);
+        return res.status(500).json({ error: 'Failed to sign score' });
     }
 });
 
@@ -721,6 +762,15 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
                 rec.usedPrivy = true;
             }
             matchTokens.set(matchToken, rec);
+
+            // Option: exiger signature de score si activée
+            if (process.env.REQUIRE_SCORE_SIG === '1') {
+                const providedScoreSig = req.headers['x-score-sig'] || req.headers['x_score_sig'] || null;
+                const expectedScoreSig = computeScoreSig(matchToken, req.firebaseAuth?.uid || '', Number(cappedScore));
+                if (!providedScoreSig || providedScoreSig !== expectedScoreSig) {
+                    return res.status(401).json({ error: 'Invalid score signature' });
+                }
+            }
         }
 
         // Si exigence stricte du delta: vérifier la cohérence avec Firebase
