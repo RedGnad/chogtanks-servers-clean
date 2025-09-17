@@ -1159,38 +1159,51 @@ async function flushBatchIfNeeded(force = false) {
     
     isFlushing = true;
     try {
-        // Préparer tableaux
-        const entries = Array.from(batchQueue.entries());
-        // Partitionner en chunks de taille BATCH_MAX
-        for (let i = 0; i < entries.length; i += BATCH_MAX) {
-            const chunk = entries.slice(i, i + BATCH_MAX);
-            const players = [];
-            const scores = [];
-            const txs = [];
-            for (const [addr, agg] of chunk) {
-                players.push(addr);
-                scores.push(ethers.BigNumber.from(agg.score));
-                txs.push(ethers.BigNumber.from(agg.tx));
-            }
+            // Préparer tuples
+            const entries = Array.from(batchQueue.entries());
+            // Partitionner en chunks de taille BATCH_MAX
+            for (let i = 0; i < entries.length; i += BATCH_MAX) {
+                const chunk = entries.slice(i, i + BATCH_MAX);
+                const dataTuples = chunk.map(([addr, agg]) => ({
+                    player: addr,
+                    score: ethers.BigNumber.from(agg.score),
+                    transactions: ethers.BigNumber.from(agg.tx)
+                }));
 
-            // Appel on-chain batch
-            const rpcUrl = process.env.MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz/';
-            const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
-            const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
-            const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
-            const contractABI = [
-                'function batchUpdatePlayerData((address player,uint256 score,uint256 transactions)[] data)'
-            ];
-            const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
+                // Appel on-chain batch (tuple[])
+                const rpcUrl = process.env.MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz/';
+                const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+                const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
+                const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
+                const contractABI = [
+                    'function batchUpdatePlayerData((address player,uint256 score,uint256 transactions)[] data)'
+                ];
+                const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
-            console.log(`[Monad Games ID][BATCH] Flushing ${players.length} updates...`);
-            const nonce = await getNextNonce(wallet);
-            const tx = await contract.batchUpdatePlayerData(players, scores, txs, {
-                gasLimit: 600000, // batch → plus de gas
-                maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
-                maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
-                nonce
-            });
+                console.log(`[Monad Games ID][BATCH] Flushing ${dataTuples.length} updates...`);
+
+                // Preflight
+                try {
+                    await contract.callStatic.batchUpdatePlayerData(dataTuples);
+                } catch (e) {
+                    console.warn('[Monad Games ID][BATCH] preflight failed:', e.message || e);
+                    continue; // ne vide pas le chunk, on réessaiera plus tard
+                }
+
+                // Gas estimate (+20%)
+                let gasLimit = ethers.BigNumber.from(600000);
+                try {
+                    const est = await contract.estimateGas.batchUpdatePlayerData(dataTuples);
+                    gasLimit = est.mul(120).div(100);
+                } catch (_) {}
+
+                const nonce = await getNextNonce(wallet);
+                const tx = await contract.batchUpdatePlayerData(dataTuples, {
+                    gasLimit,
+                    maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
+                    maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+                    nonce
+                });
             console.log(`[Monad Games ID][BATCH] Tx sent: ${tx.hash}`);
             // Backoff simple et attente confirmable
             const receipt = await tx.wait().catch(async (e) => {
@@ -1433,9 +1446,22 @@ const chogIface = new ethers.utils.Interface([
                 ];
                 const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
-                console.log(`[Monad Games ID] Calling updatePlayerData(${pa}, ${derivedScore}, ${derivedTx})`);
+                const dataTuple = { player: pa, score: ethers.BigNumber.from(derivedScore), transactions: ethers.BigNumber.from(derivedTx) };
+                console.log(`[Monad Games ID] Calling updatePlayerData tuple for ${pa}: score=${derivedScore}, tx=${derivedTx})`);
+                // Preflight
+                try {
+                    await contract.callStatic.updatePlayerData(dataTuple);
+                } catch (e) {
+                    return res.status(409).json({ error: 'Preflight failed', details: e.message || String(e) });
+                }
+                let gasLimit = ethers.BigNumber.from(150000);
+                try {
+                    const est = await contract.estimateGas.updatePlayerData(dataTuple);
+                    gasLimit = est.mul(120).div(100);
+                } catch (_) {}
                 const nonce = await getNextNonce(wallet);
-                const tx = await contract.updatePlayerData(pa, derivedScore, derivedTx, {
+                const tx = await contract.updatePlayerData(dataTuple, {
+                    gasLimit,
                     gasLimit: 150000,
                     maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
                     maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
