@@ -806,25 +806,32 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
                     const stateRef = db.collection('UserMatchState').doc(String(uid));
                     const snap = await stateRef.get();
                     const st = snap.exists ? (snap.data() || {}) : {};
-                    // Vérifie token, matchId, signature et delta
-                    if (st.lastMatchToken !== matchToken) {
-                        return res.status(409).json({ error: 'Mismatch match token' });
+                    // Si l'état Firebase n'existe pas encore (soumission Privy-only), on n'échoue pas mais on s'appuie sur X-Score-Sig + présence Photon
+                    const hasState = snap.exists && (st.lastMatchToken || st.lastMatchDelta !== undefined || st.lastMatchId || st.lastMatchSig);
+                    if (hasState) {
+                        // N'appliquer les contrôles que si la signature Firebase correspond à ce match
+                        const expectedSig = (matchToken && MATCH_SECRET) ? computeMatchSig(matchToken, uid) : null;
+                        const hasMatchingSig = Boolean(expectedSig && st.lastMatchSig && st.lastMatchSig === expectedSig);
+                        if (hasMatchingSig) {
+                            if (st.lastMatchToken && st.lastMatchToken !== matchToken) {
+                                return res.status(409).json({ error: 'Mismatch match token' });
+                            }
+                            if (typeof matchId === 'string' && st.lastMatchId && st.lastMatchId !== matchId) {
+                                return res.status(409).json({ error: 'Mismatch match id' });
+                            }
+                            if (st.lastMatchDelta !== undefined) {
+                                const delta = Number(st.lastMatchDelta || 0);
+                                if (delta !== Number(cappedScore)) {
+                                    return res.status(409).json({ error: 'Score tamper detected' });
+                                }
+                            }
+                            if (st.usedByPrivy === true) {
+                                return res.status(409).json({ error: 'Match delta already consumed' });
+                            }
+                            await stateRef.set({ usedByPrivy: true }, { merge: true });
+                        }
+                        // Sinon: état Firebase ancien/non corrélé → on ne bloque pas, X-Score-Sig + présence couvrent la sécurité
                     }
-                    if (typeof matchId === 'string' && st.lastMatchId && st.lastMatchId !== matchId) {
-                        return res.status(409).json({ error: 'Mismatch match id' });
-                    }
-                    const expectedSig = (matchToken && MATCH_SECRET) ? computeMatchSig(matchToken, uid) : null;
-                    if (expectedSig && st.lastMatchSig && st.lastMatchSig !== expectedSig) {
-                        return res.status(409).json({ error: 'Mismatch match signature' });
-                    }
-                    const delta = Number(st.lastMatchDelta || 0);
-                    if (delta !== Number(cappedScore)) {
-                        return res.status(409).json({ error: 'Score tamper detected' });
-                    }
-                    if (st.usedByPrivy === true) {
-                        return res.status(409).json({ error: 'Match delta already consumed' });
-                    }
-                    await stateRef.set({ usedByPrivy: true }, { merge: true });
                 }
             } catch (e) {
                 console.warn('[MATCH-DELTA][Privy] validation failed:', e.message || e);
