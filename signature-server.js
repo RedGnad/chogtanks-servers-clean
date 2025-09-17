@@ -300,7 +300,8 @@ app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAu
         if (sig) rec.sig = sig;
         matchTokens.set(matchToken, rec);
         
-        console.log(`[MATCH-START] Generated match token: ${matchToken}`);
+        const tail = matchToken.slice(-6);
+        console.log(`[MATCH-START] Generated match token: ****${tail}`);
         
         return res.json({
             matchToken: matchToken,
