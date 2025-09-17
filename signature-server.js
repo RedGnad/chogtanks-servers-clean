@@ -448,6 +448,63 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
 
                 console.log(`[SUBMIT-SCORE] ✅ Score sauvegardé dans Firebase: ${currentScore} + ${totalScore} = ${newTotalScore}`);
                 console.log(`[MONITORING] 📊 SCORE SUBMISSION - Wallet: ${normalized}, Score Added: ${totalScore}, New Total: ${newTotalScore}, Timestamp: ${new Date().toISOString()}`);
+
+                // Option: pousser aussi vers Monad Games ID (leaderboard) pour TOUS les joueurs (Privy ou AppKit)
+                try {
+                    if (process.env.ENABLE_PRIVY_SCORE_TO_MONAD === '1') {
+                        const scoreDelta = Number(Math.max(0, Math.min(totalScore, Number(process.env.MAX_SCORE_PER_MATCH || 50))));
+                        if (scoreDelta > 0) {
+                            const playerAddr = normalized; // Privy address as player identifier
+                            if (process.env.ENABLE_MONAD_BATCH === '1') {
+                                // Utilise le batch existant
+                                enqueuePlayerUpdate(playerAddr, scoreDelta, 1, null);
+                            } else {
+                                // Envoi immédiat non bloquant (fire-and-forget)
+                                (async () => {
+                                    try {
+                                        const rpcUrl = process.env.MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz/';
+                                        const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+                                        const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
+                                        const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
+                                        const contractABI = [
+                                            'function updatePlayerData((address player,uint256 score,uint256 transactions) _playerData)'
+                                        ];
+                                        const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
+                                        const playerData = {
+                                            player: playerAddr,
+                                            score: ethers.BigNumber.from(scoreDelta),
+                                            transactions: ethers.BigNumber.from(1)
+                                        };
+                                        const MONAD_PREFLIGHT = process.env.MONAD_PREFLIGHT === '1';
+                                        const MONAD_PREFLIGHT_STRICT = process.env.MONAD_PREFLIGHT_STRICT === '1';
+                                        if (MONAD_PREFLIGHT) {
+                                            try { await contract.callStatic.updatePlayerData(playerData); } catch (_) { if (MONAD_PREFLIGHT_STRICT) return; }
+                                        }
+                                        let gasLimit = ethers.BigNumber.from(150000);
+                                        if (MONAD_PREFLIGHT) {
+                                            try { const est = await contract.estimateGas.updatePlayerData(playerData); gasLimit = est.mul(120).div(100); } catch (_) { /* fallback 150k */ }
+                                        }
+                                        while (serverTxMutex) { await new Promise(r => setTimeout(r, 50)); }
+                                        serverTxMutex = true;
+                                        try {
+                                            const nonce = await getNextNonce(wallet);
+                                            await contract.updatePlayerData(playerData, {
+                                                gasLimit,
+                                                maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
+                                                maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+                                                nonce
+                                            });
+                                        } finally {
+                                            serverTxMutex = false;
+                                        }
+                                    } catch (e) {
+                                        try { console.warn('[SUBMIT-SCORE][MONAD] immediate update failed'); } catch (_) {}
+                                    }
+                                })();
+                            }
+                        }
+                    }
+                } catch (_) { /* silent */ }
                 
                 return res.json({
                     success: true,
