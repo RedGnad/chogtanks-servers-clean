@@ -1,3 +1,96 @@
+// Leaderboard Monad-only (Privy) : pas d'écriture Firebase
+app.post('/api/monad-games-id/submit-score', requireWallet, requireFirebaseAuth, async (req, res) => {
+    try {
+        if (process.env.ENABLE_PRIVY_SCORE_TO_MONAD !== '1') {
+            return res.status(503).json({ error: 'Leaderboard service disabled' });
+        }
+
+        const { privyAddress, score, bonus = 0, matchId, matchToken, gameId } = req.body || {};
+        if (!privyAddress || !/^0x[a-fA-F0-9]{40}$/.test(String(privyAddress))) {
+            return res.status(400).json({ error: 'Missing or invalid privyAddress' });
+        }
+        const scoreDelta = Number(score || 0) + Number(bonus || 0);
+        if (scoreDelta <= 0) {
+            return res.status(400).json({ error: 'Score must be > 0' });
+        }
+
+        // Enforce match token usage si auth active
+        if (process.env.FIREBASE_REQUIRE_AUTH === '1') {
+            if (!matchToken || typeof matchToken !== 'string') {
+                return res.status(400).json({ error: 'Missing matchToken' });
+            }
+            const rec = matchTokens.get(matchToken);
+            if (!rec) return res.status(401).json({ error: 'Invalid matchToken' });
+            if (rec.used) return res.status(401).json({ error: 'Match token already used' });
+            if (rec.expAt < Date.now()) {
+                matchTokens.delete(matchToken);
+                return res.status(401).json({ error: 'Match token expired' });
+            }
+            const uid = req.firebaseAuth?.uid || null;
+            if (rec.uid && uid && rec.uid !== uid) {
+                return res.status(401).json({ error: 'Match token does not belong to this user' });
+            }
+            rec.used = true;
+            matchTokens.set(matchToken, rec);
+        }
+
+        // Vérification Photon similaire
+        let room = (typeof gameId === 'string' && gameId.trim()) ? gameId.trim() : ((typeof matchId === 'string' && matchId.trim()) ? matchId.trim() : null);
+        let userKey = req.firebaseAuth?.uid || null;
+        if (typeof matchId === 'string' && matchId.includes('|')) {
+            const parts = matchId.split('|');
+            if (parts[0]) room = parts[0].trim();
+            if (parts[1]) userKey = parts[1].trim();
+        } else if (typeof matchId === 'string') {
+            const m = /^match_(\d+)_/.exec(matchId);
+            if (m && m[1]) userKey = m[1];
+        }
+        if (!room) {
+            const deduced = findRecentRoomForActor(userKey);
+            if (deduced) room = deduced;
+        }
+        if (!room) return res.status(400).json({ error: 'Missing gameId (Photon room)' });
+        if (!userKey || !hasAcceptablePhotonPresence(room, userKey)) {
+            const altRoom = findRecentRoomForActor(userKey);
+            if (!altRoom || !hasAcceptablePhotonPresence(altRoom, userKey)) {
+                return res.status(403).json({ error: 'Photon presence not verified for this match' });
+            }
+            room = altRoom;
+        }
+
+        // Update Monad ID (batch ou immédiat)
+        if (process.env.ENABLE_MONAD_BATCH === '1') {
+            enqueuePlayerUpdate(String(privyAddress).toLowerCase(), scoreDelta, 0, null);
+        } else {
+            (async () => {
+                try {
+                    const rpcUrl = process.env.MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz/';
+                    const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+                    const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
+                    const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
+                    const contractABI = [ 'function updatePlayerData((address player,uint256 score,uint256 transactions) _playerData)' ];
+                    const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
+                    const playerData = { player: String(privyAddress).toLowerCase(), score: ethers.BigNumber.from(scoreDelta), transactions: ethers.BigNumber.from(0) };
+                    const MONAD_PREFLIGHT = process.env.MONAD_PREFLIGHT === '1';
+                    const MONAD_PREFLIGHT_STRICT = process.env.MONAD_PREFLIGHT_STRICT === '1';
+                    if (MONAD_PREFLIGHT) { try { await contract.callStatic.updatePlayerData(playerData); } catch (_) { if (MONAD_PREFLIGHT_STRICT) return; } }
+                    let gasLimit = ethers.BigNumber.from(150000);
+                    if (MONAD_PREFLIGHT) { try { const est = await contract.estimateGas.updatePlayerData(playerData); gasLimit = est.mul(120).div(100); } catch (_) {} }
+                    while (serverTxMutex) { await new Promise(r => setTimeout(r, 50)); }
+                    serverTxMutex = true;
+                    try {
+                        const nonce = await getNextNonce(wallet);
+                        await contract.updatePlayerData(playerData, { gasLimit, maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'), maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'), nonce });
+                    } finally { serverTxMutex = false; }
+                } catch (_) {}
+            })();
+        }
+
+        return res.json({ success: true, player: String(privyAddress).toLowerCase(), scoreAdded: scoreDelta, tx: 0, validated: true });
+    } catch (e) {
+        return res.status(500).json({ error: 'Failed to submit leaderboard score' });
+    }
+});
 const express = require('express');
 const { ethers } = require('ethers');
 const cors = require('cors');
