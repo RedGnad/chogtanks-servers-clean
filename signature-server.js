@@ -433,7 +433,7 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
                 return res.status(400).json({ error: 'Missing gameId (Photon room)' });
             }
 
-            // Vérrou tentative multi-submit: refuser si déjà soumis pour ce room|actor
+            // Vérrou tentative multi-submit (canal Firebase): refuser si déjà soumis côté Firebase
             if (room && userKey && hasRoomActorSubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Score already submitted for this match' });
             }
@@ -443,7 +443,7 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
             if (ENFORCE_PRIVY_FROM_PRESENCE) {
                 try {
                     const sess = photonSessions[String(room)] || {};
-                    const expected = sess.wallets ? sess.wallets[String(userKey)] : null;
+                    const expected = sess.privyWallets ? sess.privyWallets[String(userKey)] : null;
                     if (expected && expected !== player) {
                         return res.status(403).json({ error: 'Privy wallet mismatch with Photon presence' });
                     }
@@ -476,7 +476,7 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
                 room = altRoom;
             }
 
-            // Re-vérifier le verrou après fallback éventuel
+            // Re-vérifier le verrou après fallback éventuel (canal Firebase)
             if (room && userKey && hasRoomActorSubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Score already submitted for this match' });
             }
@@ -490,6 +490,8 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
             // Marquer l'utilisation Firebase seulement après validations de cohérence
             rec.usedFirebase = true;
             matchTokens.set(matchToken, rec);
+            // Marquer le couple room|actor comme utilisé pour le canal Privy
+            if (room && userKey) markRoomActorPrivySubmitted(room, userKey);
         }
         
         console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
@@ -727,9 +729,9 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
             if (!room) {
                 return res.status(400).json({ error: 'Missing gameId (Photon room)' });
             }
-            // Idempotence: si déjà soumis via Firebase/Privy pour ce couple, on refuse
-            if (room && userKey && hasRoomActorSubmitted(room, userKey)) {
-                return res.status(409).json({ error: 'Score already submitted for this match' });
+            // Idempotence (canal Privy): refuser uniquement si Privy déjà soumis
+            if (room && userKey && hasRoomActorPrivySubmitted(room, userKey)) {
+                return res.status(409).json({ error: 'Privy score already submitted for this match' });
             }
             if (!userKey || !hasAcceptablePhotonPresence(room, userKey)) {
                 if (REQUIRE_EXPLICIT_ROOM) {
@@ -741,8 +743,8 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
                 }
                 room = altRoom;
             }
-            if (room && userKey && hasRoomActorSubmitted(room, userKey)) {
-                return res.status(409).json({ error: 'Score already submitted for this match' });
+            if (room && userKey && hasRoomActorPrivySubmitted(room, userKey)) {
+                return res.status(409).json({ error: 'Privy score already submitted for this match' });
             }
             const recRoom = rec.gameId;
             if (!recRoom && room) {
@@ -1073,7 +1075,7 @@ const walletBindings = loadWalletBindings();
 console.log(`[ANTI-FARMING] ${walletBindings.size} liaisons chargées depuis ${WALLET_BINDINGS_FILE}`);
 
 // =====================
-// Verrou 1 soumission par room|actor (persistant)
+// Verrou 1 soumission par room|actor (persistant) – canal Firebase
 // =====================
 const ROOM_ACTOR_USAGE_FILE = path.join(DATA_DIR, 'room-actor-usage.json');
 function loadRoomActorUsage() {
@@ -1118,6 +1120,50 @@ function markRoomActorSubmitted(room, actor) {
 }
 
 // =====================
+// Verrou 1 soumission par room|actor (persistant) – canal Privy
+// =====================
+const ROOM_ACTOR_PRIVY_USAGE_FILE = path.join(DATA_DIR, 'room-actor-privy-usage.json');
+function loadRoomActorPrivyUsage() {
+    try {
+        if (fs.existsSync(ROOM_ACTOR_PRIVY_USAGE_FILE)) {
+            const raw = fs.readFileSync(ROOM_ACTOR_PRIVY_USAGE_FILE, 'utf8');
+            const obj = JSON.parse(raw);
+            if (obj && typeof obj === 'object') return obj;
+        }
+    } catch (e) {
+        console.warn('[ROOM-ACTOR-PRIVY] load error:', e.message || e);
+    }
+    return {};
+}
+function saveRoomActorPrivyUsage(state) {
+    try {
+        fs.writeFileSync(ROOM_ACTOR_PRIVY_USAGE_FILE, JSON.stringify(state, null, 2), 'utf8');
+    } catch (e) {
+        console.warn('[ROOM-ACTOR-PRIVY] save error:', e.message || e);
+    }
+}
+const roomActorPrivyUsed = loadRoomActorPrivyUsage(); // { "room|actor": timestamp }
+function hasRoomActorPrivySubmitted(room, actor) {
+    if (!room || !actor) return false;
+    const key = `${String(room)}|${String(actor)}`;
+    const ts = roomActorPrivyUsed[key];
+    if (!ts) return false;
+    const TTL = Number(process.env.ROOM_ACTOR_USED_TTL_MS || 30 * 60 * 1000);
+    if (Date.now() - Number(ts) > TTL) {
+        delete roomActorPrivyUsed[key];
+        saveRoomActorPrivyUsage(roomActorPrivyUsed);
+        return false;
+    }
+    return true;
+}
+function markRoomActorPrivySubmitted(room, actor) {
+    if (!room || !actor) return;
+    const key = `${String(room)}|${String(actor)}`;
+    roomActorPrivyUsed[key] = Date.now();
+    saveRoomActorPrivyUsage(roomActorPrivyUsed);
+}
+
+// =====================
 // Idempotence événements traités (anti-replay)
 // =====================
 const PROCESSED_EVENTS_FILE = path.join(DATA_DIR, 'processed-events.json');
@@ -1142,6 +1188,13 @@ function saveProcessedEvents(set) {
     }
 }
 const processedEvents = loadProcessedEvents();
+
+// Idempotence renforcee: tracker les evenements et tx en cours
+const processingEvents = new Set();
+const processingTxHashes = new Set();
+function isEventProcessedOrQueued(eventId) {
+    return processedEvents.has(eventId) || processingEvents.has(eventId);
+}
 
 // =====================
 // Débits de points (après confirmation on-chain)
@@ -1289,7 +1342,7 @@ app.post('/photon/webhook', (req, res) => {
 
         if (!gameId) return res.status(400).json({ error: 'Missing GameId' });
 
-        const sess = photonSessions[gameId] || { users: {}, wallets: {}, createdAt: now, closed: false };
+        const sess = photonSessions[gameId] || { users: {}, wallets: {}, privyWallets: {}, createdAt: now, closed: false };
         console.log(`[PHOTON][WEBHOOK] type=${type} gameId=${gameId} userId=${userId} actor=${actorKey}`);
         switch (type) {
             case 'create':
@@ -1327,12 +1380,21 @@ app.post('/photon/webhook', (req, res) => {
                 const effectiveUser = userId || uidFromData;
                 if (effectiveUser) { sess.users[effectiveUser] = { lastSeen: now }; }
                 if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
-                // Capture éventuelle du wallet AppKit envoyé dans l'event
+                // Capture éventuelle des wallets (AppKit et Privy) envoyés dans l'event
                 try {
-                    const maybeWallet = String(data.wallet || data.appKitWallet || '').trim().toLowerCase();
-                    if (/^0x[a-f0-9]{40}$/.test(maybeWallet)) {
-                        const key = actorKey || effectiveUser;
-                        if (key) { sess.wallets[key] = maybeWallet; }
+                    const maybeAppKitWallet = String(data.wallet || data.appKitWallet || '').trim().toLowerCase();
+                    const maybePrivyWallet = String(data.privyWallet || '').trim().toLowerCase();
+                    const key = actorKey || effectiveUser;
+                    if (key) {
+                        // Stocker AppKit wallet si valide
+                        if (/^0x[a-f0-9]{40}$/.test(maybeAppKitWallet)) {
+                            sess.wallets[key] = maybeAppKitWallet;
+                        }
+                        // Stocker Privy wallet séparément si valide
+                        if (/^0x[a-f0-9]{40}$/.test(maybePrivyWallet)) {
+                            if (!sess.privyWallets) sess.privyWallets = {};
+                            sess.privyWallets[key] = maybePrivyWallet;
+                        }
                     }
                 } catch (_) {}
                 break;
@@ -1378,11 +1440,29 @@ let lastFlushAt = Date.now();
 function enqueuePlayerUpdate(player, scoreDelta, txDelta, eventIds, debitDelta = 0) {
     const key = player.toLowerCase();
     const prev = batchQueue.get(key) || { score: 0, tx: 0, debit: 0, firstAt: Date.now(), eventIds: new Set() };
+
+    // Ne comptabiliser que si des eventIds nouveaux existent (quand eventIds est fourni)
+    let newIds = [];
+    if (Array.isArray(eventIds)) {
+        for (const id of eventIds) {
+            if (!prev.eventIds.has(id) && !processingEvents.has(id)) {
+                newIds.push(id);
+            }
+        }
+    }
+
+    if (newIds.length === 0 && Array.isArray(eventIds) && eventIds.length > 0) {
+        batchQueue.set(key, prev);
+        return;
+    }
+
     prev.score = Number(prev.score) + Number(scoreDelta || 0);
     prev.tx = Number(prev.tx) + Number(txDelta || 0);
     prev.debit = Number(prev.debit) + Number(debitDelta || 0);
-    if (Array.isArray(eventIds)) {
-        for (const id of eventIds) prev.eventIds.add(id);
+
+    for (const id of newIds) {
+        prev.eventIds.add(id);
+        processingEvents.add(id);
     }
     batchQueue.set(key, prev);
 }
@@ -1459,7 +1539,10 @@ async function flushBatchIfNeeded(force = false) {
             // Marquer les événements utilisés comme traités (idempotence) puis retirer du buffer
             for (const [addr, agg] of chunk) {
                 if (agg.eventIds && agg.eventIds.size) {
-                    for (const id of agg.eventIds) processedEvents.add(id);
+                    for (const id of agg.eventIds) {
+                        processedEvents.add(id);
+                        processingEvents.delete(id); // nettoyage des events en cours
+                    }
                 }
                 batchQueue.delete(addr);
             }
@@ -1513,6 +1596,13 @@ app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth
         console.log(`[Monad Games ID] Received request: ${actionType} for ${pa}`);
         console.log(`[Monad Games ID] AppKit wallet: ${ak}`);
         console.log(`[Monad Games ID] txHash: ${txHash}`);
+
+        // Garde anti-concurrence sur le même txHash
+        if (processingTxHashes.has(txHash)) {
+            return res.status(409).json({ error: 'Transaction already being processed' });
+        }
+        processingTxHashes.add(txHash);
+        res.on('finish', () => { processingTxHashes.delete(txHash); });
 
         // Évaluer l'état de liaison pour orienter la réponse finale, sans bloquer la consommation de points
         const existingBinding = walletBindings.get(pa);
