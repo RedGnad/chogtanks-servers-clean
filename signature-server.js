@@ -318,7 +318,7 @@ app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAu
 app.post('/api/match/sign-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         if (!MATCH_SECRET) return res.status(503).json({ error: 'Score signing disabled' });
-        const { matchToken, score } = req.body || {};
+        const { matchToken, score, bonus } = req.body || {};
         if (!matchToken || typeof matchToken !== 'string') {
             return res.status(400).json({ error: 'Missing matchToken' });
         }
@@ -332,8 +332,12 @@ app.post('/api/match/sign-score', submitScoreLimiter, requireWallet, requireFire
         if (rec.uid && uid && rec.uid !== uid) {
             return res.status(401).json({ error: 'Match token does not belong to this user' });
         }
-        const sig = computeScoreSig(matchToken, uid, Number(score || 0));
-        return res.json({ scoreSig: sig, success: true });
+        // Aligner la signature sur la logique de soumission: (score + bonus) plafonné
+        const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
+        const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
+        const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        const sig = computeScoreSig(matchToken, uid, Number(cappedScore));
+        return res.json({ scoreSig: sig, cappedScore, success: true });
     } catch (e) {
         console.error('[MATCH][sign-score] error:', e.message || e);
         return res.status(500).json({ error: 'Failed to sign score' });
@@ -350,7 +354,7 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
         if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
             return res.status(400).json({ error: 'Invalid wallet address format' });
         }
-        
+
         const normalized = walletAddress.toLowerCase();
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
         if (totalScore <= 0) {
@@ -567,7 +571,7 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
                         if (rm && actorKey) markRoomActorSubmitted(rm, actorKey);
                     }
                 } catch (_) {}
-
+                
                 console.log(`[SUBMIT-SCORE] ✅ Score sauvegardé dans Firebase: ${currentScore} + ${totalScore} = ${newTotalScore}`);
                 console.log(`[MONITORING] 📊 SCORE SUBMISSION - Wallet: ${normalized}, Score Added: ${totalScore}, New Total: ${newTotalScore}, Timestamp: ${new Date().toISOString()}`);
                 
@@ -1385,10 +1389,10 @@ async function flushBatchIfNeeded(force = false) {
     isFlushing = true;
     try {
             // Préparer tuples
-            const entries = Array.from(batchQueue.entries());
-            // Partitionner en chunks de taille BATCH_MAX
-            for (let i = 0; i < entries.length; i += BATCH_MAX) {
-                const chunk = entries.slice(i, i + BATCH_MAX);
+        const entries = Array.from(batchQueue.entries());
+        // Partitionner en chunks de taille BATCH_MAX
+        for (let i = 0; i < entries.length; i += BATCH_MAX) {
+            const chunk = entries.slice(i, i + BATCH_MAX);
                 const dataTuples = chunk
                     .map(([addr, agg]) => ({ addr, agg }))
                     .filter(({ agg }) => Number(agg.score || 0) > 0)
@@ -1399,14 +1403,14 @@ async function flushBatchIfNeeded(force = false) {
                     }));
 
                 // Appel on-chain batch (tuple[])
-                const rpcUrl = process.env.MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz/';
-                const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
-                const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
-                const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
-                const contractABI = [
+            const rpcUrl = process.env.MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz/';
+            const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+            const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
+            const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
+            const contractABI = [
                     'function batchUpdatePlayerData((address player,uint256 score,uint256 transactions)[] data)'
-                ];
-                const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
+            ];
+            const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
                 if (dataTuples.length === 0) {
                     continue; // rien à envoyer dans ce chunk
@@ -1428,13 +1432,13 @@ async function flushBatchIfNeeded(force = false) {
                     gasLimit = est.mul(120).div(100);
                 } catch (_) {}
 
-                const nonce = await getNextNonce(wallet);
+            const nonce = await getNextNonce(wallet);
                 const tx = await contract.batchUpdatePlayerData(dataTuples, {
                     gasLimit,
-                    maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
-                    maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
-                    nonce
-                });
+                maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
+                maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+                nonce
+            });
             console.log(`[Monad Games ID][BATCH] Tx sent: ${tx.hash}`);
             // Backoff simple et attente confirmable
             const receipt = await tx.wait().catch(async (e) => {
