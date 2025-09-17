@@ -33,7 +33,8 @@ console.log(`[BOOT] Lancement signature server via oauth-proxy -> ${found}`);
 try {
 	require(found);
 } catch (e) {
-	console.error('[BOOT] Échec du require du fichier cible:', e.message);
+	const msg = (e && e.stack) ? e.stack : (e && e.message ? e.message : String(e));
+	console.error('[BOOT] Échec du require du fichier cible:', msg);
 	process.exit(1);
 }
 
