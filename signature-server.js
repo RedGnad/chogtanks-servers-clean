@@ -532,6 +532,135 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
     }
 });
 
+// Endpoint PRIVY → Monad Games ID (submit-score, transactions=0)
+app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+    try {
+        const { privyAddress, score, bonus, matchId, matchToken, gameId } = req.body || {};
+        if (!privyAddress || typeof score === 'undefined') {
+            return res.status(400).json({ error: 'Missing privyAddress or score' });
+        }
+        if (!/^0x[a-fA-F0-9]{40}$/.test(privyAddress)) {
+            return res.status(400).json({ error: 'Invalid privy address format' });
+        }
+
+        const player = String(privyAddress).toLowerCase();
+        const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
+        const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
+        const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+
+        // Enforce match token usage si auth active
+        if (process.env.FIREBASE_REQUIRE_AUTH === '1') {
+            if (!matchToken || typeof matchToken !== 'string') {
+                return res.status(400).json({ error: 'Missing matchToken' });
+            }
+            const rec = matchTokens.get(matchToken);
+            if (!rec) {
+                return res.status(401).json({ error: 'Invalid matchToken' });
+            }
+            if (rec.used) {
+                return res.status(401).json({ error: 'Match token already used' });
+            }
+            if (rec.expAt < Date.now()) {
+                matchTokens.delete(matchToken);
+                return res.status(401).json({ error: 'Match token expired' });
+            }
+            let room = (typeof gameId === 'string' && gameId.trim())
+              ? gameId.trim()
+              : ((typeof matchId === 'string' && matchId.trim()) ? matchId.trim() : null);
+
+            // Utiliser actorNr si fourni via matchId "room|actor"
+            let userKey = req.firebaseAuth?.uid || null;
+            if (typeof matchId === 'string' && matchId.includes('|')) {
+                const parts = matchId.split('|');
+                if (parts[0]) room = parts[0].trim();
+                if (parts[1]) userKey = parts[1].trim();
+            } else if (typeof matchId === 'string') {
+                const m = /^match_(\d+)_/.exec(matchId);
+                if (m && m[1]) userKey = m[1];
+            }
+
+            if (!room) {
+                const deduced = findRecentRoomForActor(userKey);
+                if (deduced) room = deduced;
+            }
+            if (!room) {
+                return res.status(400).json({ error: 'Missing gameId (Photon room)' });
+            }
+            if (room && userKey && hasRoomActorSubmitted(room, userKey)) {
+                return res.status(409).json({ error: 'Score already submitted for this match' });
+            }
+            if (!userKey || !hasAcceptablePhotonPresence(room, userKey)) {
+                const altRoom = findRecentRoomForActor(userKey);
+                if (!altRoom || !hasAcceptablePhotonPresence(altRoom, userKey)) {
+                    return res.status(403).json({ error: 'Photon presence not verified for this match' });
+                }
+                room = altRoom;
+            }
+            if (room && userKey && hasRoomActorSubmitted(room, userKey)) {
+                return res.status(409).json({ error: 'Score already submitted for this match' });
+            }
+            const recRoom = rec.gameId;
+            if (!recRoom && room) {
+                rec.gameId = room;
+            } else if (recRoom && room && recRoom !== room) {
+                return res.status(401).json({ error: 'Match token not for this room' });
+            }
+            rec.used = true;
+            matchTokens.set(matchToken, rec);
+        }
+
+        // Si batch activé: on queue le score avec tx=0
+        if (ENABLE_MONAD_BATCH) {
+            enqueuePlayerUpdate(player, cappedScore, 0, /*eventIds*/[]);
+            return res.json({ success: true, queued: true, playerAddress: player, scoreAmount: cappedScore, transactionAmount: 0 });
+        }
+
+        // Sinon, on envoie en direct (tx=0) – ABI tuple
+        const rpcUrl = process.env.MONAD_RPC_URL || 'https://testnet-rpc.monad.xyz/';
+        const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+        const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
+        const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
+        const contractABI = [
+            'function updatePlayerData((address player,uint256 score,uint256 transactions) data)'
+        ];
+        const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
+        const dataTuple = { player, score: ethers.BigNumber.from(cappedScore), transactions: ethers.BigNumber.from(0) };
+
+        // Préflight: callStatic + estimateGas
+        try {
+            await contract.callStatic.updatePlayerData(dataTuple);
+        } catch (e) {
+            return res.status(409).json({ error: 'Preflight failed', details: e.message || String(e) });
+        }
+        let gasLimit = ethers.BigNumber.from(150000);
+        try {
+            const est = await contract.estimateGas.updatePlayerData(dataTuple);
+            gasLimit = est.mul(120).div(100); // +20%
+        } catch (_) {}
+
+        // Mutex simple
+        while (serverTxMutex) { await new Promise(r => setTimeout(r, 50)); }
+        serverTxMutex = true;
+        try {
+            const nonce = await getNextNonce(wallet);
+            const tx = await contract.updatePlayerData(dataTuple, {
+                gasLimit,
+                maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
+                maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+                nonce
+            });
+            console.log(`[Monad Games ID] submit-score tx: ${tx.hash} for ${player} +${cappedScore}`);
+            // Ne pas attendre la confirmation ici
+            return res.json({ success: true, transactionHash: tx.hash, playerAddress: player, scoreAmount: cappedScore, transactionAmount: 0 });
+        } finally {
+            serverTxMutex = false;
+        }
+    } catch (error) {
+        console.error('[Monad Games ID][submit-score] Error:', error);
+        return res.status(500).json({ error: 'Failed to submit score to Monad Games ID', details: error.message });
+    }
+});
+
 app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, tokenId, targetLevel, playerPoints } = req.body || {};
@@ -1048,7 +1177,7 @@ async function flushBatchIfNeeded(force = false) {
             const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
             const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
             const contractABI = [
-                'function batchUpdatePlayerData(address[] players, uint256[] scoreAmounts, uint256[] transactionAmounts)'
+                'function batchUpdatePlayerData((address player,uint256 score,uint256 transactions)[] data)'
             ];
             const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
@@ -1298,7 +1427,7 @@ const chogIface = new ethers.utils.Interface([
                 const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
                 const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
                 const contractABI = [
-                    'function updatePlayerData(address player, uint256 scoreAmount, uint256 transactionAmount)'
+                    'function updatePlayerData((address player,uint256 score,uint256 transactions) data)'
                 ];
                 const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
