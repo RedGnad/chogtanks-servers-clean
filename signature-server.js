@@ -20,36 +20,37 @@ app.use((req, res, next) => {
     next();
 });
 app.use(express.json());
+// Rate limiting activé - protection contre spam
+const rateLimit = require('express-rate-limit');
 
-// Logger avec niveaux et masquage basique (adresses/tx)
-const LOG_LEVEL = String(process.env.LOG_LEVEL || 'info'); // 'silent'|'error'|'warn'|'info'|'debug'
-function maskAddress(addr) {
-    if (!addr || typeof addr !== 'string') return addr;
-    const a = addr.toLowerCase();
-    if (!a.startsWith('0x') || a.length < 10) return a;
-    return a.slice(0, 6) + '...' + a.slice(-4);
-}
-function maskTx(hash) {
-    if (!hash || typeof hash !== 'string') return hash;
-    const h = hash.toLowerCase();
-    if (!h.startsWith('0x') || h.length < 18) return h;
-    return h.slice(0, 10) + '...' + h.slice(-6);
-}
-const log = {
-    error: (...args) => { if (['error','warn','info','debug'].includes(LOG_LEVEL)) console.error(...args); },
-    warn:  (...args) => { if (['warn','info','debug'].includes(LOG_LEVEL)) console.warn(...args); },
-    info:  (...args) => { if (['info','debug'].includes(LOG_LEVEL)) console.log(...args); },
-    debug: (...args) => { if (['debug'].includes(LOG_LEVEL)) console.log(...args); },
-};
-// Rate limit simple (optionnel via RATE_LIMIT_WINDOW_MS/RATE_LIMIT_MAX)
-try {
-    const rateLimit = require('express-rate-limit');
-    const windowMs = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000); // 1 min
-    const max = Number(process.env.RATE_LIMIT_MAX || 300); // 300 req/min par IP
-    app.use(rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false }));
-} catch (_) {
-    console.warn('[BOOT] express-rate-limit non installé - pas de rate limit');
-}
+// Rate limit général (plus strict)
+const generalLimiter = rateLimit({
+    windowMs: 60_000, // 1 minute
+    max: 100, // 100 req/min par IP
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many requests' }
+});
+
+// Rate limit strict pour les endpoints critiques
+const strictLimiter = rateLimit({
+    windowMs: 10_000, // 10 secondes
+    max: 1, // 1 req/10s par IP
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Rate limit exceeded for this endpoint' }
+});
+
+// Rate limit pour match start (empêche spam de tokens)
+const matchStartLimiter = rateLimit({
+    windowMs: 10_000, // 10 secondes  
+    max: 2, // 2 req/10s par IP (1 normal + 1 retry)
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many match token requests' }
+});
+
+app.use(generalLimiter);
 
 // CORS restrictif (configurable par ALLOWED_ORIGINS)
 const defaultAllowed = [
@@ -79,7 +80,7 @@ if (!process.env.GAME_SERVER_PRIVATE_KEY) {
     console.error("ERREUR: GAME_SERVER_PRIVATE_KEY non définie. Les endpoints signés seront désactivés tant que la clé n'est pas configurée.");
 } else {
     gameWallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY);
-    log.info('Game Server Signer present:', maskAddress(gameWallet.address));
+    console.log("Game Server Signer Address:", gameWallet.address);
 }
 
 // Middleware: exige la présence du wallet pour les routes nécessitant une signature/tx
@@ -130,11 +131,11 @@ function requireFirebaseAuth(req, res, next) {
                 return next();
             })
             .catch((err) => {
-                log.warn('[AUTH] verifyIdToken failed');
+                console.error('[AUTH] verifyIdToken failed:', err.message || err);
                 return res.status(401).json({ error: 'Invalid token' });
             });
     } catch (e) {
-        log.error('[AUTH] Firebase admin init error');
+        console.error('[AUTH] Firebase admin init error:', e.message || e);
         return res.status(500).json({ error: 'Auth service unavailable' });
     }
 }
@@ -165,7 +166,7 @@ app.get('/api/check-username', async (req, res) => {
         const data = await r.json().catch(() => ({}));
         return res.status(r.ok ? 200 : 502).json(data);
     } catch (e) {
-        log.error('[PROXY][check-username] Error');
+        console.error('[PROXY][check-username] Error:', e.message || e);
         return res.status(500).json({ error: 'Proxy failed' });
     }
 });
@@ -225,7 +226,7 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
         }
         
         // Fallback: valeurs par défaut si Firebase non configuré ou erreur
-        log.info('[GET-SCORE] Using fallback values');
+        console.log(`[GET-SCORE] Using fallback values for ${normalizedAddress}`);
         return res.json({ 
             walletAddress: normalizedAddress, 
             score: 0, 
@@ -239,26 +240,39 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
 });
 
 // Endpoint pour démarrer un match (compatibilité ancien build)
-// Match tokens in-memory (TTL court, anti-replay)
-const matchTokens = new Map(); // token -> { uid, createdAt, expAt, used }
+// Match tokens in-memory (TTL court, anti-replay) + anti-spam par match
+const matchTokens = new Map(); // token -> { uid, gameId, createdAt, expAt, used }
 
-app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/match/start', requireWallet, requireFirebaseAuth, matchStartLimiter, async (req, res) => {
     try {
-        log.info('[MATCH-START] requested');
+        console.log(`[MATCH-START] Match start requested`);
         
-        // Générer un token de match unique
+        const { gameId } = req.body || {}; // Optionnel: "roomName|actorNr"
+        const uid = req.firebaseAuth?.uid || null;
+        
+        // Fallback pour anciens clients : générer un gameId temporaire
+        const effectiveGameId = gameId || `legacy_${uid}_${Date.now()}`;
+        
+        // Vérifier qu'aucune soumission n'a déjà été faite pour ce match
+        if (matchSubmissions.has(effectiveGameId)) {
+            console.log(`[MATCH-START] Reject: match ${effectiveGameId} already submitted`);
+            return res.status(409).json({ error: 'Match already submitted' });
+        }
+        
+        // Générer un token de match unique lié au gameId
         const matchToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
         const expiresInMs = Number(process.env.MATCH_TOKEN_TTL_MS || (2 * 60 * 1000)); // défaut 2 minutes
         const now = Date.now();
-        const uid = req.firebaseAuth?.uid || null;
+        
         matchTokens.set(matchToken, {
             uid,
+            gameId: effectiveGameId, // CRITIQUE: lier le token au match spécifique
             createdAt: now,
             expAt: now + expiresInMs,
             used: false
         });
         
-        log.debug('[MATCH-START] Generated match token');
+        console.log(`[MATCH-START] Generated match token for ${effectiveGameId}: ${matchToken}`);
         
         return res.json({
             matchToken: matchToken,
@@ -272,7 +286,7 @@ app.post('/api/match/start', requireWallet, requireFirebaseAuth, async (req, res
 });
 
 // Endpoint pour soumettre les scores (compatibilité ancien build)
-app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, strictLimiter, async (req, res) => {
     try {
         const { walletAddress, score, bonus, matchId, matchToken, gameId } = req.body || {};
         if (!walletAddress || typeof score === 'undefined') {
@@ -311,8 +325,28 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
             if (rec.uid && uid && rec.uid !== uid) {
                 return res.status(401).json({ error: 'Match token does not belong to this user' });
             }
+            
+            // CRITIQUE: Vérifier que le gameId soumis correspond au token
+            const submittedGameId = gameId || matchId || `${room}|${userKey}`;
+            if (rec.gameId && submittedGameId && rec.gameId !== submittedGameId) {
+                return res.status(403).json({ error: 'Match token does not belong to this game' });
+            }
+            
+            // CRITIQUE: Empêcher double soumission pour le même match
+            const matchKey = rec.gameId || submittedGameId;
+            if (matchKey && matchSubmissions.has(matchKey)) {
+                console.log(`[SUBMIT-SCORE] Reject: match ${matchKey} already submitted`);
+                return res.status(409).json({ error: 'Match already submitted' });
+            }
+            
             rec.used = true;
             matchTokens.set(matchToken, rec);
+            
+            // Marquer le match comme soumis et persister
+            if (matchKey) {
+                matchSubmissions.set(matchKey, { submitted: true, timestamp: Date.now() });
+                saveMatchSubmissions(matchSubmissions);
+            }
 
             // Vérification Photon: l'utilisateur doit être présent (trace fraîche) dans la room
             let room = (typeof gameId === 'string' && gameId.trim())
@@ -350,14 +384,14 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
                 // Fallback: si l'acteur est frais dans une autre room, accepte (certaines implémentations Photon envoient des close/leave tardifs)
                 const altRoom = findRecentRoomForActor(userKey);
                 if (!altRoom || !hasAcceptablePhotonPresence(altRoom, userKey)) {
-                    log.warn('[SUBMIT-SCORE][PHOTON-CHECK] Reject');
+                    console.warn('[SUBMIT-SCORE][PHOTON-CHECK] Reject: room=%s userKey=%s ttl=%d grace=%d', room, userKey, PHOTON_PRESENCE_TTL_MS, PHOTON_GRACE_AFTER_CLOSE_MS);
                     return res.status(403).json({ error: 'Photon presence not verified for this match' });
                 }
                 room = altRoom;
             }
         }
         
-        log.info('[SUBMIT-SCORE] submitted');
+        console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
         
         // Intégrer avec Firebase pour sauvegarder le score
         if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
@@ -403,7 +437,8 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
                     matchId: matchId || 'legacy'
                 }, { merge: true });
                 
-                log.info('[SUBMIT-SCORE] ✅ Firebase updated');
+                console.log(`[SUBMIT-SCORE] ✅ Score sauvegardé dans Firebase: ${currentScore} + ${totalScore} = ${newTotalScore}`);
+                console.log(`[MONITORING] 📊 SCORE SUBMISSION - Wallet: ${normalized}, Score Added: ${totalScore}, New Total: ${newTotalScore}, Timestamp: ${new Date().toISOString()}`);
                 
                 return res.json({
                     success: true,
@@ -414,7 +449,7 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
                 });
                 
             } catch (firebaseError) {
-                log.error('[SUBMIT-SCORE] Firebase error');
+                console.error('[SUBMIT-SCORE] Erreur Firebase:', firebaseError);
                 // Strict: ne pas valider si la persistance échoue
                 return res.status(500).json({
                     success: false,
@@ -423,7 +458,7 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
                 });
             }
         } else {
-            log.warn('[SUBMIT-SCORE] Firebase non configuré - rejet strict en prod');
+            console.warn('[SUBMIT-SCORE] Firebase non configuré - rejet strict en prod');
             return res.status(503).json({
                 success: false,
                 error: 'Score service unavailable',
@@ -431,7 +466,7 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, async
             });
         }
     } catch (error) {
-        log.error('[SUBMIT-SCORE] Error');
+        console.error('[SUBMIT-SCORE] Error:', error);
         res.status(500).json({ error: 'Failed to submit score', details: error.message });
     }
 });
@@ -454,7 +489,7 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
             );
             const signature = await gameWallet.signMessage(ethers.utils.arrayify(message));
 
-            log.info('[MINT] ✅ Autorisation (nouveau schéma) émise');
+            console.log(`[MINT] ✅ Autorisation (nouveau schéma) pour ${pAddr}, points=${playerPoints}, nonce=${nonce}`);
             return res.json({
                 authorized: true,
                 signature,
@@ -475,7 +510,7 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
         );
         const signatureLegacy = await gameWallet.signMessage(ethers.utils.arrayify(messageLegacy));
 
-        log.info('[MINT] ✅ Autorisation (legacy) émise');
+        console.log(`[MINT] ✅ Autorisation (legacy) pour ${pAddr}, mintCost=${mintCost}`);
         return res.json({
             signature: signatureLegacy,
             mintCost: Number(mintCost),
@@ -483,22 +518,18 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
         });
 
     } catch (error) {
-        log.error('[MINT] Authorization error');
+        console.error('Erreur d\'autorisation de mint:', error);
         res.status(500).json({ error: "Erreur interne du serveur" });
     }
 });
 
 app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
-        const { playerAddress, appKitWallet, tokenId, targetLevel, playerPoints } = req.body || {};
+        const { playerAddress, tokenId, targetLevel, playerPoints } = req.body || {};
 
         if (!playerAddress || tokenId === undefined || targetLevel === undefined) {
-            return res.status(400).json({ error: "Paramètres requis: playerAddress, tokenId, targetLevel" });
+            return res.status(400).json({ error: "Adresse du joueur, ID du token et niveau cible requis" });
         }
-        const paLowerInit = String(playerAddress).toLowerCase();
-        const akLower = (appKitWallet && /^0x[a-f0-9]{40}$/i.test(String(appKitWallet)))
-            ? String(appKitWallet).toLowerCase()
-            : paLowerInit;
 
         const evolutionCosts = {
             2: 2,   // Level 1 -> 2
@@ -542,8 +573,8 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
                     });
                 }
                 const db = admin.firestore();
-                // Vérification sur le wallet AppKit courant (ou fallback playerAddress si non fourni)
-                const docRef = db.collection('WalletScores').doc(akLower);
+                const normalized = String(playerAddress).toLowerCase();
+                const docRef = db.collection('WalletScores').doc(normalized);
                 const doc = await docRef.get();
                 const serverScore = doc.exists ? Number(doc.data().score || 0) : 0;
                 if (serverScore < requiredPoints) {
@@ -589,8 +620,8 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
                     });
                 }
                 const db = admin.firestore();
-                // STRICT: utiliser le wallet AppKit courant
-                const docRef = db.collection('WalletScores').doc(akLower);
+                const normalized = String(playerAddress).toLowerCase();
+                const docRef = db.collection('WalletScores').doc(normalized);
                 const doc = await docRef.get();
                 const serverScore = doc.exists ? Number(doc.data().score || 0) : 0;
                 if (serverScore < requiredPoints) {
@@ -615,14 +646,6 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
         console.log(`[EVOLVE] ✅ Autorisation d'évolution générée pour ${playerAddress}, token ${tokenId} → niveau ${targetLevel}`);
         console.log(`[MONITORING] 🚀 EVOLVE REQUEST - Wallet: ${playerAddress}, Token: ${tokenId}, Target Level: ${targetLevel}, Cost: ${requiredPoints}, PlayerPointsSigned: ${pointsForSignature}, Nonce: ${nonce}`);
 
-        // Cache pour fallback consommation points si event absent côté receipt
-        putEvolveAuth(nonce, {
-            playerAddress: String(playerAddress).toLowerCase(),
-            tokenId: Number(tokenId),
-            targetLevel: Number(targetLevel),
-            cost: Number(requiredPoints)
-        });
-
         return res.json({
             authorized: true,
             signature,
@@ -638,7 +661,7 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
     }
 });
 
-// Anti-farming: Stockage persistant des liaisons wallet
+// Anti-farming: Stockage persistant des liaisons wallet + match submissions
 const fs = require('fs');
 const path = require('path');
 
@@ -651,6 +674,8 @@ try {
 } catch (e) {
     console.error('[STORAGE] Failed to ensure DATA_DIR:', e.message || e);
 }
+
+const MATCH_SUBMISSIONS_FILE = path.join(DATA_DIR, 'match-submissions.json');
 
 const WALLET_BINDINGS_FILE = path.join(DATA_DIR, 'wallet-bindings.json');
 
@@ -677,8 +702,35 @@ function saveWalletBindings(bindings) {
     }
 }
 
+// Charger les soumissions de match existantes
+function loadMatchSubmissions() {
+    try {
+        if (fs.existsSync(MATCH_SUBMISSIONS_FILE)) {
+            const data = fs.readFileSync(MATCH_SUBMISSIONS_FILE, 'utf8');
+            return new Map(Object.entries(JSON.parse(data)));
+        }
+    } catch (error) {
+        console.error('[MATCH-SUBMISSIONS] Erreur lecture fichier soumissions:', error.message);
+    }
+    return new Map();
+}
+
+// Sauvegarder les soumissions de match
+function saveMatchSubmissions(submissions) {
+    try {
+        const data = JSON.stringify(Object.fromEntries(submissions), null, 2);
+        fs.writeFileSync(MATCH_SUBMISSIONS_FILE, data, 'utf8');
+    } catch (error) {
+        console.error('[MATCH-SUBMISSIONS] Erreur sauvegarde fichier soumissions:', error.message);
+    }
+}
+
 const walletBindings = loadWalletBindings();
 console.log(`[ANTI-FARMING] ${walletBindings.size} liaisons chargées depuis ${WALLET_BINDINGS_FILE}`);
+
+// Charger les soumissions existantes
+const matchSubmissions = loadMatchSubmissions();
+console.log(`[MATCH-SUBMISSIONS] ${matchSubmissions.size} soumissions chargées depuis ${MATCH_SUBMISSIONS_FILE}`);
 
 // =====================
 // Idempotence événements traités (anti-replay)
@@ -733,44 +785,9 @@ function savePointsDebitedEvents(set) {
 const pointsDebitedEvents = loadPointsDebitedEvents();
 
 // =====================
-// EVOLVE AUTH CACHE (fallback consommation points)
-// =====================
-const EVOLVE_AUTH_TTL_MS = Number(process.env.EVOLVE_AUTH_TTL_MS || 5 * 60 * 1000);
-// nonce(string) -> { playerAddress, appKitWallet, tokenId, targetLevel, cost, createdAt }
-const evolveAuthCache = new Map();
-function putEvolveAuth(nonce, entry) {
-    try {
-        const key = String(nonce);
-        evolveAuthCache.set(key, { ...entry, createdAt: Date.now() });
-    } catch (_) {}
-}
-function takeEvolveAuth(nonce) {
-    try {
-        const key = String(nonce);
-        const v = evolveAuthCache.get(key);
-        if (!v) return null;
-        if (Date.now() - (v.createdAt || 0) > EVOLVE_AUTH_TTL_MS) {
-            evolveAuthCache.delete(key);
-            return null;
-        }
-        // Ne pas supprimer pour permettre plusieurs retries; laisser expirer par TTL
-        return v;
-    } catch (_) { return null; }
-}
-setInterval(() => {
-    const now = Date.now();
-    for (const [k, v] of evolveAuthCache.entries()) {
-        if (!v || typeof v.createdAt !== 'number' || now - v.createdAt > EVOLVE_AUTH_TTL_MS) {
-            evolveAuthCache.delete(k);
-        }
-    }
-}, Math.min(60_000, EVOLVE_AUTH_TTL_MS)).unref();
-
-// =====================
 // Photon presence (anti-script farm via HTTP)
 // =====================
 const PHOTON_WEBHOOK_SECRET = process.env.PHOTON_WEBHOOK_SECRET || '';
-const PHOTON_SECRET_MODE = String(process.env.PHOTON_SECRET_MODE || 'both').toLowerCase(); // 'header' | 'query' | 'both'
 const PHOTON_PRESENCE_TTL_MS = Number(process.env.PHOTON_PRESENCE_TTL_MS || 60_000);
 const PHOTON_GRACE_AFTER_CLOSE_MS = Number(process.env.PHOTON_GRACE_AFTER_CLOSE_MS || 300_000);
 const PHOTON_SESSIONS_FILE = path.join(DATA_DIR, 'photon-sessions.json');
@@ -867,20 +884,14 @@ app.post('/photon/webhook', (req, res) => {
     try {
         if (PHOTON_WEBHOOK_SECRET) {
             const q = req.query || {};
-            let providedHeader = req.headers['x-photon-secret'] || req.headers['x-webhook-secret'];
-            let providedQuery = q.secret;
-            if (typeof providedHeader === 'string') providedHeader = providedHeader.trim();
-            if (typeof providedQuery === 'string') providedQuery = providedQuery.trim().replace(/[?#&]+$/g, '');
-
-            let ok = false;
-            if (PHOTON_SECRET_MODE === 'header') {
-                ok = !!providedHeader && providedHeader === PHOTON_WEBHOOK_SECRET;
-            } else if (PHOTON_SECRET_MODE === 'query') {
-                ok = !!providedQuery && providedQuery === PHOTON_WEBHOOK_SECRET;
-            } else { // both (par défaut)
-                ok = (providedHeader === PHOTON_WEBHOOK_SECRET) || (providedQuery === PHOTON_WEBHOOK_SECRET);
+            let providedSecret = q.secret || req.headers['x-webhook-secret'] || req.headers['x-photon-secret'];
+            if (typeof providedSecret === 'string') {
+                // Nettoie les suffixes type '?' ou '&' éventuellement ajoutés par l'appelant
+                providedSecret = providedSecret.trim().replace(/[?#&]+$/g, '');
             }
-            if (!ok) return res.status(401).json({ error: 'Unauthorized' });
+            if (providedSecret !== PHOTON_WEBHOOK_SECRET) {
+                return res.status(401).json({ error: 'Unauthorized' });
+            }
         }
 
         const body = req.body || {};
@@ -997,13 +1008,13 @@ async function flushBatchIfNeeded(force = false) {
         // Partitionner en chunks de taille BATCH_MAX
         for (let i = 0; i < entries.length; i += BATCH_MAX) {
             const chunk = entries.slice(i, i + BATCH_MAX);
-            const playerData = [];
+            const players = [];
+            const scores = [];
+            const txs = [];
             for (const [addr, agg] of chunk) {
-                playerData.push({
-                    player: addr,
-                    score: ethers.BigNumber.from(agg.score),
-                    transactions: ethers.BigNumber.from(agg.tx)
-                });
+                players.push(addr);
+                scores.push(ethers.BigNumber.from(agg.score));
+                txs.push(ethers.BigNumber.from(agg.tx));
             }
 
             // Appel on-chain batch
@@ -1012,57 +1023,18 @@ async function flushBatchIfNeeded(force = false) {
             const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
             const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
             const contractABI = [
-                'function batchUpdatePlayerData((address player,uint256 score,uint256 transactions)[] _playerData)'
+                'function batchUpdatePlayerData(address[] players, uint256[] scoreAmounts, uint256[] transactionAmounts)'
             ];
             const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
-            console.log(`[Monad Games ID][BATCH] Flushing ${playerData.length} updates...`);
-            const MONAD_PREFLIGHT = process.env.MONAD_PREFLIGHT === '1';
-            const MONAD_PREFLIGHT_STRICT = process.env.MONAD_PREFLIGHT_STRICT === '1';
-
-            let tx;
-            try {
-                if (MONAD_PREFLIGHT) {
-                    try {
-                        await contract.callStatic.batchUpdatePlayerData(playerData);
-                    } catch (e) {
-                        const msg = (e && (e.error && e.error.message)) || e.message || String(e);
-                        console.error('[Monad Games ID][BATCH][preflight] failed:', msg);
-                        if (MONAD_PREFLIGHT_STRICT) {
-                            // En mode strict: on skip ce chunk, on réessaiera plus tard
-                            continue;
-                        }
-                    }
-                }
-
-                // Sérialiser optionnellement (utile si d'autres TX concurrentes existent)
-                while (serverTxMutex) { await new Promise(r => setTimeout(r, 50)); }
-                serverTxMutex = true;
-                try {
-                    let gasLimit = ethers.BigNumber.from(600000);
-                    if (MONAD_PREFLIGHT) {
-                        try {
-                            const est = await contract.estimateGas.batchUpdatePlayerData(playerData);
-                            gasLimit = est.mul(120).div(100);
-                        } catch (eg) {
-                            if (MONAD_PREFLIGHT_STRICT) throw eg;
-                            console.warn('[Monad Games ID][BATCH][estimateGas] fallback 600k:', (eg && eg.message) || eg);
-                        }
-                    }
-                    const nonce = await getNextNonce(wallet);
-                    tx = await contract.batchUpdatePlayerData(playerData, {
-                        gasLimit,
-                        maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
-                        maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
-                        nonce
-                    });
-                } finally {
-                    serverTxMutex = false;
-                }
-            } catch (sendErr) {
-                console.error('[Monad Games ID][BATCH] send error:', sendErr.message || sendErr);
-                continue;
-            }
+            console.log(`[Monad Games ID][BATCH] Flushing ${players.length} updates...`);
+            const nonce = await getNextNonce(wallet);
+            const tx = await contract.batchUpdatePlayerData(players, scores, txs, {
+                gasLimit: 600000, // batch → plus de gas
+                maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
+                maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+                nonce
+            });
             console.log(`[Monad Games ID][BATCH] Tx sent: ${tx.hash}`);
             // Backoff simple et attente confirmable
             const receipt = await tx.wait().catch(async (e) => {
@@ -1218,28 +1190,6 @@ const chogIface = new ethers.utils.Interface([
         }
 
         if (derivedScore <= 0 && derivedTx <= 0) {
-            // Fallback: tenter de décoder la tx input pour EVOLVE et matcher le nonce avec le cache d'autorisation
-            try {
-                const tx = await provider.getTransaction(txHash);
-                if (tx && tx.data && actionType === 'evolve') {
-                    const evolveIface = new ethers.utils.Interface([
-                        'function evolveNFT(uint256 tokenId, uint256 playerPoints, uint256 nonce, bytes signature)'
-                    ]);
-                    const decoded = evolveIface.decodeFunctionData('evolveNFT', tx.data);
-                    const txNonce = Number(decoded.nonce || 0);
-                    const cached = takeEvolveAuth(txNonce);
-                    if (cached && typeof cached.cost === 'number' && cached.cost > 0) {
-                        derivedScore += Number(cached.cost);
-                        derivedTx += 1;
-                        console.log(`[EVOLVE][FALLBACK] Using cached authorization for nonce=${txNonce}, cost=${cached.cost}`);
-                    }
-                }
-            } catch (e) {
-                console.warn('[EVOLVE][FALLBACK] decode failed:', e.message || e);
-            }
-        }
-
-        if (derivedScore <= 0 && derivedTx <= 0) {
             return res.status(422).json({ error: 'No matching on-chain event for provided actionType' });
         }
 
@@ -1266,13 +1216,12 @@ const chogIface = new ethers.utils.Interface([
                     });
                 }
                 const db = admin.firestore();
-                // IMPORTANT: la source de vérité des points est le wallet AppKit (ak)
-                const docRef = db.collection('WalletScores').doc(ak);
+                const docRef = db.collection('WalletScores').doc(pa);
                 await db.runTransaction(async (t) => {
                     const snap = await t.get(docRef);
                     const current = snap.exists ? Number(snap.data().score || 0) : 0;
                     const next = Math.max(0, current - derivedScore);
-                    t.set(docRef, { score: next, walletAddress: ak, lastUpdated: admin.firestore.FieldValue.serverTimestamp(), lastEvolutionTimestamp: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+                    t.set(docRef, { score: next, walletAddress: pa, lastUpdated: admin.firestore.FieldValue.serverTimestamp(), lastEvolutionTimestamp: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
                 });
                 console.log(`[POINTS] ✅ Décrément appliqué après evolve: -${derivedScore} pour ${pa}`);
             } catch (debitErr) {
@@ -1324,64 +1273,14 @@ const chogIface = new ethers.utils.Interface([
                 const wallet = new ethers.Wallet(process.env.GAME_SERVER_PRIVATE_KEY, provider);
                 const MONAD_GAMES_ID_CONTRACT = '0x4b91a6541Cab9B2256EA7E6787c0aa6BE38b39c0';
                 const contractABI = [
-                    'function updatePlayerData((address player,uint256 score,uint256 transactions) _playerData)'
+                    'function updatePlayerData(address player, uint256 scoreAmount, uint256 transactionAmount)'
                 ];
                 const contract = new ethers.Contract(MONAD_GAMES_ID_CONTRACT, contractABI, wallet);
 
-                const playerData = {
-                    player: pa,
-                    score: ethers.BigNumber.from(derivedScore),
-                    transactions: ethers.BigNumber.from(derivedTx)
-                };
                 console.log(`[Monad Games ID] Calling updatePlayerData(${pa}, ${derivedScore}, ${derivedTx})`);
-                const MONAD_PREFLIGHT = process.env.MONAD_PREFLIGHT === '1';
-                const MONAD_PREFLIGHT_STRICT = process.env.MONAD_PREFLIGHT_STRICT === '1';
-
-                if (MONAD_PREFLIGHT) {
-                    try {
-                        await contract.callStatic.updatePlayerData(playerData);
-                    } catch (e) {
-                        const reason = (e && (e.error && e.error.message)) || e?.reason || e?.message || String(e);
-                        const dataHex = (e && (e.error && e.error.data)) || e?.data || null;
-                        console.error('[Monad Games ID][preflight] failed:', reason, dataHex ? `data=${dataHex}` : '');
-                        if (MONAD_PREFLIGHT_STRICT) {
-                            return res.status(502).json({
-                                error: 'Preflight failed',
-                                reason,
-                                data: dataHex,
-                                sender: wallet.address,
-                                contract: MONAD_GAMES_ID_CONTRACT,
-                                fn: 'updatePlayerData',
-                                args: { player: pa, scoreAmount: derivedScore, transactionAmount: derivedTx }
-                            });
-                        }
-                    }
-                }
-                let gasLimit = ethers.BigNumber.from(150000);
-                if (MONAD_PREFLIGHT) {
-                    try {
-                        const est = await contract.estimateGas.updatePlayerData(playerData);
-                        gasLimit = est.mul(120).div(100);
-                    } catch (eg) {
-                        if (MONAD_PREFLIGHT_STRICT) {
-                            const reason = (eg && (eg.error && eg.error.message)) || eg?.reason || eg?.message || String(eg);
-                            const dataHex = (eg && (eg.error && eg.error.data)) || eg?.data || null;
-                            return res.status(502).json({
-                                error: 'estimateGas failed',
-                                reason,
-                                data: dataHex,
-                                sender: wallet.address,
-                                contract: MONAD_GAMES_ID_CONTRACT,
-                                fn: 'updatePlayerData',
-                                args: { player: pa, scoreAmount: derivedScore, transactionAmount: derivedTx }
-                            });
-                        }
-                        console.warn('[Monad Games ID][estimateGas] fallback 150k:', (eg && eg.message) || eg);
-                    }
-                }
                 const nonce = await getNextNonce(wallet);
-                const tx = await contract.updatePlayerData(playerData, {
-                    gasLimit,
+                const tx = await contract.updatePlayerData(pa, derivedScore, derivedTx, {
+                    gasLimit: 150000,
                     maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
                     maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
                     nonce
