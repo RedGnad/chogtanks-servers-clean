@@ -22,7 +22,21 @@ app.use((req, res, next) => {
     }
     next();
 });
-app.use(express.json());
+// Limite la taille des requêtes JSON pour réduire la surface DoS
+app.use(express.json({ limit: '64kb' }));
+// Masquer les détails d'erreur en prod si GENERIC_ERRORS=1
+if (process.env.GENERIC_ERRORS === '1') {
+    app.use((req, res, next) => {
+        const originalJson = res.json.bind(res);
+        res.json = (body) => {
+            if (res.statusCode >= 400) {
+                return originalJson({ error: 'Request rejected' });
+            }
+            return originalJson(body);
+        };
+        next();
+    });
+}
 // Rate limit simple (optionnel via RATE_LIMIT_WINDOW_MS/RATE_LIMIT_MAX)
 try {
     const rateLimit = require('express-rate-limit');
@@ -281,8 +295,8 @@ app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAu
     try {
         console.log(`[MATCH-START] Match start requested`);
         
-        // Générer un token de match unique
-        const matchToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
+        // Générer un token de match unique (cryptographiquement robuste)
+        const matchToken = (require('crypto').randomBytes(16).toString('hex')) + Date.now().toString(36);
         const expiresInMs = Number(process.env.MATCH_TOKEN_TTL_MS || (2 * 60 * 1000)); // défaut 2 minutes
         const now = Date.now();
         const uid = req.firebaseAuth?.uid || null;
@@ -376,6 +390,14 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
             const rec = matchTokens.get(matchToken);
             if (!rec) {
                 return res.status(401).json({ error: 'Invalid matchToken' });
+            }
+            // Anti-match trop court
+            const MIN_MATCH_DURATION_MS = Number(process.env.MIN_MATCH_DURATION_MS || 0);
+            if (MIN_MATCH_DURATION_MS > 0) {
+                const age = Date.now() - Number(rec.createdAt || 0);
+                if (age < MIN_MATCH_DURATION_MS) {
+                    return res.status(403).json({ error: 'Match too short' });
+                }
             }
             if (rec.usedFirebase) {
                 return res.status(401).json({ error: 'Match token already used' });
@@ -675,7 +697,17 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
         const player = String(privyAddress).toLowerCase();
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
-        const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        let cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        // Politique dure: si totalScore > MAX, annuler (0)
+        if (totalScore > MAX_SCORE_PER_MATCH) {
+            cappedScore = 0;
+        }
+        if (cappedScore <= 0) {
+        let cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        // Politique dure: si totalScore > MAX, annuler (0)
+        if (totalScore > MAX_SCORE_PER_MATCH) {
+            cappedScore = 0;
+        }
         if (cappedScore <= 0) {
             return res.status(204).end();
         }
@@ -688,6 +720,14 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
             const rec = matchTokens.get(matchToken);
             if (!rec) {
                 return res.status(401).json({ error: 'Invalid matchToken' });
+            }
+            // Anti-match trop court
+            const MIN_MATCH_DURATION_MS = Number(process.env.MIN_MATCH_DURATION_MS || 0);
+            if (MIN_MATCH_DURATION_MS > 0) {
+                const age = Date.now() - Number(rec.createdAt || 0);
+                if (age < MIN_MATCH_DURATION_MS) {
+                    return res.status(403).json({ error: 'Match too short' });
+                }
             }
             // HMAC check (si activé)
             if (MATCH_SECRET) {
@@ -874,23 +914,21 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
         // Mutex simple
         while (serverTxMutex) { await new Promise(r => setTimeout(r, 50)); }
         serverTxMutex = true;
-        try {
-            const nonce = await getNextNonce(wallet);
-            const tx = await contract.updatePlayerData(dataTuple, {
-                gasLimit,
-                maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
-                maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
-                nonce
-            });
-            console.log(`[Monad Games ID] submit-score tx: ${tx.hash} for ${player} +${cappedScore}`);
-            // Ne pas attendre la confirmation ici
-            return res.json({ success: true, transactionHash: tx.hash, playerAddress: player, scoreAmount: cappedScore, transactionAmount: 0 });
-        } finally {
-            serverTxMutex = false;
-        }
+        const nonce = await getNextNonce(wallet);
+        const tx = await contract.updatePlayerData(dataTuple, {
+            gasLimit,
+            maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
+            maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+            nonce
+        });
+        console.log(`[Monad Games ID] submit-score tx: ${tx.hash} for ${player} +${cappedScore}`);
+        // Ne pas attendre la confirmation ici
+        return res.json({ success: true, transactionHash: tx.hash, playerAddress: player, scoreAmount: cappedScore, transactionAmount: 0 });
     } catch (error) {
         console.error('[Monad Games ID][submit-score] Error:', error);
         return res.status(500).json({ error: 'Failed to submit score to Monad Games ID', details: error.message });
+    } finally {
+        serverTxMutex = false;
     }
 });
 
@@ -1322,9 +1360,12 @@ app.post('/photon/webhook', (req, res) => {
     try {
         if (PHOTON_WEBHOOK_SECRET) {
             const q = req.query || {};
-            let providedSecret = q.secret || req.headers['x-webhook-secret'] || req.headers['x-photon-secret'];
+            // Refuser tout secret passé en query pour éviter fuites URL
+            if (q.secret) {
+                return res.status(401).json({ error: 'Unauthorized (query secret not allowed)' });
+            }
+            let providedSecret = req.headers['x-webhook-secret'] || req.headers['x-photon-secret'];
             if (typeof providedSecret === 'string') {
-                // Nettoie les suffixes type '?' ou '&' éventuellement ajoutés par l'appelant
                 providedSecret = providedSecret.trim().replace(/[?#&]+$/g, '');
             }
             if (providedSecret !== PHOTON_WEBHOOK_SECRET) {
@@ -1402,6 +1443,15 @@ app.post('/photon/webhook', (req, res) => {
             case 'gameproperties':
                 if (userId) { sess.users[userId] = { lastSeen: now }; }
                 if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
+                try {
+                    const data = body.Data || body.data || {};
+                    const maybePrivyWallet = String(data.privyWallet || '').trim().toLowerCase();
+                    if (/^0x[a-f0-9]{40}$/.test(maybePrivyWallet)) {
+                        if (!sess.privyWallets) sess.privyWallets = {};
+                        const key = actorKey || userId;
+                        if (key) sess.privyWallets[key] = maybePrivyWallet;
+                    }
+                } catch (_) {}
                 break;
             default:
                 if (userId || actorKey) {
