@@ -9,9 +9,10 @@ const fs = require('fs');
 const path = require('path');
 
 const override = process.env.SIGNATURE_SERVER_PATH;
+// Préfère la version sécurisée dans chogtanks-servers-clean
 const candidates = override ? [override] : [
-	'./signature-server.js',
-	'./chogtanks-servers-clean/signature-server.js'
+	'./chogtanks-servers-clean/signature-server.js',
+	'./signature-server.js'
 ];
 
 function resolveCandidate(candidate) {
