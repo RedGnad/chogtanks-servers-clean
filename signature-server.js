@@ -20,37 +20,39 @@ app.use((req, res, next) => {
     next();
 });
 app.use(express.json());
-// Rate limiting activé - protection contre spam
-const rateLimit = require('express-rate-limit');
+// Rate limit simple (optionnel via RATE_LIMIT_WINDOW_MS/RATE_LIMIT_MAX)
+try {
+    const rateLimit = require('express-rate-limit');
+    const windowMs = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000); // 1 min
+    const max = Number(process.env.RATE_LIMIT_MAX || 300); // 300 req/min par IP
+    app.use(rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false }));
+} catch (_) {
+    console.warn('[BOOT] express-rate-limit non installé - pas de rate limit');
+}
 
-// Rate limit général (plus strict)
-const generalLimiter = rateLimit({
-    windowMs: 60_000, // 1 minute
-    max: 100, // 100 req/min par IP
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: 'Too many requests' }
+// Helper pour créer des rate limiters route-spécifiques même si la lib est absente
+function buildRouteLimiter(options) {
+    try {
+        const rateLimit = require('express-rate-limit');
+        return rateLimit({
+            standardHeaders: true,
+            legacyHeaders: false,
+            ...options
+        });
+    } catch (_) {
+        return (req, res, next) => next();
+    }
+}
+
+// Route-specific rate limiters (no-op if lib missing)
+const matchStartLimiter = buildRouteLimiter({
+    windowMs: Number(process.env.MATCH_START_WINDOW_MS || 60_000),
+    max: Number(process.env.MATCH_START_MAX || 6)
 });
-
-// Rate limit strict pour les endpoints critiques
-const strictLimiter = rateLimit({
-    windowMs: 10_000, // 10 secondes
-    max: 1, // 1 req/10s par IP
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: 'Rate limit exceeded for this endpoint' }
+const submitScoreLimiter = buildRouteLimiter({
+    windowMs: Number(process.env.SUBMIT_SCORE_WINDOW_MS || 60_000),
+    max: Number(process.env.SUBMIT_SCORE_MAX || 6)
 });
-
-// Rate limit pour match start (empêche spam de tokens)
-const matchStartLimiter = rateLimit({
-    windowMs: 10_000, // 10 secondes  
-    max: 2, // 2 req/10s par IP (1 normal + 1 retry)
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { error: 'Too many match token requests' }
-});
-
-app.use(generalLimiter);
 
 // CORS restrictif (configurable par ALLOWED_ORIGINS)
 const defaultAllowed = [
@@ -240,39 +242,29 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
 });
 
 // Endpoint pour démarrer un match (compatibilité ancien build)
-// Match tokens in-memory (TTL court, anti-replay) + anti-spam par match
-const matchTokens = new Map(); // token -> { uid, gameId, createdAt, expAt, used }
+// Match tokens in-memory (TTL court, anti-replay)
+const matchTokens = new Map(); // token -> { uid, createdAt, expAt, used }
 
-app.post('/api/match/start', requireWallet, requireFirebaseAuth, matchStartLimiter, async (req, res) => {
+app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         console.log(`[MATCH-START] Match start requested`);
         
-        const { gameId } = req.body || {}; // Optionnel: "roomName|actorNr"
-        const uid = req.firebaseAuth?.uid || null;
-        
-        // Fallback pour anciens clients : générer un gameId temporaire
-        const effectiveGameId = gameId || `legacy_${uid}_${Date.now()}`;
-        
-        // Vérifier qu'aucune soumission n'a déjà été faite pour ce match
-        if (matchSubmissions.has(effectiveGameId)) {
-            console.log(`[MATCH-START] Reject: match ${effectiveGameId} already submitted`);
-            return res.status(409).json({ error: 'Match already submitted' });
-        }
-        
-        // Générer un token de match unique lié au gameId
+        // Générer un token de match unique
         const matchToken = Math.random().toString(36).slice(2) + Date.now().toString(36);
         const expiresInMs = Number(process.env.MATCH_TOKEN_TTL_MS || (2 * 60 * 1000)); // défaut 2 minutes
         const now = Date.now();
-        
+        const uid = req.firebaseAuth?.uid || null;
+        // Optionnellement lier immédiatement à un gameId si fourni
+        const providedGameId = typeof req.body?.gameId === 'string' ? req.body.gameId.trim() : null;
         matchTokens.set(matchToken, {
             uid,
-            gameId: effectiveGameId, // CRITIQUE: lier le token au match spécifique
             createdAt: now,
             expAt: now + expiresInMs,
-            used: false
+            used: false,
+            gameId: providedGameId || null
         });
         
-        console.log(`[MATCH-START] Generated match token for ${effectiveGameId}: ${matchToken}`);
+        console.log(`[MATCH-START] Generated match token: ${matchToken}`);
         
         return res.json({
             matchToken: matchToken,
@@ -286,7 +278,7 @@ app.post('/api/match/start', requireWallet, requireFirebaseAuth, matchStartLimit
 });
 
 // Endpoint pour soumettre les scores (compatibilité ancien build)
-app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, strictLimiter, async (req, res) => {
+app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { walletAddress, score, bonus, matchId, matchToken, gameId } = req.body || {};
         if (!walletAddress || typeof score === 'undefined') {
@@ -325,28 +317,6 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, stric
             if (rec.uid && uid && rec.uid !== uid) {
                 return res.status(401).json({ error: 'Match token does not belong to this user' });
             }
-            
-            // CRITIQUE: Vérifier que le gameId soumis correspond au token
-            const submittedGameId = gameId || matchId || `${room}|${userKey}`;
-            if (rec.gameId && submittedGameId && rec.gameId !== submittedGameId) {
-                return res.status(403).json({ error: 'Match token does not belong to this game' });
-            }
-            
-            // CRITIQUE: Empêcher double soumission pour le même match
-            const matchKey = rec.gameId || submittedGameId;
-            if (matchKey && matchSubmissions.has(matchKey)) {
-                console.log(`[SUBMIT-SCORE] Reject: match ${matchKey} already submitted`);
-                return res.status(409).json({ error: 'Match already submitted' });
-            }
-            
-            rec.used = true;
-            matchTokens.set(matchToken, rec);
-            
-            // Marquer le match comme soumis et persister
-            if (matchKey) {
-                matchSubmissions.set(matchKey, { submitted: true, timestamp: Date.now() });
-                saveMatchSubmissions(matchSubmissions);
-            }
 
             // Vérification Photon: l'utilisateur doit être présent (trace fraîche) dans la room
             let room = (typeof gameId === 'string' && gameId.trim())
@@ -379,6 +349,11 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, stric
                 return res.status(400).json({ error: 'Missing gameId (Photon room)' });
             }
 
+            // Vérrou tentative multi-submit: refuser si déjà soumis pour ce room|actor
+            if (room && userKey && hasRoomActorSubmitted(room, userKey)) {
+                return res.status(409).json({ error: 'Score already submitted for this match' });
+            }
+
             // Accepte si présence fraîche OU dans la fenêtre de grâce après fermeture
             if (!userKey || !hasAcceptablePhotonPresence(room, userKey)) {
                 // Fallback: si l'acteur est frais dans une autre room, accepte (certaines implémentations Photon envoient des close/leave tardifs)
@@ -389,6 +364,21 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, stric
                 }
                 room = altRoom;
             }
+
+            // Re-vérifier le verrou après fallback éventuel
+            if (room && userKey && hasRoomActorSubmitted(room, userKey)) {
+                return res.status(409).json({ error: 'Score already submitted for this match' });
+            }
+
+            // Lier le token au room final si non défini, sinon vérifier cohérence
+            if (!rec.gameId && room) {
+                rec.gameId = room;
+            } else if (rec.gameId && room && rec.gameId !== room) {
+                return res.status(401).json({ error: 'Match token not for this room' });
+            }
+            // Marquer le token utilisé seulement après validations de cohérence
+            rec.used = true;
+            matchTokens.set(matchToken, rec);
         }
         
         console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
@@ -437,6 +427,23 @@ app.post('/api/firebase/submit-score', requireWallet, requireFirebaseAuth, stric
                     matchId: matchId || 'legacy'
                 }, { merge: true });
                 
+                // Marquer le couple room|actor comme utilisé (idempotence per-match)
+                try {
+                    if (typeof matchId === 'string') {
+                        let rm = null;
+                        let actorKey = null;
+                        if (matchId.includes('|')) {
+                            const parts = matchId.split('|');
+                            rm = parts[0] ? parts[0].trim() : null;
+                            actorKey = parts[1] ? parts[1].trim() : null;
+                        } else {
+                            const m = /^match_(\d+)_/.exec(matchId);
+                            if (m && m[1]) actorKey = m[1];
+                        }
+                        if (rm && actorKey) markRoomActorSubmitted(rm, actorKey);
+                    }
+                } catch (_) {}
+
                 console.log(`[SUBMIT-SCORE] ✅ Score sauvegardé dans Firebase: ${currentScore} + ${totalScore} = ${newTotalScore}`);
                 console.log(`[MONITORING] 📊 SCORE SUBMISSION - Wallet: ${normalized}, Score Added: ${totalScore}, New Total: ${newTotalScore}, Timestamp: ${new Date().toISOString()}`);
                 
@@ -661,7 +668,7 @@ app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async 
     }
 });
 
-// Anti-farming: Stockage persistant des liaisons wallet + match submissions
+// Anti-farming: Stockage persistant des liaisons wallet
 const fs = require('fs');
 const path = require('path');
 
@@ -674,8 +681,6 @@ try {
 } catch (e) {
     console.error('[STORAGE] Failed to ensure DATA_DIR:', e.message || e);
 }
-
-const MATCH_SUBMISSIONS_FILE = path.join(DATA_DIR, 'match-submissions.json');
 
 const WALLET_BINDINGS_FILE = path.join(DATA_DIR, 'wallet-bindings.json');
 
@@ -702,35 +707,53 @@ function saveWalletBindings(bindings) {
     }
 }
 
-// Charger les soumissions de match existantes
-function loadMatchSubmissions() {
-    try {
-        if (fs.existsSync(MATCH_SUBMISSIONS_FILE)) {
-            const data = fs.readFileSync(MATCH_SUBMISSIONS_FILE, 'utf8');
-            return new Map(Object.entries(JSON.parse(data)));
-        }
-    } catch (error) {
-        console.error('[MATCH-SUBMISSIONS] Erreur lecture fichier soumissions:', error.message);
-    }
-    return new Map();
-}
-
-// Sauvegarder les soumissions de match
-function saveMatchSubmissions(submissions) {
-    try {
-        const data = JSON.stringify(Object.fromEntries(submissions), null, 2);
-        fs.writeFileSync(MATCH_SUBMISSIONS_FILE, data, 'utf8');
-    } catch (error) {
-        console.error('[MATCH-SUBMISSIONS] Erreur sauvegarde fichier soumissions:', error.message);
-    }
-}
-
 const walletBindings = loadWalletBindings();
 console.log(`[ANTI-FARMING] ${walletBindings.size} liaisons chargées depuis ${WALLET_BINDINGS_FILE}`);
 
-// Charger les soumissions existantes
-const matchSubmissions = loadMatchSubmissions();
-console.log(`[MATCH-SUBMISSIONS] ${matchSubmissions.size} soumissions chargées depuis ${MATCH_SUBMISSIONS_FILE}`);
+// =====================
+// Verrou 1 soumission par room|actor (persistant)
+// =====================
+const ROOM_ACTOR_USAGE_FILE = path.join(DATA_DIR, 'room-actor-usage.json');
+function loadRoomActorUsage() {
+    try {
+        if (fs.existsSync(ROOM_ACTOR_USAGE_FILE)) {
+            const raw = fs.readFileSync(ROOM_ACTOR_USAGE_FILE, 'utf8');
+            const obj = JSON.parse(raw);
+            if (obj && typeof obj === 'object') return obj;
+        }
+    } catch (e) {
+        console.warn('[ROOM-ACTOR] load error:', e.message || e);
+    }
+    return {};
+}
+function saveRoomActorUsage(state) {
+    try {
+        fs.writeFileSync(ROOM_ACTOR_USAGE_FILE, JSON.stringify(state, null, 2), 'utf8');
+    } catch (e) {
+        console.warn('[ROOM-ACTOR] save error:', e.message || e);
+    }
+}
+const roomActorUsed = loadRoomActorUsage(); // { "room|actor": timestamp }
+function hasRoomActorSubmitted(room, actor) {
+    if (!room || !actor) return false;
+    const key = `${String(room)}|${String(actor)}`;
+    const ts = roomActorUsed[key];
+    if (!ts) return false;
+    // TTL nettoyage doux (30 minutes)
+    const TTL = Number(process.env.ROOM_ACTOR_USED_TTL_MS || 30 * 60 * 1000);
+    if (Date.now() - Number(ts) > TTL) {
+        delete roomActorUsed[key];
+        saveRoomActorUsage(roomActorUsed);
+        return false;
+    }
+    return true;
+}
+function markRoomActorSubmitted(room, actor) {
+    if (!room || !actor) return;
+    const key = `${String(room)}|${String(actor)}`;
+    roomActorUsed[key] = Date.now();
+    saveRoomActorUsage(roomActorUsed);
+}
 
 // =====================
 // Idempotence événements traités (anti-replay)
