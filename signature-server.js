@@ -449,15 +449,28 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
                 console.log(`[SUBMIT-SCORE] ✅ Score sauvegardé dans Firebase: ${currentScore} + ${totalScore} = ${newTotalScore}`);
                 console.log(`[MONITORING] 📊 SCORE SUBMISSION - Wallet: ${normalized}, Score Added: ${totalScore}, New Total: ${newTotalScore}, Timestamp: ${new Date().toISOString()}`);
 
-                // Option: pousser aussi vers Monad Games ID (leaderboard) pour TOUS les joueurs (Privy ou AppKit)
+                // Option: pousser aussi vers Monad Games ID (leaderboard) pour TOUS les joueurs (Privy uniquement)
                 try {
                     if (process.env.ENABLE_PRIVY_SCORE_TO_MONAD === '1') {
-                        const scoreDelta = Number(Math.max(0, Math.min(totalScore, Number(process.env.MAX_SCORE_PER_MATCH || 50))));
+                        const scoreDelta = Number(totalScore); // exact équivalent au submit
                         if (scoreDelta > 0) {
-                            const playerAddr = normalized; // Privy address as player identifier
+                            // EXIGE une adresse Privy explicite (aucun fallback AppKit)
+                            const providedPrivy = String(req.body.playerAddress || req.body.privyAddress || '').toLowerCase();
+                            if (!/^0x[a-f0-9]{40}$/.test(providedPrivy)) {
+                                // Pas d'adresse Privy -> on ne pousse pas vers Monad (score Firebase conservé)
+                                log.debug('[SUBMIT-SCORE][MONAD] skipped: missing privyAddress');
+                                return res.json({
+                                    success: true,
+                                    walletAddress: normalized,
+                                    score: newTotalScore,
+                                    matchId: matchId || 'legacy',
+                                    validated: true
+                                });
+                            }
+                            const playerAddr = providedPrivy;
                             if (process.env.ENABLE_MONAD_BATCH === '1') {
                                 // Utilise le batch existant
-                                enqueuePlayerUpdate(playerAddr, scoreDelta, 1, null);
+                                enqueuePlayerUpdate(playerAddr, scoreDelta, 0, null);
                             } else {
                                 // Envoi immédiat non bloquant (fire-and-forget)
                                 (async () => {
@@ -473,7 +486,7 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
                                         const playerData = {
                                             player: playerAddr,
                                             score: ethers.BigNumber.from(scoreDelta),
-                                            transactions: ethers.BigNumber.from(1)
+                                            transactions: ethers.BigNumber.from(0)
                                         };
                                         const MONAD_PREFLIGHT = process.env.MONAD_PREFLIGHT === '1';
                                         const MONAD_PREFLIGHT_STRICT = process.env.MONAD_PREFLIGHT_STRICT === '1';
