@@ -703,12 +703,6 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
             cappedScore = 0;
         }
         if (cappedScore <= 0) {
-        let cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
-        // Politique dure: si totalScore > MAX, annuler (0)
-        if (totalScore > MAX_SCORE_PER_MATCH) {
-            cappedScore = 0;
-        }
-        if (cappedScore <= 0) {
             return res.status(204).end();
         }
 
