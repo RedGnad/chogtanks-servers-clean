@@ -1080,6 +1080,40 @@ try {
 
 const WALLET_BINDINGS_FILE = path.join(DATA_DIR, 'wallet-bindings.json');
 
+// Ecritures disque asynchrones avec débounce (réduit les blocages event-loop)
+const FLUSH_DEBOUNCE_MS = Number(process.env.FLUSH_DEBOUNCE_MS || 300);
+const _pendingJsonWrites = new Map(); // filePath -> { timer: NodeJS.Timeout|null, data: string }
+
+function scheduleJsonWrite(filePath, jsonSerializable) {
+    try {
+        const nextData = JSON.stringify(jsonSerializable, null, 2);
+        let state = _pendingJsonWrites.get(filePath);
+        if (!state) {
+            state = { timer: null, data: nextData };
+            _pendingJsonWrites.set(filePath, state);
+        } else {
+            state.data = nextData;
+            if (state.timer) {
+                clearTimeout(state.timer);
+            }
+        }
+        state.timer = setTimeout(async () => {
+            try {
+                await fs.promises.writeFile(filePath, state.data, 'utf8');
+            } catch (e) {
+                console.warn('[ASYNC-WRITE] Failed to write', filePath, e && (e.message || e));
+            } finally {
+                state.timer = null;
+            }
+        }, FLUSH_DEBOUNCE_MS);
+        if (typeof state.timer.unref === 'function') {
+            state.timer.unref();
+        }
+    } catch (e) {
+        console.warn('[ASYNC-WRITE] scheduleJsonWrite error:', e && (e.message || e));
+    }
+}
+
 // Charger les liaisons existantes
 function loadWalletBindings() {
     try {
@@ -1096,8 +1130,7 @@ function loadWalletBindings() {
 // Sauvegarder les liaisons
 function saveWalletBindings(bindings) {
     try {
-        const data = JSON.stringify(Object.fromEntries(bindings), null, 2);
-        fs.writeFileSync(WALLET_BINDINGS_FILE, data, 'utf8');
+        scheduleJsonWrite(WALLET_BINDINGS_FILE, Object.fromEntries(bindings));
     } catch (error) {
         console.error('[ANTI-FARMING] Erreur sauvegarde fichier liaisons:', error.message);
     }
@@ -1124,7 +1157,7 @@ function loadRoomActorUsage() {
 }
 function saveRoomActorUsage(state) {
     try {
-        fs.writeFileSync(ROOM_ACTOR_USAGE_FILE, JSON.stringify(state, null, 2), 'utf8');
+        scheduleJsonWrite(ROOM_ACTOR_USAGE_FILE, state);
     } catch (e) {
         console.warn('[ROOM-ACTOR] save error:', e.message || e);
     }
@@ -1169,7 +1202,7 @@ function loadRoomActorPrivyUsage() {
 }
 function saveRoomActorPrivyUsage(state) {
     try {
-        fs.writeFileSync(ROOM_ACTOR_PRIVY_USAGE_FILE, JSON.stringify(state, null, 2), 'utf8');
+        scheduleJsonWrite(ROOM_ACTOR_PRIVY_USAGE_FILE, state);
     } catch (e) {
         console.warn('[ROOM-ACTOR-PRIVY] save error:', e.message || e);
     }
@@ -1214,7 +1247,7 @@ function loadProcessedEvents() {
 function saveProcessedEvents(set) {
     try {
         const arr = Array.from(set);
-        fs.writeFileSync(PROCESSED_EVENTS_FILE, JSON.stringify(arr, null, 2), 'utf8');
+        scheduleJsonWrite(PROCESSED_EVENTS_FILE, arr);
     } catch (e) {
         console.error('[IDEMPOTENCE] Erreur sauvegarde processed events:', e.message || e);
     }
@@ -1247,7 +1280,7 @@ function loadPointsDebitedEvents() {
 function savePointsDebitedEvents(set) {
     try {
         const arr = Array.from(set);
-        fs.writeFileSync(POINTS_DEBIT_EVENTS_FILE, JSON.stringify(arr, null, 2), 'utf8');
+        scheduleJsonWrite(POINTS_DEBIT_EVENTS_FILE, arr);
     } catch (e) {
         console.error('[POINTS-DEBIT] Erreur sauvegarde points debited events:', e.message || e);
     }
@@ -1275,7 +1308,7 @@ function loadPhotonSessions() {
 
 function savePhotonSessions(state) {
     try {
-        fs.writeFileSync(PHOTON_SESSIONS_FILE, JSON.stringify(state, null, 2), 'utf8');
+        scheduleJsonWrite(PHOTON_SESSIONS_FILE, state);
     } catch (e) {
         console.warn('[PHOTON] save error:', e.message || e);
     }
