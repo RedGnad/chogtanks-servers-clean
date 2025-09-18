@@ -330,7 +330,8 @@ app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAu
 });
 
 // Signature de score (anti "copy as fetch" sans Firebase delta)
-app.post('/api/match/sign-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+// Note: pas besoin du wallet ici; on signe pour l'utilisateur Firebase authentifié
+app.post('/api/match/sign-score', submitScoreLimiter, requireFirebaseAuth, async (req, res) => {
     try {
         if (!MATCH_SECRET) return res.status(503).json({ error: 'Score signing disabled' });
         const { matchToken, score, bonus } = req.body || {};
