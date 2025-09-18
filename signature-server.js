@@ -257,6 +257,11 @@ app.get('/health', (req, res) => {
 // Supporte aussi la méthode HEAD sur /health
 app.head('/health', (req, res) => res.sendStatus(200));
 
+// Route racine légère pour éviter des 502 sur GET /
+app.get('/', (req, res) => {
+    res.status(200).json({ ok: true, service: 'chogtanks-signature-server' });
+});
+
 // Proxy: check username (évite CORS côté WebView)
 app.get('/api/check-username', async (req, res) => {
     try {
@@ -443,7 +448,7 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
         if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
             return res.status(400).json({ error: 'Invalid wallet address format' });
         }
-
+        
         const normalized = walletAddress.toLowerCase();
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
         if (totalScore <= 0) {
@@ -636,7 +641,7 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
                     lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
                     matchId: matchId || 'legacy'
                 }, { merge: true });
-
+                
                 // Enregistrer le delta de match par uid pour validation Privy ultérieure
                 try {
                     const uid = req.firebaseAuth?.uid;
@@ -864,9 +869,27 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
                 }
                 const altRoom = findRecentRoomForActor(userKey);
                 if (!altRoom || !hasAcceptablePhotonPresence(altRoom, userKey)) {
-                    return res.status(403).json({ error: 'Photon presence not verified for this match' });
+                    // Fenêtre de grâce ciblée fin de match: accepter si la room vient d'être fermée très récemment
+                    try {
+                        const FINAL_SUBMIT_GRACE_MS = Number(process.env.FINAL_SUBMIT_GRACE_MS || 2000);
+                        const now = Date.now();
+                        const sess = photonSessions[String(room)] || photonSessions[String(altRoom)] || null;
+                        const justClosed = Boolean(sess && sess.closed && typeof sess.closedAt === 'number' && (now - sess.closedAt) <= FINAL_SUBMIT_GRACE_MS);
+                        // Exiger X-Score-Sig valide pour accepter en grâce
+                        const providedScoreSig = req.headers['x-score-sig'] || req.headers['x_score_sig'] || null;
+                        const expectedScoreSig = computeScoreSig(matchToken, req.firebaseAuth?.uid || '', Number(cappedScore));
+                        const scoreSigOk = Boolean(expectedScoreSig && providedScoreSig === expectedScoreSig);
+                        if (!(justClosed && scoreSigOk)) {
+                            return res.status(403).json({ error: 'Photon presence not verified for this match' });
+                        }
+                        console.log(`[FINAL-GRACE] ✅ Accept submit-score in grace window: room=%s userKey=%s closedAgoMs=%d`, String(room || altRoom), String(userKey || ''), sess && sess.closedAt ? (now - sess.closedAt) : -1);
+                        // Sinon: on accepte dans la fenêtre de grâce
+                    } catch (_) {
+                        return res.status(403).json({ error: 'Photon presence not verified for this match' });
+                    }
+                } else {
+                    room = altRoom;
                 }
-                room = altRoom;
             }
             if (room && userKey && hasRoomActorPrivySubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Privy score already submitted for this match' });
@@ -1532,49 +1555,62 @@ app.post('/photon/webhook', jsonParserSmall, (req, res) => {
                     return; // Ignore silencieusement
                 }
                 
-                const gameId = String(body.GameId || body.gameId || body.roomName || body.room || '').trim();
+        const gameId = String(body.GameId || body.gameId || body.roomName || body.room || '').trim();
                 if (!gameId) return;
-                const userId = String(body.UserId || body.userId || '').trim();
-                const actorKey = String(body.ActorNr || body.actorNr || body.ActorNumber || body.actorNumber || '').trim();
-                const now = Date.now();
+        const userId = String(body.UserId || body.userId || '').trim();
+        const actorKey = String(body.ActorNr || body.actorNr || body.ActorNumber || body.actorNumber || '').trim();
+        const now = Date.now();
 
                 const sess = photonSessions[gameId] || { users: {}, wallets: {}, privyWallets: {}, createdAt: now, closed: false };
                 logPhotonThrottled(`type=${type} gameId=${gameId} userId=${userId} actor=${actorKey}`);
-                switch (type) {
-                    case 'create':
-                    case 'gamecreated':
-                    case 'roomcreated':
-                    case 'gamestarted':
-                        sess.createdAt = now;
-                        if (userId) { sess.users[userId] = { lastSeen: now }; }
-                        if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
-                        break;
-                    case 'join':
-                    case 'actorjoin':
-                    case 'playerjoined':
-                    case 'joinrequest':
-                        if (userId) { sess.users[userId] = { lastSeen: now }; }
-                        if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
-                        break;
-                    case 'leave':
-                    case 'actorleave':
-                    case 'playerleft':
-                    case 'leaverequest':
-                        if (userId) { sess.users[userId] = { lastSeen: now }; }
-                        if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
-                        break;
-                    case 'close':
-                    case 'gameclosed':
-                    case 'roomclosed':
-                        sess.closed = true;
-                        sess.closedAt = now;
-                        break;
+        switch (type) {
+            case 'create':
+            case 'gamecreated':
+            case 'roomcreated':
+            case 'gamestarted':
+                sess.createdAt = now;
+                if (userId) { sess.users[userId] = { lastSeen: now }; }
+                if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
+                break;
+            case 'join':
+            case 'actorjoin':
+            case 'playerjoined':
+            case 'joinrequest':
+                if (userId) { sess.users[userId] = { lastSeen: now }; }
+                if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
+                break;
+            case 'leave':
+            case 'actorleave':
+            case 'playerleft':
+            case 'leaverequest':
+                if (userId) { sess.users[userId] = { lastSeen: now }; }
+                if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
+                break;
+            case 'close':
+            case 'gameclosed':
+            case 'roomclosed':
+                sess.closed = true;
+                sess.closedAt = now;
+                break;
                     case 'event': {
-                        const data = body.Data || body.data || {};
-                        const uidFromData = String(data.userId || '').trim();
-                        const effectiveUser = userId || uidFromData;
-                        if (effectiveUser) { sess.users[effectiveUser] = { lastSeen: now }; }
-                        if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
+                        // Throttle par acteur pour lisser les rafales (par défaut 250ms)
+                        try {
+                            const THROTTLE_EVENT_MS = Number(process.env.PHOTON_EVENT_THROTTLE_MS || 250);
+                            const key = String(actorKey || userId || '').trim();
+                            if (key) {
+                                if (!photonSessions.__lastEventAt) photonSessions.__lastEventAt = {};
+                                const lastAt = photonSessions.__lastEventAt[key] || 0;
+                                if (Date.now() - lastAt < THROTTLE_EVENT_MS) {
+                                    break;
+                                }
+                                photonSessions.__lastEventAt[key] = Date.now();
+                            }
+                        } catch (_) {}
+                const data = body.Data || body.data || {};
+                const uidFromData = String(data.userId || '').trim();
+                const effectiveUser = userId || uidFromData;
+                if (effectiveUser) { sess.users[effectiveUser] = { lastSeen: now }; }
+                if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
                         try {
                             const maybeAppKitWallet = String(data.wallet || data.appKitWallet || '').trim().toLowerCase();
                             const maybePrivyWallet = String(data.privyWallet || '').trim().toLowerCase();
@@ -1590,11 +1626,11 @@ app.post('/photon/webhook', jsonParserSmall, (req, res) => {
                                 }
                             }
                         } catch (_) {}
-                        break;
-                    }
-                    case 'gameproperties':
-                        if (userId) { sess.users[userId] = { lastSeen: now }; }
-                        if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
+                break;
+            }
+            case 'gameproperties':
+                if (userId) { sess.users[userId] = { lastSeen: now }; }
+                if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
                         try {
                             const props = body.Properties || body.properties || body.Data || body.data || {};
                             const maybePrivyWallet = String(props.privyWallet || '').trim().toLowerCase();
@@ -1607,15 +1643,15 @@ app.post('/photon/webhook', jsonParserSmall, (req, res) => {
                                 }
                             }
                         } catch (_) {}
-                        break;
-                    default:
-                        if (userId || actorKey) {
-                            if (userId) { sess.users[userId] = { lastSeen: now }; }
-                            if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
-                        }
-                        break;
+                break;
+            default:
+                if (userId || actorKey) {
+                    if (userId) { sess.users[userId] = { lastSeen: now }; }
+                    if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
                 }
-                photonSessions[gameId] = sess;
+                break;
+        }
+        photonSessions[gameId] = sess;
                 photonSessionsDirty = true;
             } catch (e) {
                 console.warn('[PHOTON][WEBHOOK][ASYNC] error:', e && (e.message || e));
@@ -1690,9 +1726,9 @@ async function flushBatchIfNeeded(force = false) {
                     .map(([addr, agg]) => ({ addr, agg }))
                     .filter(({ agg }) => Number(agg.score || 0) > 0)
                     .map(({ addr, agg }) => ({
-                        player: addr,
-                        score: ethers.BigNumber.from(agg.score),
-                        transactions: ethers.BigNumber.from(agg.tx)
+                    player: addr,
+                    score: ethers.BigNumber.from(agg.score),
+                    transactions: ethers.BigNumber.from(agg.tx)
                     }));
 
                 // Appel on-chain batch (tuple[])
@@ -1713,25 +1749,25 @@ async function flushBatchIfNeeded(force = false) {
                 // Preflight
                 try {
                     await contract.callStatic.batchUpdatePlayerData(dataTuples);
-                } catch (e) {
+                    } catch (e) {
                     console.warn('[Monad Games ID][BATCH] preflight failed:', e.message || e);
                     continue; // ne vide pas le chunk, on réessaiera plus tard
                 }
 
                 // Gas estimate (+20%)
-                let gasLimit = ethers.BigNumber.from(600000);
-                try {
+                    let gasLimit = ethers.BigNumber.from(600000);
+                        try {
                     const est = await contract.estimateGas.batchUpdatePlayerData(dataTuples);
-                    gasLimit = est.mul(120).div(100);
+                            gasLimit = est.mul(120).div(100);
                 } catch (_) {}
 
-            const nonce = await getNextNonce(wallet);
+                    const nonce = await getNextNonce(wallet);
                 const tx = await contract.batchUpdatePlayerData(dataTuples, {
-                    gasLimit,
-                maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
-                maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
-                nonce
-            });
+                        gasLimit,
+                        maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
+                        maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+                        nonce
+                    });
             console.log(`[Monad Games ID][BATCH] Tx sent: ${tx.hash}`);
             // Backoff simple et attente confirmable
             const receipt = await tx.wait().catch(async (e) => {
@@ -1989,13 +2025,13 @@ const chogIface = new ethers.utils.Interface([
                 // Preflight
                 try {
                     await contract.callStatic.updatePlayerData(dataTuple);
-                } catch (e) {
+                    } catch (e) {
                     return res.status(409).json({ error: 'Preflight failed', details: e.message || String(e) });
                 }
                 let gasLimit = ethers.BigNumber.from(150000);
-                try {
+                    try {
                     const est = await contract.estimateGas.updatePlayerData(dataTuple);
-                    gasLimit = est.mul(120).div(100);
+                        gasLimit = est.mul(120).div(100);
                 } catch (_) {}
                 const nonce = await getNextNonce(wallet);
                 const tx = await contract.updatePlayerData(dataTuple, {
