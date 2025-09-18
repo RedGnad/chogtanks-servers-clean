@@ -90,20 +90,6 @@ function computeScoreSig(token, uid, score) {
     }
 }
 
-const DYNAMIC_MAX_SCORE = process.env.DYNAMIC_MAX_SCORE === '1';
-function dynamicMaxScore(rec, fallbackMax) {
-    if (!DYNAMIC_MAX_SCORE) return fallbackMax;
-    try {
-        if (!rec || typeof rec.createdAt !== 'number') return fallbackMax;
-        const ageSec = Math.floor((Date.now() - Number(rec.createdAt || 0)) / 1000);
-        if (ageSec <= 75) return 10;
-        if (ageSec <= 90) return 20;
-        return 40;
-    } catch (_) {
-        return fallbackMax;
-    }
-}
-
 // Route-specific rate limiters (no-op if lib missing)
 const matchStartLimiter = buildRouteLimiter({
     windowMs: Number(process.env.MATCH_START_WINDOW_MS || 60_000),
@@ -125,21 +111,14 @@ const allowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
     .map(s => s.trim())
     .filter(Boolean);
 const allowedOrigins = new Set(allowedFromEnv.length ? allowedFromEnv : defaultAllowed);
-const corsOptions = {
+app.use(cors({
     origin: (origin, cb) => {
         if (!origin) return cb(null, true); // allow non-browser tools
         if (allowedOrigins.has(origin)) return cb(null, true);
         return cb(new Error('Not allowed by CORS'));
     },
-    credentials: true,
-    methods: ['GET', 'HEAD', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Match-Sig', 'X-Score-Sig'],
-    optionsSuccessStatus: 204,
-    maxAge: 86400
-};
-app.use(cors(corsOptions));
-// Répondre explicitement aux préflights OPTIONS avec les bons en-têtes
-app.options('*', cors(corsOptions));
+    credentials: true
+}));
 
 const port = process.env.PORT || 3001;
 
@@ -351,8 +330,7 @@ app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAu
 });
 
 // Signature de score (anti "copy as fetch" sans Firebase delta)
-// Note: pas besoin du wallet ici; on signe pour l'utilisateur Firebase authentifié
-app.post('/api/match/sign-score', submitScoreLimiter, requireFirebaseAuth, async (req, res) => {
+app.post('/api/match/sign-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         if (!MATCH_SECRET) return res.status(503).json({ error: 'Score signing disabled' });
         const { matchToken, score, bonus } = req.body || {};
@@ -369,13 +347,10 @@ app.post('/api/match/sign-score', submitScoreLimiter, requireFirebaseAuth, async
         if (rec.uid && uid && rec.uid !== uid) {
             return res.status(401).json({ error: 'Match token does not belong to this user' });
         }
-        // Aligner la signature sur la logique de soumission: (score + bonus) plafonné (cap dynamique optionnel)
+        // Aligner la signature sur la logique de soumission: (score + bonus) plafonné
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
-        const dynCap = dynamicMaxScore(rec, MAX_SCORE_PER_MATCH);
-        const cappedScore = Math.min(totalScore, dynCap);
-        // Mémoriser le cap utilisé au moment de la signature pour éviter les désynchronisations aux seuils
-        try { rec.capAtSign = dynCap; matchTokens.set(matchToken, rec); } catch (_) {}
+        const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
         const sig = computeScoreSig(matchToken, uid, Number(cappedScore));
         return res.json({ scoreSig: sig, cappedScore, success: true });
     } catch (e) {
@@ -400,13 +375,11 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
         if (totalScore <= 0) {
             return res.status(204).end();
         }
-        // Cap doux par match (configurable) + cap dynamique optionnel
+        // Cap doux par match (configurable)
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
-        const rec = (typeof matchToken === 'string') ? matchTokens.get(matchToken) : null;
-        const dynCap = dynamicMaxScore(rec, MAX_SCORE_PER_MATCH);
-        const cappedScore = Math.min(totalScore, dynCap);
+        const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
         if (cappedScore < totalScore) {
-            console.log(`[SCORE-CAP] Score plafonné pour ${normalized}: ${totalScore} -> ${cappedScore} (MAX=${dynCap})`);
+            console.log(`[SCORE-CAP] Score plafonné pour ${normalized}: ${totalScore} -> ${cappedScore} (MAX=${MAX_SCORE_PER_MATCH})`);
         }
 
         // Enforce match token usage si auth active
@@ -578,8 +551,8 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
                     currentScore = Number(doc.data().score || 0);
                 }
                 
-        // Ajouter le nouveau score (appliquer le cap)
-        const newTotalScore = currentScore + cappedScore;
+                // Ajouter le nouveau score
+                const newTotalScore = currentScore + totalScore;
                 
                 // Sauvegarder dans Firebase
                 await docRef.set({
@@ -624,8 +597,8 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
                     }
                 } catch (_) {}
                 
-                console.log(`[SUBMIT-SCORE] ✅ Score sauvegardé dans Firebase: ${currentScore} + ${cappedScore} = ${newTotalScore}`);
-                console.log(`[MONITORING] 📊 SCORE SUBMISSION - Wallet: ${normalized}, Score Added: ${cappedScore}, New Total: ${newTotalScore}, Timestamp: ${new Date().toISOString()}`);
+                console.log(`[SUBMIT-SCORE] ✅ Score sauvegardé dans Firebase: ${currentScore} + ${totalScore} = ${newTotalScore}`);
+                console.log(`[MONITORING] 📊 SCORE SUBMISSION - Wallet: ${normalized}, Score Added: ${totalScore}, New Total: ${newTotalScore}, Timestamp: ${new Date().toISOString()}`);
                 
                 return res.json({
                     success: true,
@@ -724,10 +697,8 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
         const player = String(privyAddress).toLowerCase();
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
-        const recForCap = (typeof matchToken === 'string') ? matchTokens.get(matchToken) : null;
-        const dynCapForPrivy = dynamicMaxScore(recForCap, MAX_SCORE_PER_MATCH);
-        let cappedScore = Math.min(totalScore, dynCapForPrivy);
-        // Politique dure: si totalScore > MAX statique, annuler (0)
+        let cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        // Politique dure: si totalScore > MAX, annuler (0)
         if (totalScore > MAX_SCORE_PER_MATCH) {
             cappedScore = 0;
         }
@@ -833,13 +804,10 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
             }
             matchTokens.set(matchToken, rec);
 
-            // Option: exiger signature de score si activée (utiliser le même cap qu'au moment de la signature)
+            // Option: exiger signature de score si activée
             if (process.env.REQUIRE_SCORE_SIG === '1') {
                 const providedScoreSig = req.headers['x-score-sig'] || req.headers['x_score_sig'] || null;
-                const uidForSig = req.firebaseAuth?.uid || '';
-                const capUsedAtSign = (rec && typeof rec.capAtSign === 'number') ? rec.capAtSign : dynamicMaxScore(rec, MAX_SCORE_PER_MATCH);
-                const cappedForSig = Math.min(totalScore, capUsedAtSign);
-                const expectedScoreSig = computeScoreSig(matchToken, uidForSig, Number(cappedForSig));
+                const expectedScoreSig = computeScoreSig(matchToken, req.firebaseAuth?.uid || '', Number(cappedScore));
                 if (!providedScoreSig || providedScoreSig !== expectedScoreSig) {
                     return res.status(401).json({ error: 'Invalid score signature' });
                 }
@@ -1403,7 +1371,7 @@ app.post('/photon/webhook', (req, res) => {
         // Support Photon v1.2 and v2 field names + normalize property events
         let type = String(body.Type || body.type || body.eventType || '').toLowerCase();
         // Normaliser les alias d'événements de propriétés vers 'gameproperties'
-        if (['propertieschanged', 'roomproperties', 'propertyupdate', 'customproperties', 'game'].includes(type)) {
+        if (['propertieschanged', 'roomproperties', 'propertyupdate', 'customproperties'].includes(type)) {
             type = 'gameproperties';
         }
         const gameId = String(body.GameId || body.gameId || body.roomName || body.room || '').trim();
@@ -1690,8 +1658,8 @@ app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth
         res.on('finish', () => { processingTxHashes.delete(txHash); });
 
         // Évaluer l'état de liaison pour orienter la réponse finale, sans bloquer la consommation de points
-        let existingBinding = walletBindings.get(pa);
-        let mismatchBinding = !!(existingBinding && String(existingBinding).toLowerCase() !== ak);
+        const existingBinding = walletBindings.get(pa);
+        const mismatchBinding = !!(existingBinding && String(existingBinding).toLowerCase() !== ak);
 
         // (Déplacé) Liaison anti-farming après validations on-chain (création/validation de la liaison)
 
@@ -1816,24 +1784,25 @@ const chogIface = new ethers.utils.Interface([
             }
         }
 
-        // Vérifier la liaison: n'awarder on-chain que si liaison existante et cohérente
-        let canAwardMonad = existingBinding && !mismatchBinding;
-        
-        if (!canAwardMonad) {
-            console.log(`[ANTI-FARMING] ⚠️ Pas d'award Monad: ${!existingBinding ? 'pas de liaison' : 'mismatch liaison'} pour ${pa}`);
-            return res.json({
-                success: true,
-                playerAddress: pa,
-                scoreAmount: derivedScore,
-                transactionAmount: derivedTx,
-                actionType,
-                verified: true,
-                monadAwarded: false,
-                message: 'Points debited but no Monad Games ID award (wallet not bound or mismatch)'
+        // En cas de mismatch de liaison, répondre 403 après consommation des points (pas d'update binding/monad)
+        if (mismatchBinding) {
+            return res.status(403).json({
+                error: "Wallet farming detected",
+                details: "This Monad Games ID account is bound to a different AppKit wallet"
             });
         }
 
-        console.log(`[ANTI-FARMING] ✅ Wallet vérifié: ${ak} → award Monad`);
+        // ANTI-FARMING: Établir/valider la liaison maintenant que tout est cohérent
+        {
+            const boundWallet = walletBindings.get(pa);
+            if (!boundWallet) {
+                walletBindings.set(pa, ak);
+                saveWalletBindings(walletBindings);
+                console.log(`[ANTI-FARMING] 🔗 Liaison confirmée: Privy ${pa} → AppKit ${ak}`);
+            } else {
+                console.log(`[ANTI-FARMING] ✅ Wallet vérifié: ${ak}`);
+            }
+        }
 
         if (ENABLE_MONAD_BATCH) {
             // En mode strict, on prépare aussi un débit égal au score dérivé
@@ -1846,8 +1815,7 @@ const chogIface = new ethers.utils.Interface([
                 scoreAmount: derivedScore,
                 transactionAmount: derivedTx,
                 actionType,
-                verified: true,
-                monadAwarded: true
+                verified: true
             });
         } else {
             // Sérialiser les tx du serveur pour éviter les collisions de nonce
@@ -1939,7 +1907,6 @@ const chogIface = new ethers.utils.Interface([
                     transactionAmount: derivedTx, 
                     actionType,
                     verified: true,
-                    monadAwarded: true,
                     message: 'Score submitted to Monad Games ID contract'
                 });
             } finally {
