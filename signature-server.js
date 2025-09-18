@@ -43,13 +43,31 @@ try {
         credentials: true
     }));
 } catch (_) {}
-// Répondre immédiatement aux préflights pour réduire la charge et éviter des 502 proxy
-app.use((req, res, next) => {
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(204);
-    }
-    next();
-});
+// Répondre immédiatement aux préflights avec en-têtes CORS explicites
+try {
+    const defaultAllowedEarly = [
+        'https://redgnad.github.io',
+        'https://chogtanks.vercel.app',
+        'https://monadclip.vercel.app'
+    ];
+    const earlyAllowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+    const earlyAllowedOrigins = new Set(earlyAllowedFromEnv.length ? earlyAllowedFromEnv : defaultAllowedEarly);
+    app.options('*', cors({
+        origin: (origin, cb) => {
+            if (!origin) return cb(null, true);
+            if (earlyAllowedOrigins.has(origin)) return cb(null, true);
+            return cb(new Error('Not allowed by CORS'));
+        },
+        credentials: true,
+        methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+        allowedHeaders: ['Content-Type', 'Authorization', 'X-Match-Sig', 'X-Score-Sig', 'X-Webhook-Secret', 'X-Photon-Secret']
+    }), (req, res) => {
+        res.sendStatus(204);
+    });
+} catch (_) {}
 // Limite la taille des requêtes JSON pour réduire la surface DoS (augmenté pour webhooks volumineux)
 app.use(express.json({ limit: '256kb' }));
 // Masquer les détails d'erreur en prod si GENERIC_ERRORS=1
@@ -1484,6 +1502,12 @@ app.post('/photon/webhook', (req, res) => {
                 if (['propertieschanged', 'roomproperties', 'propertyupdate', 'customproperties'].includes(type)) {
                     type = 'gameproperties';
                 }
+                
+                // Ignorer les événements "game" qui créent beaucoup de bruit sans valeur critique
+                if (type === 'game' || type === 'gameevent' || type === 'gameplay') {
+                    return; // Ignore silencieusement
+                }
+                
                 const gameId = String(body.GameId || body.gameId || body.roomName || body.room || '').trim();
                 if (!gameId) return;
                 const userId = String(body.UserId || body.userId || '').trim();
