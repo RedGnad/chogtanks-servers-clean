@@ -291,22 +291,6 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
 // Match tokens in-memory (TTL court, anti-replay)
 const matchTokens = new Map(); // token -> { uid, createdAt, expAt, used }
 
-// Cap dynamique simple en fonction de la durée réelle du match
-// Règles: ≤ 75s → 10, ≤ 90s → 20, ≤ 180s+ → 40 (borné par fallbackMax)
-function getDynamicMaxScore(matchToken, fallbackMax) {
-    try {
-        if (!matchToken || typeof matchToken !== 'string') return Number(fallbackMax || 0);
-        const rec = matchTokens.get(matchToken);
-        if (!rec || typeof rec.createdAt !== 'number') return Number(fallbackMax || 0);
-        const elapsed = Date.now() - Number(rec.createdAt);
-        if (elapsed <= 75_000) return Math.min(Number(fallbackMax || 0), 10);
-        if (elapsed <= 90_000) return Math.min(Number(fallbackMax || 0), 20);
-        return Math.min(Number(fallbackMax || 0), 40);
-    } catch (_) {
-        return Number(fallbackMax || 0);
-    }
-}
-
 app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         console.log(`[MATCH-START] Match start requested`);
@@ -363,11 +347,10 @@ app.post('/api/match/sign-score', submitScoreLimiter, requireWallet, requireFire
         if (rec.uid && uid && rec.uid !== uid) {
             return res.status(401).json({ error: 'Match token does not belong to this user' });
         }
-        // Aligner la signature sur la logique de soumission: (score + bonus) plafonné (cap dynamique)
+        // Aligner la signature sur la logique de soumission: (score + bonus) plafonné
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
-        const dynCap = getDynamicMaxScore(matchToken, MAX_SCORE_PER_MATCH);
-        const cappedScore = Math.min(totalScore, dynCap);
+        const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
         const sig = computeScoreSig(matchToken, uid, Number(cappedScore));
         return res.json({ scoreSig: sig, cappedScore, success: true });
     } catch (e) {
@@ -392,12 +375,11 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
         if (totalScore <= 0) {
             return res.status(204).end();
         }
-        // Cap doux par match (configurable) – cap dynamique selon durée réelle
+        // Cap doux par match (configurable)
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
-        const dynCap = getDynamicMaxScore(matchToken, MAX_SCORE_PER_MATCH);
-        const cappedScore = Math.min(totalScore, dynCap);
+        const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
         if (cappedScore < totalScore) {
-            console.log(`[SCORE-CAP] Score plafonné pour ${normalized}: ${totalScore} -> ${cappedScore} (MAX=${dynCap})`);
+            console.log(`[SCORE-CAP] Score plafonné pour ${normalized}: ${totalScore} -> ${cappedScore} (MAX=${MAX_SCORE_PER_MATCH})`);
         }
 
         // Enforce match token usage si auth active
@@ -715,10 +697,9 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
         const player = String(privyAddress).toLowerCase();
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
-        const dynCap = getDynamicMaxScore(matchToken, MAX_SCORE_PER_MATCH);
-        let cappedScore = Math.min(totalScore, dynCap);
-        // Politique dure: si totalScore > dynCap, annuler (0)
-        if (totalScore > dynCap) {
+        let cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        // Politique dure: si totalScore > MAX, annuler (0)
+        if (totalScore > MAX_SCORE_PER_MATCH) {
             cappedScore = 0;
         }
         if (cappedScore <= 0) {
