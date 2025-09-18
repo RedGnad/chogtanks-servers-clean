@@ -830,6 +830,21 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
             if (!room) {
                 return res.status(400).json({ error: 'Missing gameId (Photon room)' });
             }
+            // Si on n'a pas d'userKey exploitable, tenter de dériver depuis la présence Photon via le wallet Privy
+            try {
+                if (!userKey) {
+                    const sess = photonSessions[String(room)] || {};
+                    const pw = (sess && sess.privyWallets) ? sess.privyWallets : null;
+                    if (pw && typeof pw === 'object') {
+                        for (const [candidateKey, w] of Object.entries(pw)) {
+                            if (String(w).toLowerCase() === player) {
+                                userKey = candidateKey;
+                                break;
+                            }
+                        }
+                    }
+                }
+            } catch (_) {}
             // Idempotence (canal Privy): refuser uniquement si Privy déjà soumis
             if (room && userKey && hasRoomActorPrivySubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Privy score already submitted for this match' });
