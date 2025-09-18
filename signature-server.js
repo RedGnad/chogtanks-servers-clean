@@ -1338,6 +1338,13 @@ function savePhotonSessions(state) {
 
 // Structure: { [gameId]: { users: { [userId]: { lastSeen:number } }, wallets: { [actorOrUser]: address }, createdAt:number, closed:boolean, closedAt:number|null } }
 const photonSessions = loadPhotonSessions();
+let photonSessionsDirty = false;
+const PHOTON_FLUSH_MS = Number(process.env.PHOTON_FLUSH_MS || 1000);
+setInterval(() => {
+    if (!photonSessionsDirty) return;
+    photonSessionsDirty = false;
+    savePhotonSessions(photonSessions);
+}, PHOTON_FLUSH_MS).unref();
 
 // Helper: verify a fresh presence for a user in a Photon room
 function hasFreshPhotonPresence(gameId, userId) {
@@ -1522,7 +1529,7 @@ app.post('/photon/webhook', (req, res) => {
         }
 
         photonSessions[gameId] = sess;
-        savePhotonSessions(photonSessions);
+        photonSessionsDirty = true;
         return res.json({ ok: true });
     } catch (e) {
         console.error('[PHOTON][WEBHOOK] error:', e.message || e);
