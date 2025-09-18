@@ -1659,8 +1659,8 @@ app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth
         res.on('finish', () => { processingTxHashes.delete(txHash); });
 
         // Évaluer l'état de liaison pour orienter la réponse finale, sans bloquer la consommation de points
-        const existingBinding = walletBindings.get(pa);
-        const mismatchBinding = !!(existingBinding && String(existingBinding).toLowerCase() !== ak);
+        let existingBinding = walletBindings.get(pa);
+        let mismatchBinding = !!(existingBinding && String(existingBinding).toLowerCase() !== ak);
 
         // (Déplacé) Liaison anti-farming après validations on-chain (création/validation de la liaison)
 
@@ -1785,25 +1785,24 @@ const chogIface = new ethers.utils.Interface([
             }
         }
 
-        // En cas de mismatch de liaison, répondre 403 après consommation des points (pas d'update binding/monad)
-        if (mismatchBinding) {
-            return res.status(403).json({
-                error: "Wallet farming detected",
-                details: "This Monad Games ID account is bound to a different AppKit wallet"
+        // Vérifier la liaison: n'awarder on-chain que si liaison existante et cohérente
+        let canAwardMonad = existingBinding && !mismatchBinding;
+        
+        if (!canAwardMonad) {
+            console.log(`[ANTI-FARMING] ⚠️ Pas d'award Monad: ${!existingBinding ? 'pas de liaison' : 'mismatch liaison'} pour ${pa}`);
+            return res.json({
+                success: true,
+                playerAddress: pa,
+                scoreAmount: derivedScore,
+                transactionAmount: derivedTx,
+                actionType,
+                verified: true,
+                monadAwarded: false,
+                message: 'Points debited but no Monad Games ID award (wallet not bound or mismatch)'
             });
         }
 
-        // ANTI-FARMING: Établir/valider la liaison maintenant que tout est cohérent
-        {
-            const boundWallet = walletBindings.get(pa);
-            if (!boundWallet) {
-                walletBindings.set(pa, ak);
-                saveWalletBindings(walletBindings);
-                console.log(`[ANTI-FARMING] 🔗 Liaison confirmée: Privy ${pa} → AppKit ${ak}`);
-            } else {
-                console.log(`[ANTI-FARMING] ✅ Wallet vérifié: ${ak}`);
-            }
-        }
+        console.log(`[ANTI-FARMING] ✅ Wallet vérifié: ${ak} → award Monad`);
 
         if (ENABLE_MONAD_BATCH) {
             // En mode strict, on prépare aussi un débit égal au score dérivé
@@ -1816,7 +1815,8 @@ const chogIface = new ethers.utils.Interface([
                 scoreAmount: derivedScore,
                 transactionAmount: derivedTx,
                 actionType,
-                verified: true
+                verified: true,
+                monadAwarded: true
             });
         } else {
             // Sérialiser les tx du serveur pour éviter les collisions de nonce
@@ -1908,6 +1908,7 @@ const chogIface = new ethers.utils.Interface([
                     transactionAmount: derivedTx, 
                     actionType,
                     verified: true,
+                    monadAwarded: true,
                     message: 'Score submitted to Monad Games ID contract'
                 });
             } finally {
