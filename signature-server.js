@@ -1371,7 +1371,7 @@ app.post('/photon/webhook', (req, res) => {
         // Support Photon v1.2 and v2 field names + normalize property events
         let type = String(body.Type || body.type || body.eventType || '').toLowerCase();
         // Normaliser les alias d'événements de propriétés vers 'gameproperties'
-        if (['propertieschanged', 'roomproperties', 'propertyupdate', 'customproperties'].includes(type)) {
+        if (['propertieschanged', 'roomproperties', 'propertyupdate', 'customproperties', 'game'].includes(type)) {
             type = 'gameproperties';
         }
         const gameId = String(body.GameId || body.gameId || body.roomName || body.room || '').trim();
