@@ -2051,10 +2051,18 @@ const chogIface = new ethers.utils.Interface([
     }
 });
 
-app.listen(port, () => {
+const server = app.listen(port, () => {
     console.log(`Signature server running on port ${port}`);
     console.log(`Game Server Address: ${gameWallet ? gameWallet.address : 'N/A (no private key)'}`);
 });
+// Réglages de timeouts HTTP pour limiter les 502 côté proxy
+try {
+    // Garder les connexions en vie un peu plus longtemps que le proxy
+    server.keepAliveTimeout = Number(process.env.KEEP_ALIVE_TIMEOUT_MS || 62000);
+    server.headersTimeout = Number(process.env.HEADERS_TIMEOUT_MS || 65000);
+    // Timeout de requête global (évite de laisser des sockets pendantes)
+    server.requestTimeout = Number(process.env.REQUEST_TIMEOUT_MS || 60000);
+} catch (_) {}
 
 // Garde-fous contre les crashs silencieux
 process.on('unhandledRejection', (reason) => {
