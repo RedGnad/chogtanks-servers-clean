@@ -552,8 +552,8 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
                     currentScore = Number(doc.data().score || 0);
                 }
                 
-                // Ajouter le nouveau score
-                const newTotalScore = currentScore + totalScore;
+        // Ajouter le nouveau score (appliquer le cap)
+        const newTotalScore = currentScore + cappedScore;
                 
                 // Sauvegarder dans Firebase
                 await docRef.set({
@@ -598,8 +598,8 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
                     }
                 } catch (_) {}
                 
-                console.log(`[SUBMIT-SCORE] ✅ Score sauvegardé dans Firebase: ${currentScore} + ${totalScore} = ${newTotalScore}`);
-                console.log(`[MONITORING] 📊 SCORE SUBMISSION - Wallet: ${normalized}, Score Added: ${totalScore}, New Total: ${newTotalScore}, Timestamp: ${new Date().toISOString()}`);
+                console.log(`[SUBMIT-SCORE] ✅ Score sauvegardé dans Firebase: ${currentScore} + ${cappedScore} = ${newTotalScore}`);
+                console.log(`[MONITORING] 📊 SCORE SUBMISSION - Wallet: ${normalized}, Score Added: ${cappedScore}, New Total: ${newTotalScore}, Timestamp: ${new Date().toISOString()}`);
                 
                 return res.json({
                     success: true,
