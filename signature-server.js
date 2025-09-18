@@ -22,6 +22,27 @@ app.use((req, res, next) => {
     }
     next();
 });
+// CORS en tout début (pour que même les 429/erreurs aient ACAO)
+try {
+    const defaultAllowedEarly = [
+        'https://redgnad.github.io',
+        'https://chogtanks.vercel.app',
+        'https://monadclip.vercel.app'
+    ];
+    const earlyAllowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+    const earlyAllowedOrigins = new Set(earlyAllowedFromEnv.length ? earlyAllowedFromEnv : defaultAllowedEarly);
+    app.use(cors({
+        origin: (origin, cb) => {
+            if (!origin) return cb(null, true);
+            if (earlyAllowedOrigins.has(origin)) return cb(null, true);
+            return cb(new Error('Not allowed by CORS'));
+        },
+        credentials: true
+    }));
+} catch (_) {}
 // Limite la taille des requêtes JSON pour réduire la surface DoS
 app.use(express.json({ limit: '64kb' }));
 // Masquer les détails d'erreur en prod si GENERIC_ERRORS=1
@@ -42,7 +63,7 @@ try {
     const rateLimit = require('express-rate-limit');
     const windowMs = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000); // 1 min
     const max = Number(process.env.RATE_LIMIT_MAX || 300); // 300 req/min par IP
-    app.use(rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false }));
+    app.use(rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false, skip: (req) => req.method === 'OPTIONS' }));
 } catch (_) {
     console.warn('[BOOT] express-rate-limit non installé - pas de rate limit');
 }
@@ -54,6 +75,7 @@ function buildRouteLimiter(options) {
         return rateLimit({
             standardHeaders: true,
             legacyHeaders: false,
+            skip: (req) => req.method === 'OPTIONS',
             ...options
         });
     } catch (_) {
