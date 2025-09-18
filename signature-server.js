@@ -1474,109 +1474,105 @@ app.post('/photon/webhook', (req, res) => {
                 return res.status(401).json({ error: 'Unauthorized' });
             }
         }
-
+        // Répondre très vite, traiter l'update en async pour réduire les 502 proxy
         const body = req.body || {};
-        // Support Photon v1.2 and v2 field names + normalize property events
-        let type = String(body.Type || body.type || body.eventType || '').toLowerCase();
-        // Normaliser les alias d'événements de propriétés vers 'gameproperties'
-        if (['propertieschanged', 'roomproperties', 'propertyupdate', 'customproperties'].includes(type)) {
-            type = 'gameproperties';
-        }
-        const gameId = String(body.GameId || body.gameId || body.roomName || body.room || '').trim();
-        const userId = String(body.UserId || body.userId || '').trim();
-        const actorKey = String(body.ActorNr || body.actorNr || body.ActorNumber || body.actorNumber || '').trim();
-        const now = Date.now();
+        res.json({ ok: true });
 
-        if (!gameId) return res.status(400).json({ error: 'Missing GameId' });
-
-        const sess = photonSessions[gameId] || { users: {}, wallets: {}, privyWallets: {}, createdAt: now, closed: false };
-        logPhotonThrottled(`type=${type} gameId=${gameId} userId=${userId} actor=${actorKey}`);
-        switch (type) {
-            case 'create':
-            case 'gamecreated':
-            case 'roomcreated':
-            case 'gamestarted':
-                sess.createdAt = now;
-                // Marquer présence immédiatement si des identifiants sont fournis
-                if (userId) { sess.users[userId] = { lastSeen: now }; }
-                if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
-                break;
-            case 'join':
-            case 'actorjoin':
-            case 'playerjoined':
-            case 'joinrequest':
-                if (userId) { sess.users[userId] = { lastSeen: now }; }
-                if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
-                break;
-            case 'leave':
-            case 'actorleave':
-            case 'playerleft':
-            case 'leaverequest':
-                if (userId) { sess.users[userId] = { lastSeen: now }; }
-                if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
-                break;
-            case 'close':
-            case 'gameclosed':
-            case 'roomclosed':
-                sess.closed = true;
-                sess.closedAt = now;
-                break;
-            case 'event': {
-                const data = body.Data || body.data || {};
-                const uidFromData = String(data.userId || '').trim();
-                const effectiveUser = userId || uidFromData;
-                if (effectiveUser) { sess.users[effectiveUser] = { lastSeen: now }; }
-                if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
-                // Capture éventuelle des wallets (AppKit et Privy) envoyés dans l'event
-                try {
-                    const maybeAppKitWallet = String(data.wallet || data.appKitWallet || '').trim().toLowerCase();
-                    const maybePrivyWallet = String(data.privyWallet || '').trim().toLowerCase();
-                    const key = actorKey || effectiveUser;
-                    if (key) {
-                        // Stocker AppKit wallet si valide
-                        if (/^0x[a-f0-9]{40}$/.test(maybeAppKitWallet)) {
-                            sess.wallets[key] = maybeAppKitWallet;
-                        }
-                        // Stocker Privy wallet séparément si valide
-                        if (/^0x[a-f0-9]{40}$/.test(maybePrivyWallet)) {
-                            if (!sess.privyWallets) sess.privyWallets = {};
-                            sess.privyWallets[key] = maybePrivyWallet;
-                            console.log(`[PHOTON][WEBHOOK][EVENT] Stored Privy wallet for ${key}: ${maybePrivyWallet}`);
-                        }
-                    }
-                } catch (_) {}
-                break;
-            }
-            case 'gameproperties':
-                if (userId) { sess.users[userId] = { lastSeen: now }; }
-                if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
-                try {
-                    // Lire Properties (room custom properties) ET Data (fallback)
-                    const props = body.Properties || body.properties || body.Data || body.data || {};
-                    const maybePrivyWallet = String(props.privyWallet || '').trim().toLowerCase();
-                    if (/^0x[a-f0-9]{40}$/.test(maybePrivyWallet)) {
-                        if (!sess.privyWallets) sess.privyWallets = {};
-                        const key = actorKey || userId;
-                        if (key) {
-                            sess.privyWallets[key] = maybePrivyWallet;
-                            console.log(`[PHOTON][WEBHOOK][GAMEPROPS] Stored Privy wallet for ${key}: ${maybePrivyWallet}`);
-                        }
-                    }
-                } catch (_) {}
-                break;
-            default:
-                if (userId || actorKey) {
-                    if (userId) { sess.users[userId] = { lastSeen: now }; }
-                    if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
-                } else {
-                    console.log(`[PHOTON][WEBHOOK] Unknown event type: ${type}`);
+        setImmediate(() => {
+            try {
+                let type = String(body.Type || body.type || body.eventType || '').toLowerCase();
+                if (['propertieschanged', 'roomproperties', 'propertyupdate', 'customproperties'].includes(type)) {
+                    type = 'gameproperties';
                 }
-                break;
-        }
+                const gameId = String(body.GameId || body.gameId || body.roomName || body.room || '').trim();
+                if (!gameId) return;
+                const userId = String(body.UserId || body.userId || '').trim();
+                const actorKey = String(body.ActorNr || body.actorNr || body.ActorNumber || body.actorNumber || '').trim();
+                const now = Date.now();
 
-        photonSessions[gameId] = sess;
-        photonSessionsDirty = true;
-        return res.json({ ok: true });
+                const sess = photonSessions[gameId] || { users: {}, wallets: {}, privyWallets: {}, createdAt: now, closed: false };
+                logPhotonThrottled(`type=${type} gameId=${gameId} userId=${userId} actor=${actorKey}`);
+                switch (type) {
+                    case 'create':
+                    case 'gamecreated':
+                    case 'roomcreated':
+                    case 'gamestarted':
+                        sess.createdAt = now;
+                        if (userId) { sess.users[userId] = { lastSeen: now }; }
+                        if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
+                        break;
+                    case 'join':
+                    case 'actorjoin':
+                    case 'playerjoined':
+                    case 'joinrequest':
+                        if (userId) { sess.users[userId] = { lastSeen: now }; }
+                        if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
+                        break;
+                    case 'leave':
+                    case 'actorleave':
+                    case 'playerleft':
+                    case 'leaverequest':
+                        if (userId) { sess.users[userId] = { lastSeen: now }; }
+                        if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
+                        break;
+                    case 'close':
+                    case 'gameclosed':
+                    case 'roomclosed':
+                        sess.closed = true;
+                        sess.closedAt = now;
+                        break;
+                    case 'event': {
+                        const data = body.Data || body.data || {};
+                        const uidFromData = String(data.userId || '').trim();
+                        const effectiveUser = userId || uidFromData;
+                        if (effectiveUser) { sess.users[effectiveUser] = { lastSeen: now }; }
+                        if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
+                        try {
+                            const maybeAppKitWallet = String(data.wallet || data.appKitWallet || '').trim().toLowerCase();
+                            const maybePrivyWallet = String(data.privyWallet || '').trim().toLowerCase();
+                            const key = actorKey || effectiveUser;
+                            if (key) {
+                                if (/^0x[a-f0-9]{40}$/.test(maybeAppKitWallet)) {
+                                    sess.wallets[key] = maybeAppKitWallet;
+                                }
+                                if (/^0x[a-f0-9]{40}$/.test(maybePrivyWallet)) {
+                                    if (!sess.privyWallets) sess.privyWallets = {};
+                                    sess.privyWallets[key] = maybePrivyWallet;
+                                    console.log(`[PHOTON][WEBHOOK][EVENT] Stored Privy wallet for ${key}: ${maybePrivyWallet}`);
+                                }
+                            }
+                        } catch (_) {}
+                        break;
+                    }
+                    case 'gameproperties':
+                        if (userId) { sess.users[userId] = { lastSeen: now }; }
+                        if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
+                        try {
+                            const props = body.Properties || body.properties || body.Data || body.data || {};
+                            const maybePrivyWallet = String(props.privyWallet || '').trim().toLowerCase();
+                            if (/^0x[a-f0-9]{40}$/.test(maybePrivyWallet)) {
+                                if (!sess.privyWallets) sess.privyWallets = {};
+                                const key = actorKey || userId;
+                                if (key) {
+                                    sess.privyWallets[key] = maybePrivyWallet;
+                                    console.log(`[PHOTON][WEBHOOK][GAMEPROPS] Stored Privy wallet for ${key}: ${maybePrivyWallet}`);
+                                }
+                            }
+                        } catch (_) {}
+                        break;
+                    default:
+                        if (userId || actorKey) {
+                            if (userId) { sess.users[userId] = { lastSeen: now }; }
+                            if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
+                        }
+                        break;
+                }
+                photonSessions[gameId] = sess;
+                photonSessionsDirty = true;
+            } catch (e) {
+                console.warn('[PHOTON][WEBHOOK][ASYNC] error:', e && (e.message || e));
+            }
+        });
     } catch (e) {
         console.error('[PHOTON][WEBHOOK] error:', e.message || e);
         return res.status(500).json({ error: 'Webhook error' });
