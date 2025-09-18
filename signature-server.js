@@ -65,11 +65,20 @@ try {
         methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
         allowedHeaders: ['Content-Type', 'Authorization', 'X-Match-Sig', 'X-Score-Sig', 'X-Webhook-Secret', 'X-Photon-Secret']
     }), (req, res) => {
+        try {
+            const origin = req.headers.origin;
+            if (origin) {
+                res.set('Vary', 'Origin');
+            }
+            res.set('Access-Control-Max-Age', '600');
+            res.set('Access-Control-Allow-Credentials', 'true');
+        } catch (_) {}
         res.sendStatus(204);
     });
 } catch (_) {}
-// Limite la taille des requêtes JSON pour réduire la surface DoS (augmenté pour webhooks volumineux)
-app.use(express.json({ limit: '256kb' }));
+// Parseurs JSON par route (évite de parser globalement sous rafales)
+const jsonParserSmall = express.json({ limit: '64kb' });
+const jsonParserMedium = express.json({ limit: '256kb' });
 // Masquer les détails d'erreur en prod si GENERIC_ERRORS=1
 if (process.env.GENERIC_ERRORS === '1') {
     app.use((req, res, next) => {
@@ -355,7 +364,7 @@ function getDynamicMaxScore(matchToken, fallbackMax) {
     }
 }
 
-app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/match/start', jsonParserSmall, matchStartLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         console.log(`[MATCH-START] Match start requested`);
         
@@ -394,7 +403,7 @@ app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAu
 });
 
 // Signature de score (anti "copy as fetch" sans Firebase delta)
-app.post('/api/match/sign-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/match/sign-score', jsonParserSmall, submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         if (!MATCH_SECRET) return res.status(503).json({ error: 'Score signing disabled' });
         const { matchToken, score, bonus } = req.body || {};
@@ -425,7 +434,7 @@ app.post('/api/match/sign-score', submitScoreLimiter, requireWallet, requireFire
 });
 
 // Endpoint pour soumettre les scores (compatibilité ancien build)
-app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { walletAddress, score, bonus, matchId, matchToken, gameId } = req.body || {};
         if (!walletAddress || typeof score === 'undefined') {
@@ -697,7 +706,7 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
     }
 });
 
-app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/mint-authorization', jsonParserSmall, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, mintCost, playerPoints } = req.body || {};
         const pAddr = playerAddress || req.body?.walletAddress; // alias compat
@@ -750,7 +759,7 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
 });
 
 // Endpoint PRIVY → Monad Games ID (submit-score, transactions=0)
-app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { privyAddress, score, bonus, matchId, matchToken, gameId } = req.body || {};
         if (!privyAddress || typeof score === 'undefined') {
@@ -1008,7 +1017,7 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
     }
 });
 
-app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/evolve-authorization', jsonParserSmall, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, tokenId, targetLevel, playerPoints } = req.body || {};
 
@@ -1491,7 +1500,7 @@ function findRecentRoomForActor(userId) {
 }
 
 // Webhook endpoint to receive Photon Realtime callbacks (Create/Join/Leave/Close/Event)
-app.post('/photon/webhook', (req, res) => {
+app.post('/photon/webhook', jsonParserSmall, (req, res) => {
     try {
         if (PHOTON_WEBHOOK_SECRET) {
             const q = req.query || {};
@@ -1778,7 +1787,7 @@ async function getNextNonce(wallet) {
     }
 }
 
-app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/monad-games-id/update-player', jsonParserSmall, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, appKitWallet, actionType, txHash } = req.body || {};
 
@@ -2077,6 +2086,20 @@ try {
     server.headersTimeout = Number(process.env.HEADERS_TIMEOUT_MS || 65000);
     // Timeout de requête global (évite de laisser des sockets pendantes)
     server.requestTimeout = Number(process.env.REQUEST_TIMEOUT_MS || 60000);
+} catch (_) {}
+
+// Moniteur simple de lag event-loop: log si > 200ms
+try {
+    const LAG_THRESHOLD_MS = Number(process.env.EVENT_LOOP_LAG_MS || 200);
+    let last = process.hrtime.bigint();
+    setInterval(() => {
+        const now = process.hrtime.bigint();
+        const diffMs = Number(now - last) / 1e6 - 1000; // interval 1000ms attendu
+        last = now;
+        if (diffMs > LAG_THRESHOLD_MS) {
+            console.warn(`[MONITOR] Event loop lag detected: +${diffMs.toFixed(0)}ms`);
+        }
+    }, 1000).unref();
 } catch (_) {}
 
 // Garde-fous contre les crashs silencieux
