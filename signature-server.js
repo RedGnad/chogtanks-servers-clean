@@ -22,8 +22,29 @@ app.use((req, res, next) => {
     }
     next();
 });
-// Limite la taille des requêtes JSON pour réduire la surface DoS
-app.use(express.json({ limit: '64kb' }));
+// CORS en tout début (pour que même les 429/erreurs aient ACAO)
+try {
+    const defaultAllowedEarly = [
+        'https://redgnad.github.io',
+        'https://chogtanks.vercel.app',
+        'https://monadclip.vercel.app'
+    ];
+    const earlyAllowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+    const earlyAllowedOrigins = new Set(earlyAllowedFromEnv.length ? earlyAllowedFromEnv : defaultAllowedEarly);
+    app.use(cors({
+        origin: (origin, cb) => {
+            if (!origin) return cb(null, true);
+            if (earlyAllowedOrigins.has(origin)) return cb(null, true);
+            return cb(new Error('Not allowed by CORS'));
+        },
+        credentials: true
+    }));
+} catch (_) {}
+// Limite la taille des requêtes JSON pour réduire la surface DoS (augmenté pour webhooks volumineux)
+app.use(express.json({ limit: '256kb' }));
 // Masquer les détails d'erreur en prod si GENERIC_ERRORS=1
 if (process.env.GENERIC_ERRORS === '1') {
     app.use((req, res, next) => {
@@ -42,7 +63,7 @@ try {
     const rateLimit = require('express-rate-limit');
     const windowMs = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000); // 1 min
     const max = Number(process.env.RATE_LIMIT_MAX || 300); // 300 req/min par IP
-    app.use(rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false }));
+    app.use(rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false, skip: (req) => req.method === 'OPTIONS' }));
 } catch (_) {
     console.warn('[BOOT] express-rate-limit non installé - pas de rate limit');
 }
@@ -54,6 +75,7 @@ function buildRouteLimiter(options) {
         return rateLimit({
             standardHeaders: true,
             legacyHeaders: false,
+            skip: (req) => req.method === 'OPTIONS',
             ...options
         });
     } catch (_) {
@@ -1080,6 +1102,40 @@ try {
 
 const WALLET_BINDINGS_FILE = path.join(DATA_DIR, 'wallet-bindings.json');
 
+// Ecritures disque asynchrones avec débounce (réduit les blocages event-loop)
+const FLUSH_DEBOUNCE_MS = Number(process.env.FLUSH_DEBOUNCE_MS || 300);
+const _pendingJsonWrites = new Map(); // filePath -> { timer: NodeJS.Timeout|null, data: string }
+
+function scheduleJsonWrite(filePath, jsonSerializable) {
+    try {
+        const nextData = JSON.stringify(jsonSerializable, null, 2);
+        let state = _pendingJsonWrites.get(filePath);
+        if (!state) {
+            state = { timer: null, data: nextData };
+            _pendingJsonWrites.set(filePath, state);
+        } else {
+            state.data = nextData;
+            if (state.timer) {
+                clearTimeout(state.timer);
+            }
+        }
+        state.timer = setTimeout(async () => {
+            try {
+                await fs.promises.writeFile(filePath, state.data, 'utf8');
+            } catch (e) {
+                console.warn('[ASYNC-WRITE] Failed to write', filePath, e && (e.message || e));
+            } finally {
+                state.timer = null;
+            }
+        }, FLUSH_DEBOUNCE_MS);
+        if (typeof state.timer.unref === 'function') {
+            state.timer.unref();
+        }
+    } catch (e) {
+        console.warn('[ASYNC-WRITE] scheduleJsonWrite error:', e && (e.message || e));
+    }
+}
+
 // Charger les liaisons existantes
 function loadWalletBindings() {
     try {
@@ -1096,8 +1152,7 @@ function loadWalletBindings() {
 // Sauvegarder les liaisons
 function saveWalletBindings(bindings) {
     try {
-        const data = JSON.stringify(Object.fromEntries(bindings), null, 2);
-        fs.writeFileSync(WALLET_BINDINGS_FILE, data, 'utf8');
+        scheduleJsonWrite(WALLET_BINDINGS_FILE, Object.fromEntries(bindings));
     } catch (error) {
         console.error('[ANTI-FARMING] Erreur sauvegarde fichier liaisons:', error.message);
     }
@@ -1124,7 +1179,7 @@ function loadRoomActorUsage() {
 }
 function saveRoomActorUsage(state) {
     try {
-        fs.writeFileSync(ROOM_ACTOR_USAGE_FILE, JSON.stringify(state, null, 2), 'utf8');
+        scheduleJsonWrite(ROOM_ACTOR_USAGE_FILE, state);
     } catch (e) {
         console.warn('[ROOM-ACTOR] save error:', e.message || e);
     }
@@ -1169,7 +1224,7 @@ function loadRoomActorPrivyUsage() {
 }
 function saveRoomActorPrivyUsage(state) {
     try {
-        fs.writeFileSync(ROOM_ACTOR_PRIVY_USAGE_FILE, JSON.stringify(state, null, 2), 'utf8');
+        scheduleJsonWrite(ROOM_ACTOR_PRIVY_USAGE_FILE, state);
     } catch (e) {
         console.warn('[ROOM-ACTOR-PRIVY] save error:', e.message || e);
     }
@@ -1214,7 +1269,7 @@ function loadProcessedEvents() {
 function saveProcessedEvents(set) {
     try {
         const arr = Array.from(set);
-        fs.writeFileSync(PROCESSED_EVENTS_FILE, JSON.stringify(arr, null, 2), 'utf8');
+        scheduleJsonWrite(PROCESSED_EVENTS_FILE, arr);
     } catch (e) {
         console.error('[IDEMPOTENCE] Erreur sauvegarde processed events:', e.message || e);
     }
@@ -1247,7 +1302,7 @@ function loadPointsDebitedEvents() {
 function savePointsDebitedEvents(set) {
     try {
         const arr = Array.from(set);
-        fs.writeFileSync(POINTS_DEBIT_EVENTS_FILE, JSON.stringify(arr, null, 2), 'utf8');
+        scheduleJsonWrite(POINTS_DEBIT_EVENTS_FILE, arr);
     } catch (e) {
         console.error('[POINTS-DEBIT] Erreur sauvegarde points debited events:', e.message || e);
     }
@@ -1275,7 +1330,7 @@ function loadPhotonSessions() {
 
 function savePhotonSessions(state) {
     try {
-        fs.writeFileSync(PHOTON_SESSIONS_FILE, JSON.stringify(state, null, 2), 'utf8');
+        scheduleJsonWrite(PHOTON_SESSIONS_FILE, state);
     } catch (e) {
         console.warn('[PHOTON] save error:', e.message || e);
     }
@@ -1283,6 +1338,32 @@ function savePhotonSessions(state) {
 
 // Structure: { [gameId]: { users: { [userId]: { lastSeen:number } }, wallets: { [actorOrUser]: address }, createdAt:number, closed:boolean, closedAt:number|null } }
 const photonSessions = loadPhotonSessions();
+let photonSessionsDirty = false;
+const PHOTON_FLUSH_MS = Number(process.env.PHOTON_FLUSH_MS || 1000);
+setInterval(() => {
+    if (!photonSessionsDirty) return;
+    photonSessionsDirty = false;
+    savePhotonSessions(photonSessions);
+}, PHOTON_FLUSH_MS).unref();
+
+// Throttle logging des webhooks pour éviter la saturation stdout
+let photonLogLastAt = 0;
+const PHOTON_LOG_EVERY_MS = Number(process.env.PHOTON_LOG_EVERY_MS || 500);
+let photonLogSkipped = 0;
+function logPhotonThrottled(message) {
+    const now = Date.now();
+    if (now - photonLogLastAt >= PHOTON_LOG_EVERY_MS) {
+        photonLogLastAt = now;
+        if (photonLogSkipped > 0) {
+            console.log(`[PHOTON][WEBHOOK][...${photonLogSkipped} skipped] ${message}`);
+            photonLogSkipped = 0;
+        } else {
+            console.log(`[PHOTON][WEBHOOK] ${message}`);
+        }
+    } else {
+        photonLogSkipped++;
+    }
+}
 
 // Helper: verify a fresh presence for a user in a Photon room
 function hasFreshPhotonPresence(gameId, userId) {
@@ -1368,8 +1449,12 @@ app.post('/photon/webhook', (req, res) => {
         }
 
         const body = req.body || {};
-        // Support Photon v1.2 and v2 field names
-        const type = String(body.Type || body.type || body.eventType || '').toLowerCase();
+        // Support Photon v1.2 and v2 field names + normalize property events
+        let type = String(body.Type || body.type || body.eventType || '').toLowerCase();
+        // Normaliser les alias d'événements de propriétés vers 'gameproperties'
+        if (['propertieschanged', 'roomproperties', 'propertyupdate', 'customproperties'].includes(type)) {
+            type = 'gameproperties';
+        }
         const gameId = String(body.GameId || body.gameId || body.roomName || body.room || '').trim();
         const userId = String(body.UserId || body.userId || '').trim();
         const actorKey = String(body.ActorNr || body.actorNr || body.ActorNumber || body.actorNumber || '').trim();
@@ -1378,7 +1463,7 @@ app.post('/photon/webhook', (req, res) => {
         if (!gameId) return res.status(400).json({ error: 'Missing GameId' });
 
         const sess = photonSessions[gameId] || { users: {}, wallets: {}, privyWallets: {}, createdAt: now, closed: false };
-        console.log(`[PHOTON][WEBHOOK] type=${type} gameId=${gameId} userId=${userId} actor=${actorKey}`);
+        logPhotonThrottled(`type=${type} gameId=${gameId} userId=${userId} actor=${actorKey}`);
         switch (type) {
             case 'create':
             case 'gamecreated':
@@ -1429,6 +1514,7 @@ app.post('/photon/webhook', (req, res) => {
                         if (/^0x[a-f0-9]{40}$/.test(maybePrivyWallet)) {
                             if (!sess.privyWallets) sess.privyWallets = {};
                             sess.privyWallets[key] = maybePrivyWallet;
+                            console.log(`[PHOTON][WEBHOOK][EVENT] Stored Privy wallet for ${key}: ${maybePrivyWallet}`);
                         }
                     }
                 } catch (_) {}
@@ -1438,12 +1524,16 @@ app.post('/photon/webhook', (req, res) => {
                 if (userId) { sess.users[userId] = { lastSeen: now }; }
                 if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
                 try {
-                    const data = body.Data || body.data || {};
-                    const maybePrivyWallet = String(data.privyWallet || '').trim().toLowerCase();
+                    // Lire Properties (room custom properties) ET Data (fallback)
+                    const props = body.Properties || body.properties || body.Data || body.data || {};
+                    const maybePrivyWallet = String(props.privyWallet || '').trim().toLowerCase();
                     if (/^0x[a-f0-9]{40}$/.test(maybePrivyWallet)) {
                         if (!sess.privyWallets) sess.privyWallets = {};
                         const key = actorKey || userId;
-                        if (key) sess.privyWallets[key] = maybePrivyWallet;
+                        if (key) {
+                            sess.privyWallets[key] = maybePrivyWallet;
+                            console.log(`[PHOTON][WEBHOOK][GAMEPROPS] Stored Privy wallet for ${key}: ${maybePrivyWallet}`);
+                        }
                     }
                 } catch (_) {}
                 break;
@@ -1458,7 +1548,7 @@ app.post('/photon/webhook', (req, res) => {
         }
 
         photonSessions[gameId] = sess;
-        savePhotonSessions(photonSessions);
+        photonSessionsDirty = true;
         return res.json({ ok: true });
     } catch (e) {
         console.error('[PHOTON][WEBHOOK] error:', e.message || e);
