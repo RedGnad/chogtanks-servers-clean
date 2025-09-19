@@ -448,7 +448,8 @@ app.post('/api/match/sign-score', jsonParserSmall, submitScoreLimiter, requireWa
         }
         const rec = matchTokens.get(matchToken);
         if (!rec) return res.status(401).json({ error: 'Invalid matchToken' });
-        if (rec.expAt < Date.now()) {
+        const MATCH_TOKEN_GRACE_MS = Number(process.env.MATCH_TOKEN_GRACE_MS || 45000);
+        if (rec.expAt + MATCH_TOKEN_GRACE_MS < Date.now()) {
             matchTokens.delete(matchToken);
             return res.status(401).json({ error: 'Match token expired' });
         }
