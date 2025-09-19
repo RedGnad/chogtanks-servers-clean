@@ -234,9 +234,17 @@ app.get('/api/check-username', async (req, res) => {
         }
         const fetch = require('node-fetch');
         const url = `https://monadclip.fun/api/check-wallet?wallet=${wallet}`;
-        const r = await fetch(url, { method: 'GET', headers: { 'accept': 'application/json' } });
+        const r = await fetch(url, { 
+            method: 'GET', 
+            headers: { 'accept': 'application/json' },
+            timeout: 2000
+        }).catch(() => null);
+        if (!r) {
+            return res.status(200).json({ ok: false, error: 'Upstream timeout' });
+        }
         const data = await r.json().catch(() => ({}));
-        return res.status(r.ok ? 200 : 502).json(data);
+        const strict = process.env.CHECK_USERNAME_STRICT_502 === '1';
+        return res.status(strict ? (r.ok ? 200 : 502) : 200).json(strict ? data : { ok: r.ok, ...data });
     } catch (e) {
         console.error('[PROXY][check-username] Error:', e.message || e);
         return res.status(500).json({ error: 'Proxy failed' });
@@ -796,6 +804,7 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
             if (room && userKey && hasRoomActorPrivySubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Privy score already submitted for this match' });
             }
+            
             const BYPASS_PRIVY_PRESENCE = process.env.BYPASS_PRIVY_PRESENCE === '1';
             if (!BYPASS_PRIVY_PRESENCE && (!userKey || !hasAcceptablePhotonPresence(room, userKey))) {
                 if (REQUIRE_EXPLICIT_ROOM) {
@@ -1351,6 +1360,7 @@ function hasFreshPhotonPresence(gameId, userId) {
 // Presence acceptable: soit fraîche, soit dans une fenêtre de grâce après fermeture/quit
 function hasAcceptablePhotonPresence(gameId, userId) {
     try {
+        if (process.env.PHOTON_CHECK_DISABLE === '1') return true; // bypass total
         if (!gameId || !userId) return false;
         const now = Date.now();
         const sess = photonSessions[String(gameId)];
@@ -1972,6 +1982,18 @@ const chogIface = new ethers.utils.Interface([
         });
     }
 });
+
+// Moniteur de lag pour identifier les pics de charge
+setInterval(() => {
+    const start = process.hrtime.bigint();
+    setImmediate(() => {
+        const lag = Number(process.hrtime.bigint() - start) / 1000000;
+        if (lag > 50) console.warn(`[LAG] Event loop lag: ${lag.toFixed(1)}ms`);
+    });
+}, 5000);
+
+// Route racine pour éviter les 502 sur /
+app.get('/', (req, res) => res.status(200).json({ ok: true, ts: Date.now() }));
 
 const server = app.listen(port, () => {
     console.log(`Signature server running on port ${port}`);
