@@ -345,6 +345,31 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
 // Match tokens in-memory (TTL court, anti-replay)
 const matchTokens = new Map(); // token -> { uid, createdAt, expAt, used }
 
+// Cap dynamique par durée: parse tiers depuis env (ex: "30:10,90:20,179:40")
+function getDurationMaxScore(recCreatedAt) {
+    const enable = process.env.ENABLE_DURATION_CAPS === '1';
+    const hardMax = Number(process.env.MAX_SCORE_PER_MATCH || 50);
+    if (!enable || !recCreatedAt) return hardMax;
+    const spec = String(process.env.DURATION_CAPS || '30:10,90:20,179:40');
+    const tiers = spec
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((pair) => {
+            const parts = pair.split(':');
+            return { sec: Number(parts[0]), cap: Number(parts[1]) };
+        })
+        .filter((t) => Number.isFinite(t.sec) && Number.isFinite(t.cap))
+        .sort((a, b) => a.sec - b.sec);
+    if (!tiers.length) return hardMax;
+    const ageSec = Math.max(0, Math.floor((Date.now() - Number(recCreatedAt || 0)) / 1000));
+    let chosenCap = tiers[tiers.length - 1].cap;
+    for (const t of tiers) {
+        if (ageSec <= t.sec) { chosenCap = t.cap; break; }
+    }
+    return Math.min(chosenCap, hardMax);
+}
+
 // Middleware: Auth Firebase OU signature de match (X-Match-Sig)
 async function requireFirebaseAuthOrMatchSig(req, res, next) {
     try {
@@ -462,9 +487,9 @@ app.post('/api/match/sign-score', jsonParserSmall, submitScoreLimiter, requireWa
             return res.status(401).json({ error: 'Match token does not belong to this user' });
         }
         // Aligner la signature sur la logique de soumission: (score + bonus) plafonné
-        const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
-        const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        const dynMaxSign = getDurationMaxScore(rec.createdAt);
+        const cappedScore = Math.min(totalScore, dynMaxSign);
         const sig = computeScoreSig(matchToken, uid, Number(cappedScore));
         return res.json({ scoreSig: sig, cappedScore, success: true });
     } catch (e) {
@@ -489,11 +514,10 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
         if (totalScore <= 0) {
             return res.status(204).end();
         }
-        // Cap doux par match (configurable)
-        const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
-        const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        // Cap par match (dynamique si activé)
+        let cappedScore = Math.min(totalScore, Number(process.env.MAX_SCORE_PER_MATCH || 50));
         if (cappedScore < totalScore) {
-            console.log(`[SCORE-CAP] Score plafonné pour ${normalized}: ${totalScore} -> ${cappedScore} (MAX=${MAX_SCORE_PER_MATCH})`);
+            console.log(`[SCORE-CAP] Score plafonné pour ${normalized}: ${totalScore} -> ${cappedScore} (MAX=${process.env.MAX_SCORE_PER_MATCH || 50})`);
         }
 
         // Enforce match token usage si auth active
@@ -810,12 +834,7 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
 
         const player = String(privyAddress).toLowerCase();
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
-        const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
-        let cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
-        // Politique dure: si totalScore > MAX, annuler (0)
-        if (totalScore > MAX_SCORE_PER_MATCH) {
-            cappedScore = 0;
-        }
+        let cappedScore = Math.min(totalScore, Number(process.env.MAX_SCORE_PER_MATCH || 50));
         if (cappedScore <= 0) {
             return res.status(204).end();
         }
