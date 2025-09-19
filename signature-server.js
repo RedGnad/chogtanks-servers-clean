@@ -22,6 +22,26 @@ app.use((req, res, next) => {
     }
     next();
 });
+// CORS très tôt: refléter l'origine autorisée pour toutes les réponses (même erreurs)
+const defaultAllowed = [
+    'https://redgnad.github.io',
+    'https://chogtanks.vercel.app',
+    'https://monadclip.vercel.app'
+];
+const allowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+const allowedOrigins = new Set(allowedFromEnv.length ? allowedFromEnv : defaultAllowed);
+app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && allowedOrigins.has(origin)) {
+        res.set('Access-Control-Allow-Origin', origin);
+        res.set('Vary', 'Origin');
+        res.set('Access-Control-Allow-Credentials', 'true');
+    }
+    next();
+});
 // Parsers JSON dédiés par route (évite le coût global sur chaque requête)
 const jsonParserSmall = express.json({ limit: '16kb' });
 const jsonParserMedium = express.json({ limit: '64kb' });
@@ -43,7 +63,7 @@ try {
     const rateLimit = require('express-rate-limit');
     const windowMs = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000); // 1 min
     const max = Number(process.env.RATE_LIMIT_MAX || 300); // 300 req/min par IP
-    app.use(rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false }));
+    app.use(rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false, skip: (req) => req.method === 'OPTIONS' }));
 } catch (_) {
     console.warn('[BOOT] express-rate-limit non installé - pas de rate limit');
 }
@@ -101,17 +121,6 @@ const submitScoreLimiter = buildRouteLimiter({
     max: Number(process.env.SUBMIT_SCORE_MAX || 6)
 });
 
-// CORS restrictif (configurable par ALLOWED_ORIGINS)
-const defaultAllowed = [
-    'https://redgnad.github.io',
-    'https://chogtanks.vercel.app',
-    'https://monadclip.vercel.app'
-];
-const allowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
-const allowedOrigins = new Set(allowedFromEnv.length ? allowedFromEnv : defaultAllowed);
 app.use(cors({
     origin: (origin, cb) => {
         if (!origin) return cb(null, true); // allow non-browser tools
