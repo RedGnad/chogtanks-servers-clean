@@ -111,6 +111,29 @@ function computeScoreSig(token, uid, score) {
     }
 }
 
+// Cap dynamique basé sur la durée du match (âge du matchToken)
+function getDurationMaxScore(createdAtMs, defaultMax) {
+    try {
+        const enabled = process.env.ENABLE_DURATION_CAPS === '1';
+        if (!enabled) return Number(defaultMax || 0);
+        const now = Date.now();
+        const age = (typeof createdAtMs === 'number') ? (now - createdAtMs) : 0;
+        // Paliers par défaut: <30s => 10, <90s => 20, <179s => 40, sinon max statique
+        const T1 = Number(process.env.CAP_TIER1_SECONDS || 30) * 1000;
+        const T2 = Number(process.env.CAP_TIER2_SECONDS || 90) * 1000;
+        const T3 = Number(process.env.CAP_TIER3_SECONDS || 179) * 1000;
+        const C1 = Number(process.env.CAP_TIER1_MAX || 10);
+        const C2 = Number(process.env.CAP_TIER2_MAX || 20);
+        const C3 = Number(process.env.CAP_TIER3_MAX || 40);
+        if (age < T1) return C1;
+        if (age < T2) return C2;
+        if (age < T3) return C3;
+        return Number(defaultMax || 0);
+    } catch (_) {
+        return Number(defaultMax || 0);
+    }
+}
+
 // Route-specific rate limiters (no-op if lib missing)
 const matchStartLimiter = buildRouteLimiter({
     windowMs: Number(process.env.MATCH_START_WINDOW_MS || 60_000),
@@ -379,7 +402,11 @@ app.post('/api/match/sign-score', jsonParserSmall, submitScoreLimiter, requireWa
         // Aligner la signature sur la logique de soumission: (score + bonus) plafonné
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
-        const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        let cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        if (process.env.ENABLE_DURATION_CAPS === '1') {
+            const dynMax = getDurationMaxScore(rec?.createdAt, MAX_SCORE_PER_MATCH);
+            cappedScore = Math.min(cappedScore, dynMax);
+        }
         const sig = computeScoreSig(matchToken, uid, Number(cappedScore));
         return res.json({ scoreSig: sig, cappedScore, success: true });
     } catch (e) {
@@ -406,7 +433,11 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
         }
         // Cap doux par match (configurable)
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
-        const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        let cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        if (process.env.ENABLE_DURATION_CAPS === '1') {
+            const dynMax = getDurationMaxScore(rec?.createdAt, MAX_SCORE_PER_MATCH);
+            cappedScore = Math.min(cappedScore, dynMax);
+        }
         if (cappedScore < totalScore) {
             console.log(`[SCORE-CAP] Score plafonné pour ${normalized}: ${totalScore} -> ${cappedScore} (MAX=${MAX_SCORE_PER_MATCH})`);
         }
@@ -731,6 +762,9 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
         if (totalScore > MAX_SCORE_PER_MATCH) {
             cappedScore = 0;
         }
+        if (process.env.ENABLE_DURATION_CAPS === '1') {
+            // on utilise rec.createdAt après sa récupération plus bas; ici on garde min statique
+        }
         if (cappedScore <= 0) {
             return res.status(204).end();
         }
@@ -768,6 +802,11 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
             let room = (typeof gameId === 'string' && gameId.trim())
               ? gameId.trim()
               : ((typeof matchId === 'string' && matchId.trim()) ? matchId.trim() : null);
+            // Appliquer cap dynamique après avoir récupéré rec.createdAt
+            if (process.env.ENABLE_DURATION_CAPS === '1') {
+                const dynMax = getDurationMaxScore(rec?.createdAt, MAX_SCORE_PER_MATCH);
+                cappedScore = Math.min(cappedScore, dynMax);
+            }
 
             // Utiliser actorNr si fourni via matchId "room|actor"
             let userKey = req.firebaseAuth?.uid || null;
@@ -853,6 +892,13 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
                 rec.usedPrivy = true;
             }
             matchTokens.set(matchToken, rec);
+
+            // Idempotence: marquer le couple room|actor comme utilisé pour le canal Privy
+            try {
+                if (room && userKey) {
+                    markRoomActorPrivySubmitted(room, userKey);
+                }
+            } catch (_) {}
 
             // Option: exiger signature de score si activée
             if (process.env.REQUIRE_SCORE_SIG === '1') {
