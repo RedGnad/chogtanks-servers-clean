@@ -787,7 +787,8 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
             if (room && userKey && hasRoomActorPrivySubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Privy score already submitted for this match' });
             }
-            if (!userKey || !hasAcceptablePhotonPresence(room, userKey)) {
+            const BYPASS_PRIVY_PRESENCE = process.env.BYPASS_PRIVY_PRESENCE === '1';
+            if (!BYPASS_PRIVY_PRESENCE && (!userKey || !hasAcceptablePhotonPresence(room, userKey))) {
                 if (REQUIRE_EXPLICIT_ROOM) {
                     return res.status(403).json({ error: 'Photon presence not verified (explicit room required)' });
                 }
@@ -808,6 +809,14 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
                     }
                 }
                 room = altRoom;
+            } else if (BYPASS_PRIVY_PRESENCE) {
+                // Mode contournement temporaire: exiger obligatoirement la signature de score
+                const providedScoreSig = req.headers['x-score-sig'] || req.headers['x_score_sig'] || null;
+                const expectedScoreSig = computeScoreSig(matchToken, req.firebaseAuth?.uid || '', Number(cappedScore));
+                if (!providedScoreSig || providedScoreSig !== expectedScoreSig) {
+                    return res.status(401).json({ error: 'Invalid score signature (presence bypass mode)' });
+                }
+                console.log('[PRIVY-BYPASS] ✅ Presence bypass with valid X-Score-Sig');
             }
             if (room && userKey && hasRoomActorPrivySubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Privy score already submitted for this match' });
