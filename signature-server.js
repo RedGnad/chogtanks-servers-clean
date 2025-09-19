@@ -22,6 +22,10 @@ app.use((req, res, next) => {
     }
     next();
 });
+// Si on veut neutraliser totalement le webhook Photon, on déclare une route ultra-légère AVANT tout parser
+if (process.env.PHOTON_WEBHOOK_DISABLE === '1') {
+    app.post('/photon/webhook', (req, res) => res.sendStatus(204));
+}
 // CORS très tôt: refléter l'origine autorisée pour toutes les réponses (même erreurs)
 const defaultAllowed = [
     'https://redgnad.github.io',
