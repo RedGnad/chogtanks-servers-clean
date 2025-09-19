@@ -42,6 +42,19 @@ app.use((req, res, next) => {
     }
     next();
 });
+// Répondre aux préflights ultra-tôt, sans coût (évite pics/502)
+app.use((req, res, next) => {
+    if (req.method !== 'OPTIONS') return next();
+    const origin = req.headers.origin;
+    if (origin && allowedOrigins.has(origin)) {
+        res.set('Access-Control-Allow-Origin', origin);
+        res.set('Access-Control-Allow-Credentials', 'true');
+    }
+    res.set('Access-Control-Allow-Methods', 'GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Match-Sig, X-Score-Sig');
+    res.set('Access-Control-Max-Age', '600');
+    return res.status(204).end();
+});
 // Parsers JSON dédiés par route (évite le coût global sur chaque requête)
 const jsonParserSmall = express.json({ limit: '16kb' });
 const jsonParserMedium = express.json({ limit: '64kb' });
