@@ -245,42 +245,18 @@ app.get('/api/check-username', async (req, res) => {
         if (!wallet || !/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
             return res.status(400).json({ error: 'Invalid wallet parameter' });
         }
-        
-        // Forcer lowercase pour éviter problèmes de casse upstream
-        const walletLower = wallet.toLowerCase();
         const fetch = require('node-fetch');
-        const url = `https://monadclip.fun/api/check-wallet?wallet=${walletLower}`;
-        
+        const url = `https://monadclip.fun/api/check-wallet?wallet=${wallet}`;
         const r = await fetch(url, { 
             method: 'GET', 
             headers: { 'accept': 'application/json' },
             timeout: 2000
         }).catch(() => null);
-        
         if (!r) {
             return res.status(200).json({ ok: false, error: 'Upstream timeout' });
         }
-        
         const data = await r.json().catch(() => ({}));
         const strict = process.env.CHECK_USERNAME_STRICT_502 === '1';
-        
-        // Headers anti-cache pour Safari WebView
-        res.set({
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-            'Pragma': 'no-cache',
-            'Expires': '0'
-        });
-        
-        // ETag basé sur le contenu pour revalidation
-        const etag = `"${Buffer.from(JSON.stringify(data)).toString('base64').slice(0, 16)}"`;
-        res.set('ETag', etag);
-        
-        // Si client envoie If-None-Match et ça matche, retourner 304
-        const ifNoneMatch = req.headers['if-none-match'];
-        if (ifNoneMatch === etag) {
-            return res.status(304).end();
-        }
-        
         return res.status(strict ? (r.ok ? 200 : 502) : 200).json(strict ? data : { ok: r.ok, ...data });
     } catch (e) {
         console.error('[PROXY][check-username] Error:', e.message || e);
@@ -502,7 +478,7 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
         if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
             return res.status(400).json({ error: 'Invalid wallet address format' });
         }
-
+        
         const normalized = walletAddress.toLowerCase();
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
         if (totalScore <= 0) {
@@ -694,7 +670,7 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
                     lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
                     matchId: matchId || 'legacy'
                 }, { merge: true });
-
+                
                 // Enregistrer le delta de match par uid pour validation Privy ultérieure
                 try {
                     const uid = req.firebaseAuth?.uid;
@@ -1508,6 +1484,9 @@ function findRecentRoomForActor(userId) {
 // Webhook endpoint to receive Photon Realtime callbacks (Create/Join/Leave/Close/Event)
 app.post('/photon/webhook', jsonParserSmall, (req, res) => {
     try {
+        if (process.env.PHOTON_WEBHOOK_DISABLE === '1') {
+            return res.sendStatus(204);
+        }
         if (PHOTON_WEBHOOK_SECRET) {
             const q = req.query || {};
             // Refuser tout secret passé en query pour éviter fuites URL
@@ -1694,9 +1673,9 @@ async function flushBatchIfNeeded(force = false) {
                     .map(([addr, agg]) => ({ addr, agg }))
                     .filter(({ agg }) => Number(agg.score || 0) > 0)
                     .map(({ addr, agg }) => ({
-                        player: addr,
-                        score: ethers.BigNumber.from(agg.score),
-                        transactions: ethers.BigNumber.from(agg.tx)
+                    player: addr,
+                    score: ethers.BigNumber.from(agg.score),
+                    transactions: ethers.BigNumber.from(agg.tx)
                     }));
 
                 // Appel on-chain batch (tuple[])
@@ -1717,25 +1696,25 @@ async function flushBatchIfNeeded(force = false) {
                 // Preflight
                 try {
                     await contract.callStatic.batchUpdatePlayerData(dataTuples);
-                } catch (e) {
+                    } catch (e) {
                     console.warn('[Monad Games ID][BATCH] preflight failed:', e.message || e);
                     continue; // ne vide pas le chunk, on réessaiera plus tard
                 }
 
                 // Gas estimate (+20%)
-                let gasLimit = ethers.BigNumber.from(600000);
-                try {
+                    let gasLimit = ethers.BigNumber.from(600000);
+                        try {
                     const est = await contract.estimateGas.batchUpdatePlayerData(dataTuples);
-                    gasLimit = est.mul(120).div(100);
+                            gasLimit = est.mul(120).div(100);
                 } catch (_) {}
 
-            const nonce = await getNextNonce(wallet);
+                    const nonce = await getNextNonce(wallet);
                 const tx = await contract.batchUpdatePlayerData(dataTuples, {
-                    gasLimit,
-                maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
-                maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
-                nonce
-            });
+                        gasLimit,
+                        maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
+                        maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+                        nonce
+                    });
             console.log(`[Monad Games ID][BATCH] Tx sent: ${tx.hash}`);
             // Backoff simple et attente confirmable
             const receipt = await tx.wait().catch(async (e) => {
@@ -1993,13 +1972,13 @@ const chogIface = new ethers.utils.Interface([
                 // Preflight
                 try {
                     await contract.callStatic.updatePlayerData(dataTuple);
-                } catch (e) {
+                    } catch (e) {
                     return res.status(409).json({ error: 'Preflight failed', details: e.message || String(e) });
                 }
                 let gasLimit = ethers.BigNumber.from(150000);
-                try {
+                    try {
                     const est = await contract.estimateGas.updatePlayerData(dataTuple);
-                    gasLimit = est.mul(120).div(100);
+                        gasLimit = est.mul(120).div(100);
                 } catch (_) {}
                 const nonce = await getNextNonce(wallet);
                 const tx = await contract.updatePlayerData(dataTuple, {
