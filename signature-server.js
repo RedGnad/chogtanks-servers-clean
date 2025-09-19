@@ -328,6 +328,65 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
 // Match tokens in-memory (TTL court, anti-replay)
 const matchTokens = new Map(); // token -> { uid, createdAt, expAt, used }
 
+// Middleware: Auth Firebase OU signature de match (X-Match-Sig)
+async function requireFirebaseAuthOrMatchSig(req, res, next) {
+    try {
+        if (process.env.FIREBASE_REQUIRE_AUTH !== '1') {
+            return next();
+        }
+        const auth = req.headers.authorization || '';
+        if (auth.startsWith('Bearer ')) {
+            const idToken = auth.slice(7);
+            try {
+                const admin = require('firebase-admin');
+                if (!admin.apps.length) {
+                    const serviceAccount = {
+                        type: "service_account",
+                        project_id: process.env.FIREBASE_PROJECT_ID,
+                        private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+                        private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
+                        client_email: process.env.FIREBASE_CLIENT_EMAIL,
+                        client_id: process.env.FIREBASE_CLIENT_ID,
+                        auth_uri: "https://accounts.google.com/o/oauth2/auth",
+                        token_uri: "https://oauth2.googleapis.com/token",
+                        auth_provider_x509_cert_url: "https://www.googleapis.com/oauth2/v1/certs",
+                        client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${process.env.FIREBASE_CLIENT_EMAIL}`
+                    };
+                    admin.initializeApp({
+                        credential: admin.credential.cert(serviceAccount),
+                        projectId: process.env.FIREBASE_PROJECT_ID
+                    });
+                }
+                const decoded = await admin.auth().verifyIdToken(idToken);
+                req.firebaseAuth = { uid: decoded.uid };
+                return next();
+            } catch (_) {
+                // fallback sur X-Match-Sig
+            }
+        }
+
+        // Fallback sécurisé: exiger un X-Match-Sig valide basé sur le matchToken et l'uid lié
+        const { matchToken } = req.body || {};
+        const providedSig = req.headers['x-match-sig'] || req.headers['x_match_sig'] || req.headers['x-matchsig'];
+        if (!MATCH_SECRET || !matchToken || !providedSig) {
+            return res.status(401).json({ error: 'Missing auth (no Firebase, no X-Match-Sig)' });
+        }
+        const rec = matchTokens.get(matchToken);
+        if (!rec) {
+            return res.status(401).json({ error: 'Invalid matchToken' });
+        }
+        const expected = computeMatchSig(matchToken, rec.uid || '');
+        if (String(providedSig) !== expected) {
+            return res.status(401).json({ error: 'Invalid match signature' });
+        }
+        // Propager l'uid pour la suite de la requête
+        req.firebaseAuth = { uid: rec.uid || '' };
+        return next();
+    } catch (e) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+}
+
 app.post('/api/match/start', jsonParserSmall, matchStartLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         console.log(`[MATCH-START] Match start requested`);
@@ -367,7 +426,7 @@ app.post('/api/match/start', jsonParserSmall, matchStartLimiter, requireWallet, 
 });
 
 // Signature de score (anti "copy as fetch" sans Firebase delta)
-app.post('/api/match/sign-score', jsonParserSmall, submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/match/sign-score', jsonParserSmall, submitScoreLimiter, requireWallet, requireFirebaseAuthOrMatchSig, async (req, res) => {
     try {
         if (!MATCH_SECRET) return res.status(503).json({ error: 'Score signing disabled' });
         const { matchToken, score, bonus } = req.body || {};
