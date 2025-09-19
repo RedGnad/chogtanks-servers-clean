@@ -22,8 +22,9 @@ app.use((req, res, next) => {
     }
     next();
 });
-// Limite la taille des requêtes JSON pour réduire la surface DoS
-app.use(express.json({ limit: '64kb' }));
+// Parsers JSON dédiés par route (évite le coût global sur chaque requête)
+const jsonParserSmall = express.json({ limit: '16kb' });
+const jsonParserMedium = express.json({ limit: '64kb' });
 // Masquer les détails d'erreur en prod si GENERIC_ERRORS=1
 if (process.env.GENERIC_ERRORS === '1') {
     app.use((req, res, next) => {
@@ -118,6 +119,20 @@ app.use(cors({
         return cb(new Error('Not allowed by CORS'));
     },
     credentials: true
+}));
+
+// Réponses rapides et cacheables aux preflights CORS
+app.options('*', cors({
+    origin: (origin, cb) => {
+        if (!origin) return cb(null, true);
+        if (allowedOrigins.has(origin)) return cb(null, true);
+        return cb(new Error('Not allowed by CORS'));
+    },
+    credentials: true,
+    methods: ['GET','HEAD','POST','PUT','PATCH','DELETE','OPTIONS'],
+    allowedHeaders: ['Content-Type','Authorization','X-Match-Sig','X-Score-Sig'],
+    maxAge: 600,
+    optionsSuccessStatus: 204
 }));
 
 const port = process.env.PORT || 3001;
@@ -219,6 +234,11 @@ app.get('/api/check-username', async (req, res) => {
     }
 });
 
+// Root route simple pour éviter 502 sur GET /
+app.get('/', (req, res) => {
+    res.status(200).send('OK');
+});
+
 // Endpoint pour récupérer le score (compatibilité ancien build)
 app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res) => {
     try {
@@ -291,7 +311,7 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
 // Match tokens in-memory (TTL court, anti-replay)
 const matchTokens = new Map(); // token -> { uid, createdAt, expAt, used }
 
-app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/match/start', jsonParserSmall, matchStartLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         console.log(`[MATCH-START] Match start requested`);
         
@@ -330,7 +350,7 @@ app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAu
 });
 
 // Signature de score (anti "copy as fetch" sans Firebase delta)
-app.post('/api/match/sign-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/match/sign-score', jsonParserSmall, submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         if (!MATCH_SECRET) return res.status(503).json({ error: 'Score signing disabled' });
         const { matchToken, score, bonus } = req.body || {};
@@ -360,7 +380,7 @@ app.post('/api/match/sign-score', submitScoreLimiter, requireWallet, requireFire
 });
 
 // Endpoint pour soumettre les scores (compatibilité ancien build)
-app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { walletAddress, score, bonus, matchId, matchToken, gameId } = req.body || {};
         if (!walletAddress || typeof score === 'undefined') {
@@ -684,7 +704,7 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
 });
 
 // Endpoint PRIVY → Monad Games ID (submit-score, transactions=0)
-app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { privyAddress, score, bonus, matchId, matchToken, gameId } = req.body || {};
         if (!privyAddress || typeof score === 'undefined') {
@@ -773,7 +793,19 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
                 }
                 const altRoom = findRecentRoomForActor(userKey);
                 if (!altRoom || !hasAcceptablePhotonPresence(altRoom, userKey)) {
-                    return res.status(403).json({ error: 'Photon presence not verified for this match' });
+                    // Fallback optionnel: accepter si X-Score-Sig valide même sans présence (fin de timer)
+                    const ALLOW_PRIVY_WITHOUT_PRESENCE = process.env.ALLOW_PRIVY_WITHOUT_PRESENCE === '1';
+                    if (ALLOW_PRIVY_WITHOUT_PRESENCE) {
+                        const providedScoreSig = req.headers['x-score-sig'] || req.headers['x_score_sig'] || null;
+                        const expectedScoreSig = computeScoreSig(matchToken, req.firebaseAuth?.uid || '', Number(cappedScore));
+                        if (providedScoreSig && expectedScoreSig && providedScoreSig === expectedScoreSig) {
+                            console.log('[PRIVY-FALLBACK] ✅ Accept without fresh presence (scoreSig ok)');
+                        } else {
+                            return res.status(403).json({ error: 'Photon presence not verified for this match' });
+                        }
+                    } else {
+                        return res.status(403).json({ error: 'Photon presence not verified for this match' });
+                    }
                 }
                 room = altRoom;
             }
@@ -1350,7 +1382,7 @@ function findRecentRoomForActor(userId) {
 }
 
 // Webhook endpoint to receive Photon Realtime callbacks (Create/Join/Leave/Close/Event)
-app.post('/photon/webhook', (req, res) => {
+app.post('/photon/webhook', jsonParserSmall, (req, res) => {
     try {
         if (PHOTON_WEBHOOK_SECRET) {
             const q = req.query || {};
@@ -1923,10 +1955,18 @@ const chogIface = new ethers.utils.Interface([
     }
 });
 
-app.listen(port, () => {
+const server = app.listen(port, () => {
     console.log(`Signature server running on port ${port}`);
     console.log(`Game Server Address: ${gameWallet ? gameWallet.address : 'N/A (no private key)'}`);
 });
+
+// Réglages de timeouts HTTP (mitige 502 proxy Render)
+try {
+    server.keepAliveTimeout = Number(process.env.KEEP_ALIVE_TIMEOUT_MS || 65000);
+    server.headersTimeout = Number(process.env.HEADERS_TIMEOUT_MS || 66000);
+    server.requestTimeout = Number(process.env.REQUEST_TIMEOUT_MS || 30000);
+    console.log('[HTTP] timeouts configured');
+} catch (_) {}
 
 // Garde-fous contre les crashs silencieux
 process.on('unhandledRejection', (reason) => {
