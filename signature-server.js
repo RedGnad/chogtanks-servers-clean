@@ -22,29 +22,29 @@ app.use((req, res, next) => {
     }
     next();
 });
-// CORS en tout début (pour que même les 429/erreurs aient ACAO)
-try {
-    const defaultAllowedEarly = [
-        'https://redgnad.github.io',
-        'https://chogtanks.vercel.app',
-        'https://monadclip.vercel.app'
-    ];
-    const earlyAllowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
-        .split(',')
-        .map(s => s.trim())
-        .filter(Boolean);
-    const earlyAllowedOrigins = new Set(earlyAllowedFromEnv.length ? earlyAllowedFromEnv : defaultAllowedEarly);
-    app.use(cors({
-        origin: (origin, cb) => {
-            if (!origin) return cb(null, true);
-            if (earlyAllowedOrigins.has(origin)) return cb(null, true);
-            return cb(new Error('Not allowed by CORS'));
-        },
-        credentials: true
-    }));
-} catch (_) {}
-// Limite la taille des requêtes JSON pour réduire la surface DoS (augmenté pour webhooks volumineux)
-app.use(express.json({ limit: '256kb' }));
+// CORS très tôt: refléter l'origine autorisée pour toutes les réponses (même erreurs)
+const defaultAllowed = [
+    'https://redgnad.github.io',
+    'https://chogtanks.vercel.app',
+    'https://monadclip.vercel.app'
+];
+const allowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+const allowedOrigins = new Set(allowedFromEnv.length ? allowedFromEnv : defaultAllowed);
+app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && allowedOrigins.has(origin)) {
+        res.set('Access-Control-Allow-Origin', origin);
+        res.set('Vary', 'Origin');
+        res.set('Access-Control-Allow-Credentials', 'true');
+    }
+    next();
+});
+// Parsers JSON dédiés par route (évite le coût global sur chaque requête)
+const jsonParserSmall = express.json({ limit: '16kb' });
+const jsonParserMedium = express.json({ limit: '64kb' });
 // Masquer les détails d'erreur en prod si GENERIC_ERRORS=1
 if (process.env.GENERIC_ERRORS === '1') {
     app.use((req, res, next) => {
@@ -75,7 +75,6 @@ function buildRouteLimiter(options) {
         return rateLimit({
             standardHeaders: true,
             legacyHeaders: false,
-            skip: (req) => req.method === 'OPTIONS',
             ...options
         });
     } catch (_) {
@@ -112,6 +111,29 @@ function computeScoreSig(token, uid, score) {
     }
 }
 
+// Cap dynamique basé sur la durée du match (âge du matchToken)
+function getDurationMaxScore(createdAtMs, defaultMax) {
+    try {
+        const enabled = process.env.ENABLE_DURATION_CAPS === '1';
+        if (!enabled) return Number(defaultMax || 0);
+        const now = Date.now();
+        const age = (typeof createdAtMs === 'number') ? (now - createdAtMs) : 0;
+        // Paliers par défaut: <30s => 10, <90s => 20, <179s => 40, sinon max statique
+        const T1 = Number(process.env.CAP_TIER1_SECONDS || 30) * 1000;
+        const T2 = Number(process.env.CAP_TIER2_SECONDS || 90) * 1000;
+        const T3 = Number(process.env.CAP_TIER3_SECONDS || 179) * 1000;
+        const C1 = Number(process.env.CAP_TIER1_MAX || 10);
+        const C2 = Number(process.env.CAP_TIER2_MAX || 20);
+        const C3 = Number(process.env.CAP_TIER3_MAX || 40);
+        if (age < T1) return C1;
+        if (age < T2) return C2;
+        if (age < T3) return C3;
+        return Number(defaultMax || 0);
+    } catch (_) {
+        return Number(defaultMax || 0);
+    }
+}
+
 // Route-specific rate limiters (no-op if lib missing)
 const matchStartLimiter = buildRouteLimiter({
     windowMs: Number(process.env.MATCH_START_WINDOW_MS || 60_000),
@@ -122,25 +144,27 @@ const submitScoreLimiter = buildRouteLimiter({
     max: Number(process.env.SUBMIT_SCORE_MAX || 6)
 });
 
-// CORS restrictif (configurable par ALLOWED_ORIGINS)
-const defaultAllowed = [
-    'https://redgnad.github.io',
-    'https://chogtanks.vercel.app',
-    'https://monadclip.vercel.app'
-];
-const allowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
-const allowedOrigins = new Set(allowedFromEnv.length ? allowedFromEnv : defaultAllowed);
 app.use(cors({
     origin: (origin, cb) => {
         if (!origin) return cb(null, true); // allow non-browser tools
         if (allowedOrigins.has(origin)) return cb(null, true);
-        return cb(new Error('Not allowed by CORS'));
+        return cb(null, false); // pas d'erreur: pas d'en-têtes CORS → le navigateur bloquera côté client
     },
     credentials: true
 }));
+
+// Réponses rapides et cacheables aux preflights CORS
+app.options('*', (req, res) => {
+    const origin = req.headers.origin;
+    if (origin && allowedOrigins.has(origin)) {
+        res.set('Access-Control-Allow-Origin', origin);
+        res.set('Access-Control-Allow-Credentials', 'true');
+    }
+    res.set('Access-Control-Allow-Methods', 'GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Match-Sig, X-Score-Sig');
+    res.set('Access-Control-Max-Age', '600');
+    return res.sendStatus(204);
+});
 
 const port = process.env.PORT || 3001;
 
@@ -241,6 +265,11 @@ app.get('/api/check-username', async (req, res) => {
     }
 });
 
+// Root route simple pour éviter 502 sur GET /
+app.get('/', (req, res) => {
+    res.status(200).send('OK');
+});
+
 // Endpoint pour récupérer le score (compatibilité ancien build)
 app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res) => {
     try {
@@ -313,24 +342,7 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
 // Match tokens in-memory (TTL court, anti-replay)
 const matchTokens = new Map(); // token -> { uid, createdAt, expAt, used }
 
-// Cap dynamique selon la durée réelle du match
-// ≤ 30s → 10, ≤ 90s → 20, ≤ 179s → 40 (borné par fallbackMax)
-function getDynamicMaxScore(matchToken, fallbackMax) {
-    try {
-        if (!matchToken || typeof matchToken !== 'string') return Number(fallbackMax || 0);
-        const rec = matchTokens.get(matchToken);
-        if (!rec || typeof rec.createdAt !== 'number') return Number(fallbackMax || 0);
-        const elapsed = Date.now() - Number(rec.createdAt);
-        if (elapsed <= 30_000) return Math.min(Number(fallbackMax || 0), 10);
-        if (elapsed <= 90_000) return Math.min(Number(fallbackMax || 0), 20);
-        if (elapsed <= 179_000) return Math.min(Number(fallbackMax || 0), 40);
-        return Math.min(Number(fallbackMax || 0), 40);
-    } catch (_) {
-        return Number(fallbackMax || 0);
-    }
-}
-
-app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/match/start', jsonParserSmall, matchStartLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         console.log(`[MATCH-START] Match start requested`);
         
@@ -369,7 +381,7 @@ app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAu
 });
 
 // Signature de score (anti "copy as fetch" sans Firebase delta)
-app.post('/api/match/sign-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/match/sign-score', jsonParserSmall, submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         if (!MATCH_SECRET) return res.status(503).json({ error: 'Score signing disabled' });
         const { matchToken, score, bonus } = req.body || {};
@@ -389,8 +401,11 @@ app.post('/api/match/sign-score', submitScoreLimiter, requireWallet, requireFire
         // Aligner la signature sur la logique de soumission: (score + bonus) plafonné
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
-        const dynCap = getDynamicMaxScore(matchToken, MAX_SCORE_PER_MATCH);
-        const cappedScore = Math.min(totalScore, dynCap);
+        let cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        if (process.env.ENABLE_DURATION_CAPS === '1') {
+            const dynMax = getDurationMaxScore(rec?.createdAt, MAX_SCORE_PER_MATCH);
+            cappedScore = Math.min(cappedScore, dynMax);
+        }
         const sig = computeScoreSig(matchToken, uid, Number(cappedScore));
         return res.json({ scoreSig: sig, cappedScore, success: true });
     } catch (e) {
@@ -400,7 +415,7 @@ app.post('/api/match/sign-score', submitScoreLimiter, requireWallet, requireFire
 });
 
 // Endpoint pour soumettre les scores (compatibilité ancien build)
-app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { walletAddress, score, bonus, matchId, matchToken, gameId } = req.body || {};
         if (!walletAddress || typeof score === 'undefined') {
@@ -415,13 +430,8 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
         if (totalScore <= 0) {
             return res.status(204).end();
         }
-        // Cap doux par match (configurable)
-        const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
-        const dynCap = getDynamicMaxScore(matchToken, MAX_SCORE_PER_MATCH);
-        const cappedScore = Math.min(totalScore, dynCap);
-        if (cappedScore < totalScore) {
-            console.log(`[SCORE-CAP] Score plafonné pour ${normalized}: ${totalScore} -> ${cappedScore} (MAX=${dynCap})`);
-        }
+        // Cap par match: sera calculé après lecture du matchToken (rec)
+        let cappedScore = null; // calculé après validations du token
 
         // Enforce match token usage si auth active
         if (process.env.FIREBASE_REQUIRE_AUTH === '1') {
@@ -557,7 +567,20 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
             if (room && userKey) markRoomActorSubmitted(room, userKey);
         }
         
-        console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
+        // Calcul du cap maintenant que rec est connu
+        {
+            const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
+            cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+            if (process.env.ENABLE_DURATION_CAPS === '1') {
+                const dynMax = getDurationMaxScore((typeof matchToken === 'string') ? (matchTokens.get(matchToken)?.createdAt) : undefined, MAX_SCORE_PER_MATCH);
+                cappedScore = Math.min(cappedScore, dynMax);
+            }
+            if (cappedScore < totalScore) {
+                console.log(`[SCORE-CAP] Score plafonné pour ${normalized}: ${totalScore} -> ${cappedScore} (MAX=${process.env.MAX_SCORE_PER_MATCH || 50})`);
+            }
+        }
+
+        console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: total=${totalScore}, capped=${cappedScore} (base: ${score}, bonus: ${bonus})`);
         
         // Intégrer avec Firebase pour sauvegarder le score
         if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
@@ -592,8 +615,8 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
                     currentScore = Number(doc.data().score || 0);
                 }
                 
-                // Ajouter le nouveau score
-                const newTotalScore = currentScore + totalScore;
+                // Ajouter le nouveau score (aligné sur cappedScore)
+                const newTotalScore = currentScore + Number(cappedScore || 0);
                 
                 // Sauvegarder dans Firebase
                 await docRef.set({
@@ -611,7 +634,7 @@ app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requir
                         await stateRef.set({
                             lastMatchId: matchId || null,
                             lastMatchToken: matchToken || null,
-                            lastMatchDelta: cappedScore,
+                            lastMatchDelta: Number(cappedScore || 0),
                             lastMatchSig: (matchToken && MATCH_SECRET) ? computeMatchSig(matchToken, uid) : null,
                             lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
                             usedByPrivy: false
@@ -725,7 +748,7 @@ app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (r
 });
 
 // Endpoint PRIVY → Monad Games ID (submit-score, transactions=0)
-app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { privyAddress, score, bonus, matchId, matchToken, gameId } = req.body || {};
         if (!privyAddress || typeof score === 'undefined') {
@@ -738,11 +761,13 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
         const player = String(privyAddress).toLowerCase();
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
-        const dynCap = getDynamicMaxScore(matchToken, MAX_SCORE_PER_MATCH);
-        let cappedScore = Math.min(totalScore, dynCap);
-        // Politique dure: si totalScore > dynCap, annuler (0)
-        if (totalScore > dynCap) {
+        let cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        // Politique dure: si totalScore > MAX, annuler (0)
+        if (totalScore > MAX_SCORE_PER_MATCH) {
             cappedScore = 0;
+        }
+        if (process.env.ENABLE_DURATION_CAPS === '1') {
+            // on utilise rec.createdAt après sa récupération plus bas; ici on garde min statique
         }
         if (cappedScore <= 0) {
             return res.status(204).end();
@@ -781,6 +806,11 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
             let room = (typeof gameId === 'string' && gameId.trim())
               ? gameId.trim()
               : ((typeof matchId === 'string' && matchId.trim()) ? matchId.trim() : null);
+            // Appliquer cap dynamique après avoir récupéré rec.createdAt
+            if (process.env.ENABLE_DURATION_CAPS === '1') {
+                const dynMax = getDurationMaxScore(rec?.createdAt, MAX_SCORE_PER_MATCH);
+                cappedScore = Math.min(cappedScore, dynMax);
+            }
 
             // Utiliser actorNr si fourni via matchId "room|actor"
             let userKey = req.firebaseAuth?.uid || null;
@@ -809,15 +839,36 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
             if (room && userKey && hasRoomActorPrivySubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Privy score already submitted for this match' });
             }
-            if (!userKey || !hasAcceptablePhotonPresence(room, userKey)) {
+            const BYPASS_PRIVY_PRESENCE = process.env.BYPASS_PRIVY_PRESENCE === '1';
+            if (!BYPASS_PRIVY_PRESENCE && (!userKey || !hasAcceptablePhotonPresence(room, userKey))) {
                 if (REQUIRE_EXPLICIT_ROOM) {
                     return res.status(403).json({ error: 'Photon presence not verified (explicit room required)' });
                 }
                 const altRoom = findRecentRoomForActor(userKey);
                 if (!altRoom || !hasAcceptablePhotonPresence(altRoom, userKey)) {
-                    return res.status(403).json({ error: 'Photon presence not verified for this match' });
+                    // Fallback optionnel: accepter si X-Score-Sig valide même sans présence (fin de timer)
+                    const ALLOW_PRIVY_WITHOUT_PRESENCE = process.env.ALLOW_PRIVY_WITHOUT_PRESENCE === '1';
+                    if (ALLOW_PRIVY_WITHOUT_PRESENCE) {
+                        const providedScoreSig = req.headers['x-score-sig'] || req.headers['x_score_sig'] || null;
+                        const expectedScoreSig = computeScoreSig(matchToken, req.firebaseAuth?.uid || '', Number(cappedScore));
+                        if (providedScoreSig && expectedScoreSig && providedScoreSig === expectedScoreSig) {
+                            console.log('[PRIVY-FALLBACK] ✅ Accept without fresh presence (scoreSig ok)');
+                        } else {
+                            return res.status(403).json({ error: 'Photon presence not verified for this match' });
+                        }
+                    } else {
+                        return res.status(403).json({ error: 'Photon presence not verified for this match' });
+                    }
                 }
                 room = altRoom;
+            } else if (BYPASS_PRIVY_PRESENCE) {
+                // Mode contournement temporaire: exiger obligatoirement la signature de score
+                const providedScoreSig = req.headers['x-score-sig'] || req.headers['x_score_sig'] || null;
+                const expectedScoreSig = computeScoreSig(matchToken, req.firebaseAuth?.uid || '', Number(cappedScore));
+                if (!providedScoreSig || providedScoreSig !== expectedScoreSig) {
+                    return res.status(401).json({ error: 'Invalid score signature (presence bypass mode)' });
+                }
+                console.log('[PRIVY-BYPASS] ✅ Presence bypass with valid X-Score-Sig');
             }
             if (room && userKey && hasRoomActorPrivySubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Privy score already submitted for this match' });
@@ -845,6 +896,13 @@ app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, 
                 rec.usedPrivy = true;
             }
             matchTokens.set(matchToken, rec);
+
+            // Idempotence: marquer le couple room|actor comme utilisé pour le canal Privy
+            try {
+                if (room && userKey) {
+                    markRoomActorPrivySubmitted(room, userKey);
+                }
+            } catch (_) {}
 
             // Option: exiger signature de score si activée
             if (process.env.REQUIRE_SCORE_SIG === '1') {
@@ -1122,40 +1180,6 @@ try {
 
 const WALLET_BINDINGS_FILE = path.join(DATA_DIR, 'wallet-bindings.json');
 
-// Ecritures disque asynchrones avec débounce (réduit les blocages event-loop)
-const FLUSH_DEBOUNCE_MS = Number(process.env.FLUSH_DEBOUNCE_MS || 300);
-const _pendingJsonWrites = new Map(); // filePath -> { timer: NodeJS.Timeout|null, data: string }
-
-function scheduleJsonWrite(filePath, jsonSerializable) {
-    try {
-        const nextData = JSON.stringify(jsonSerializable, null, 2);
-        let state = _pendingJsonWrites.get(filePath);
-        if (!state) {
-            state = { timer: null, data: nextData };
-            _pendingJsonWrites.set(filePath, state);
-        } else {
-            state.data = nextData;
-            if (state.timer) {
-                clearTimeout(state.timer);
-            }
-        }
-        state.timer = setTimeout(async () => {
-            try {
-                await fs.promises.writeFile(filePath, state.data, 'utf8');
-            } catch (e) {
-                console.warn('[ASYNC-WRITE] Failed to write', filePath, e && (e.message || e));
-            } finally {
-                state.timer = null;
-            }
-        }, FLUSH_DEBOUNCE_MS);
-        if (typeof state.timer.unref === 'function') {
-            state.timer.unref();
-        }
-    } catch (e) {
-        console.warn('[ASYNC-WRITE] scheduleJsonWrite error:', e && (e.message || e));
-    }
-}
-
 // Charger les liaisons existantes
 function loadWalletBindings() {
     try {
@@ -1172,7 +1196,8 @@ function loadWalletBindings() {
 // Sauvegarder les liaisons
 function saveWalletBindings(bindings) {
     try {
-        scheduleJsonWrite(WALLET_BINDINGS_FILE, Object.fromEntries(bindings));
+        const data = JSON.stringify(Object.fromEntries(bindings), null, 2);
+        fs.writeFileSync(WALLET_BINDINGS_FILE, data, 'utf8');
     } catch (error) {
         console.error('[ANTI-FARMING] Erreur sauvegarde fichier liaisons:', error.message);
     }
@@ -1199,7 +1224,7 @@ function loadRoomActorUsage() {
 }
 function saveRoomActorUsage(state) {
     try {
-        scheduleJsonWrite(ROOM_ACTOR_USAGE_FILE, state);
+        fs.writeFileSync(ROOM_ACTOR_USAGE_FILE, JSON.stringify(state, null, 2), 'utf8');
     } catch (e) {
         console.warn('[ROOM-ACTOR] save error:', e.message || e);
     }
@@ -1244,7 +1269,7 @@ function loadRoomActorPrivyUsage() {
 }
 function saveRoomActorPrivyUsage(state) {
     try {
-        scheduleJsonWrite(ROOM_ACTOR_PRIVY_USAGE_FILE, state);
+        fs.writeFileSync(ROOM_ACTOR_PRIVY_USAGE_FILE, JSON.stringify(state, null, 2), 'utf8');
     } catch (e) {
         console.warn('[ROOM-ACTOR-PRIVY] save error:', e.message || e);
     }
@@ -1289,7 +1314,7 @@ function loadProcessedEvents() {
 function saveProcessedEvents(set) {
     try {
         const arr = Array.from(set);
-        scheduleJsonWrite(PROCESSED_EVENTS_FILE, arr);
+        fs.writeFileSync(PROCESSED_EVENTS_FILE, JSON.stringify(arr, null, 2), 'utf8');
     } catch (e) {
         console.error('[IDEMPOTENCE] Erreur sauvegarde processed events:', e.message || e);
     }
@@ -1322,7 +1347,7 @@ function loadPointsDebitedEvents() {
 function savePointsDebitedEvents(set) {
     try {
         const arr = Array.from(set);
-        scheduleJsonWrite(POINTS_DEBIT_EVENTS_FILE, arr);
+        fs.writeFileSync(POINTS_DEBIT_EVENTS_FILE, JSON.stringify(arr, null, 2), 'utf8');
     } catch (e) {
         console.error('[POINTS-DEBIT] Erreur sauvegarde points debited events:', e.message || e);
     }
@@ -1336,6 +1361,7 @@ const PHOTON_WEBHOOK_SECRET = process.env.PHOTON_WEBHOOK_SECRET || '';
 const PHOTON_PRESENCE_TTL_MS = Number(process.env.PHOTON_PRESENCE_TTL_MS || 60_000);
 const PHOTON_GRACE_AFTER_CLOSE_MS = Number(process.env.PHOTON_GRACE_AFTER_CLOSE_MS || 300_000);
 const PHOTON_SESSIONS_FILE = path.join(DATA_DIR, 'photon-sessions.json');
+const PHOTON_PERSIST = process.env.PHOTON_PERSIST !== '0';
 
 function loadPhotonSessions() {
     try {
@@ -1350,7 +1376,8 @@ function loadPhotonSessions() {
 
 function savePhotonSessions(state) {
     try {
-        scheduleJsonWrite(PHOTON_SESSIONS_FILE, state);
+        if (!PHOTON_PERSIST) return; // désactivé
+        fs.writeFileSync(PHOTON_SESSIONS_FILE, JSON.stringify(state, null, 2), 'utf8');
     } catch (e) {
         console.warn('[PHOTON] save error:', e.message || e);
     }
@@ -1358,31 +1385,15 @@ function savePhotonSessions(state) {
 
 // Structure: { [gameId]: { users: { [userId]: { lastSeen:number } }, wallets: { [actorOrUser]: address }, createdAt:number, closed:boolean, closedAt:number|null } }
 const photonSessions = loadPhotonSessions();
-let photonSessionsDirty = false;
-const PHOTON_FLUSH_MS = Number(process.env.PHOTON_FLUSH_MS || 1000);
-setInterval(() => {
-    if (!photonSessionsDirty) return;
-    photonSessionsDirty = false;
-    savePhotonSessions(photonSessions);
-}, PHOTON_FLUSH_MS).unref();
 
-// Throttle logging des webhooks pour éviter la saturation stdout
-let photonLogLastAt = 0;
-const PHOTON_LOG_EVERY_MS = Number(process.env.PHOTON_LOG_EVERY_MS || 500);
-let photonLogSkipped = 0;
-function logPhotonThrottled(message) {
-    const now = Date.now();
-    if (now - photonLogLastAt >= PHOTON_LOG_EVERY_MS) {
-        photonLogLastAt = now;
-        if (photonLogSkipped > 0) {
-            console.log(`[PHOTON][WEBHOOK][...${photonLogSkipped} skipped] ${message}`);
-            photonLogSkipped = 0;
-        } else {
-            console.log(`[PHOTON][WEBHOOK] ${message}`);
-        }
-    } else {
-        photonLogSkipped++;
-    }
+// Débounce d'écriture du fichier de sessions pour éviter les blocages disque lors de rafales
+let photonSaveTimer = null;
+function schedulePhotonSave() {
+    if (!PHOTON_PERSIST) return;
+    if (photonSaveTimer) return;
+    photonSaveTimer = setTimeout(() => {
+        try { savePhotonSessions(photonSessions); } finally { photonSaveTimer = null; }
+    }, Number(process.env.PHOTON_FLUSH_MS || 1000)).unref();
 }
 
 // Helper: verify a fresh presence for a user in a Photon room
@@ -1451,7 +1462,7 @@ function findRecentRoomForActor(userId) {
 }
 
 // Webhook endpoint to receive Photon Realtime callbacks (Create/Join/Leave/Close/Event)
-app.post('/photon/webhook', (req, res) => {
+app.post('/photon/webhook', jsonParserSmall, (req, res) => {
     try {
         if (PHOTON_WEBHOOK_SECRET) {
             const q = req.query || {};
@@ -1483,7 +1494,13 @@ app.post('/photon/webhook', (req, res) => {
         if (!gameId) return res.status(400).json({ error: 'Missing GameId' });
 
         const sess = photonSessions[gameId] || { users: {}, wallets: {}, privyWallets: {}, createdAt: now, closed: false };
-        logPhotonThrottled(`type=${type} gameId=${gameId} userId=${userId} actor=${actorKey}`);
+        console.log(`[PHOTON][WEBHOOK] type=${type} gameId=${gameId} userId=${userId} actor=${actorKey}`);
+        // Ignorer les événements verbeux non nécessaires pour la présence
+        if (type === 'game' || type === 'gameplay') {
+            photonSessions[gameId] = sess; // no-op, juste assure l'entrée
+            schedulePhotonSave();
+            return res.json({ ok: true });
+        }
         switch (type) {
             case 'create':
             case 'gamecreated':
@@ -1568,7 +1585,7 @@ app.post('/photon/webhook', (req, res) => {
         }
 
         photonSessions[gameId] = sess;
-        photonSessionsDirty = true;
+        schedulePhotonSave();
         return res.json({ ok: true });
     } catch (e) {
         console.error('[PHOTON][WEBHOOK] error:', e.message || e);
@@ -2024,10 +2041,18 @@ const chogIface = new ethers.utils.Interface([
     }
 });
 
-app.listen(port, () => {
+const server = app.listen(port, () => {
     console.log(`Signature server running on port ${port}`);
     console.log(`Game Server Address: ${gameWallet ? gameWallet.address : 'N/A (no private key)'}`);
 });
+
+// Réglages de timeouts HTTP (mitige 502 proxy Render)
+try {
+    server.keepAliveTimeout = Number(process.env.KEEP_ALIVE_TIMEOUT_MS || 65000);
+    server.headersTimeout = Number(process.env.HEADERS_TIMEOUT_MS || 66000);
+    server.requestTimeout = Number(process.env.REQUEST_TIMEOUT_MS || 30000);
+    console.log('[HTTP] timeouts configured');
+} catch (_) {}
 
 // Garde-fous contre les crashs silencieux
 process.on('unhandledRejection', (reason) => {
