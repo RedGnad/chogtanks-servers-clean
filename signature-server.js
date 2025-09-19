@@ -22,63 +22,8 @@ app.use((req, res, next) => {
     }
     next();
 });
-// CORS en tout début (pour que même les 429/erreurs aient ACAO)
-try {
-    const defaultAllowedEarly = [
-        'https://redgnad.github.io',
-        'https://chogtanks.vercel.app',
-        'https://monadclip.vercel.app'
-    ];
-    const earlyAllowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
-        .split(',')
-        .map(s => s.trim())
-        .filter(Boolean);
-    const earlyAllowedOrigins = new Set(earlyAllowedFromEnv.length ? earlyAllowedFromEnv : defaultAllowedEarly);
-    app.use(cors({
-        origin: (origin, cb) => {
-            if (!origin) return cb(null, true);
-            if (earlyAllowedOrigins.has(origin)) return cb(null, true);
-            return cb(new Error('Not allowed by CORS'));
-        },
-        credentials: true
-    }));
-} catch (_) {}
-// Répondre immédiatement aux préflights avec en-têtes CORS explicites
-try {
-    const defaultAllowedEarly = [
-        'https://redgnad.github.io',
-        'https://chogtanks.vercel.app',
-        'https://monadclip.vercel.app'
-    ];
-    const earlyAllowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
-        .split(',')
-        .map(s => s.trim())
-        .filter(Boolean);
-    const earlyAllowedOrigins = new Set(earlyAllowedFromEnv.length ? earlyAllowedFromEnv : defaultAllowedEarly);
-    app.options('*', cors({
-        origin: (origin, cb) => {
-            if (!origin) return cb(null, true);
-            if (earlyAllowedOrigins.has(origin)) return cb(null, true);
-            return cb(new Error('Not allowed by CORS'));
-        },
-        credentials: true,
-        methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-        allowedHeaders: ['Content-Type', 'Authorization', 'X-Match-Sig', 'X-Score-Sig', 'X-Webhook-Secret', 'X-Photon-Secret']
-    }), (req, res) => {
-        try {
-            const origin = req.headers.origin;
-            if (origin) {
-                res.set('Vary', 'Origin');
-            }
-            res.set('Access-Control-Max-Age', '600');
-            res.set('Access-Control-Allow-Credentials', 'true');
-        } catch (_) {}
-        res.sendStatus(204);
-    });
-} catch (_) {}
-// Parseurs JSON par route (évite de parser globalement sous rafales)
-const jsonParserSmall = express.json({ limit: '64kb' });
-const jsonParserMedium = express.json({ limit: '256kb' });
+// Limite la taille des requêtes JSON pour réduire la surface DoS
+app.use(express.json({ limit: '64kb' }));
 // Masquer les détails d'erreur en prod si GENERIC_ERRORS=1
 if (process.env.GENERIC_ERRORS === '1') {
     app.use((req, res, next) => {
@@ -97,7 +42,7 @@ try {
     const rateLimit = require('express-rate-limit');
     const windowMs = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000); // 1 min
     const max = Number(process.env.RATE_LIMIT_MAX || 300); // 300 req/min par IP
-    app.use(rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false, skip: (req) => req.method === 'OPTIONS' }));
+    app.use(rateLimit({ windowMs, max, standardHeaders: true, legacyHeaders: false }));
 } catch (_) {
     console.warn('[BOOT] express-rate-limit non installé - pas de rate limit');
 }
@@ -109,7 +54,6 @@ function buildRouteLimiter(options) {
         return rateLimit({
             standardHeaders: true,
             legacyHeaders: false,
-            skip: (req) => req.method === 'OPTIONS',
             ...options
         });
     } catch (_) {
@@ -257,11 +201,6 @@ app.get('/health', (req, res) => {
 // Supporte aussi la méthode HEAD sur /health
 app.head('/health', (req, res) => res.sendStatus(200));
 
-// Route racine légère pour éviter des 502 sur GET /
-app.get('/', (req, res) => {
-    res.status(200).json({ ok: true, service: 'chogtanks-signature-server' });
-});
-
 // Proxy: check username (évite CORS côté WebView)
 app.get('/api/check-username', async (req, res) => {
     try {
@@ -352,24 +291,7 @@ app.get('/api/firebase/get-score/:walletAddress', requireWallet, async (req, res
 // Match tokens in-memory (TTL court, anti-replay)
 const matchTokens = new Map(); // token -> { uid, createdAt, expAt, used }
 
-// Cap dynamique selon la durée réelle du match
-// ≤ 30s → 10, ≤ 90s → 20, ≤ 179s → 40 (borné par fallbackMax)
-function getDynamicMaxScore(matchToken, fallbackMax) {
-    try {
-        if (!matchToken || typeof matchToken !== 'string') return Number(fallbackMax || 0);
-        const rec = matchTokens.get(matchToken);
-        if (!rec || typeof rec.createdAt !== 'number') return Number(fallbackMax || 0);
-        const elapsed = Date.now() - Number(rec.createdAt);
-        if (elapsed <= 30_000) return Math.min(Number(fallbackMax || 0), 10);
-        if (elapsed <= 90_000) return Math.min(Number(fallbackMax || 0), 20);
-        if (elapsed <= 179_000) return Math.min(Number(fallbackMax || 0), 40);
-        return Math.min(Number(fallbackMax || 0), 40);
-    } catch (_) {
-        return Number(fallbackMax || 0);
-    }
-}
-
-app.post('/api/match/start', jsonParserSmall, matchStartLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/match/start', matchStartLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         console.log(`[MATCH-START] Match start requested`);
         
@@ -408,7 +330,7 @@ app.post('/api/match/start', jsonParserSmall, matchStartLimiter, requireWallet, 
 });
 
 // Signature de score (anti "copy as fetch" sans Firebase delta)
-app.post('/api/match/sign-score', jsonParserSmall, submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/match/sign-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         if (!MATCH_SECRET) return res.status(503).json({ error: 'Score signing disabled' });
         const { matchToken, score, bonus } = req.body || {};
@@ -428,8 +350,7 @@ app.post('/api/match/sign-score', jsonParserSmall, submitScoreLimiter, requireWa
         // Aligner la signature sur la logique de soumission: (score + bonus) plafonné
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
-        const dynCap = getDynamicMaxScore(matchToken, MAX_SCORE_PER_MATCH);
-        const cappedScore = Math.min(totalScore, dynCap);
+        const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
         const sig = computeScoreSig(matchToken, uid, Number(cappedScore));
         return res.json({ scoreSig: sig, cappedScore, success: true });
     } catch (e) {
@@ -439,7 +360,7 @@ app.post('/api/match/sign-score', jsonParserSmall, submitScoreLimiter, requireWa
 });
 
 // Endpoint pour soumettre les scores (compatibilité ancien build)
-app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/firebase/submit-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { walletAddress, score, bonus, matchId, matchToken, gameId } = req.body || {};
         if (!walletAddress || typeof score === 'undefined') {
@@ -448,7 +369,7 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
         if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
             return res.status(400).json({ error: 'Invalid wallet address format' });
         }
-        
+
         const normalized = walletAddress.toLowerCase();
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
         if (totalScore <= 0) {
@@ -456,10 +377,9 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
         }
         // Cap doux par match (configurable)
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
-        const dynCap = getDynamicMaxScore(matchToken, MAX_SCORE_PER_MATCH);
-        const cappedScore = Math.min(totalScore, dynCap);
+        const cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
         if (cappedScore < totalScore) {
-            console.log(`[SCORE-CAP] Score plafonné pour ${normalized}: ${totalScore} -> ${cappedScore} (MAX=${dynCap})`);
+            console.log(`[SCORE-CAP] Score plafonné pour ${normalized}: ${totalScore} -> ${cappedScore} (MAX=${MAX_SCORE_PER_MATCH})`);
         }
 
         // Enforce match token usage si auth active
@@ -641,7 +561,7 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
                     lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
                     matchId: matchId || 'legacy'
                 }, { merge: true });
-                
+
                 // Enregistrer le delta de match par uid pour validation Privy ultérieure
                 try {
                     const uid = req.firebaseAuth?.uid;
@@ -711,7 +631,7 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
     }
 });
 
-app.post('/api/mint-authorization', jsonParserSmall, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, mintCost, playerPoints } = req.body || {};
         const pAddr = playerAddress || req.body?.walletAddress; // alias compat
@@ -764,7 +684,7 @@ app.post('/api/mint-authorization', jsonParserSmall, requireWallet, requireFireb
 });
 
 // Endpoint PRIVY → Monad Games ID (submit-score, transactions=0)
-app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/monad-games-id/submit-score', submitScoreLimiter, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { privyAddress, score, bonus, matchId, matchToken, gameId } = req.body || {};
         if (!privyAddress || typeof score === 'undefined') {
@@ -777,10 +697,9 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
         const player = String(privyAddress).toLowerCase();
         const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
         const MAX_SCORE_PER_MATCH = Number(process.env.MAX_SCORE_PER_MATCH || 50);
-        const dynCap = getDynamicMaxScore(matchToken, MAX_SCORE_PER_MATCH);
-        let cappedScore = Math.min(totalScore, dynCap);
-        // Politique dure: si totalScore > dynCap, annuler (0)
-        if (totalScore > dynCap) {
+        let cappedScore = Math.min(totalScore, MAX_SCORE_PER_MATCH);
+        // Politique dure: si totalScore > MAX, annuler (0)
+        if (totalScore > MAX_SCORE_PER_MATCH) {
             cappedScore = 0;
         }
         if (cappedScore <= 0) {
@@ -844,21 +763,6 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
             if (!room) {
                 return res.status(400).json({ error: 'Missing gameId (Photon room)' });
             }
-            // Si on n'a pas d'userKey exploitable, tenter de dériver depuis la présence Photon via le wallet Privy
-            try {
-                if (!userKey) {
-                    const sess = photonSessions[String(room)] || {};
-                    const pw = (sess && sess.privyWallets) ? sess.privyWallets : null;
-                    if (pw && typeof pw === 'object') {
-                        for (const [candidateKey, w] of Object.entries(pw)) {
-                            if (String(w).toLowerCase() === player) {
-                                userKey = candidateKey;
-                                break;
-                            }
-                        }
-                    }
-                }
-            } catch (_) {}
             // Idempotence (canal Privy): refuser uniquement si Privy déjà soumis
             if (room && userKey && hasRoomActorPrivySubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Privy score already submitted for this match' });
@@ -869,27 +773,9 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
                 }
                 const altRoom = findRecentRoomForActor(userKey);
                 if (!altRoom || !hasAcceptablePhotonPresence(altRoom, userKey)) {
-                    // Fenêtre de grâce ciblée fin de match: accepter si la room vient d'être fermée très récemment
-                    try {
-                        const FINAL_SUBMIT_GRACE_MS = Number(process.env.FINAL_SUBMIT_GRACE_MS || 2000);
-                        const now = Date.now();
-                        const sess = photonSessions[String(room)] || photonSessions[String(altRoom)] || null;
-                        const justClosed = Boolean(sess && sess.closed && typeof sess.closedAt === 'number' && (now - sess.closedAt) <= FINAL_SUBMIT_GRACE_MS);
-                        // Exiger X-Score-Sig valide pour accepter en grâce
-                        const providedScoreSig = req.headers['x-score-sig'] || req.headers['x_score_sig'] || null;
-                        const expectedScoreSig = computeScoreSig(matchToken, req.firebaseAuth?.uid || '', Number(cappedScore));
-                        const scoreSigOk = Boolean(expectedScoreSig && providedScoreSig === expectedScoreSig);
-                        if (!(justClosed && scoreSigOk)) {
-                            return res.status(403).json({ error: 'Photon presence not verified for this match' });
-                        }
-                        console.log(`[FINAL-GRACE] ✅ Accept submit-score in grace window: room=%s userKey=%s closedAgoMs=%d`, String(room || altRoom), String(userKey || ''), sess && sess.closedAt ? (now - sess.closedAt) : -1);
-                        // Sinon: on accepte dans la fenêtre de grâce
-                    } catch (_) {
-                        return res.status(403).json({ error: 'Photon presence not verified for this match' });
-                    }
-                } else {
-                    room = altRoom;
+                    return res.status(403).json({ error: 'Photon presence not verified for this match' });
                 }
+                room = altRoom;
             }
             if (room && userKey && hasRoomActorPrivySubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Privy score already submitted for this match' });
@@ -1040,7 +926,7 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
     }
 });
 
-app.post('/api/evolve-authorization', jsonParserSmall, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, tokenId, targetLevel, playerPoints } = req.body || {};
 
@@ -1194,40 +1080,6 @@ try {
 
 const WALLET_BINDINGS_FILE = path.join(DATA_DIR, 'wallet-bindings.json');
 
-// Ecritures disque asynchrones avec débounce (réduit les blocages event-loop)
-const FLUSH_DEBOUNCE_MS = Number(process.env.FLUSH_DEBOUNCE_MS || 300);
-const _pendingJsonWrites = new Map(); // filePath -> { timer: NodeJS.Timeout|null, data: string }
-
-function scheduleJsonWrite(filePath, jsonSerializable) {
-    try {
-        const nextData = JSON.stringify(jsonSerializable, null, 2);
-        let state = _pendingJsonWrites.get(filePath);
-        if (!state) {
-            state = { timer: null, data: nextData };
-            _pendingJsonWrites.set(filePath, state);
-        } else {
-            state.data = nextData;
-            if (state.timer) {
-                clearTimeout(state.timer);
-            }
-        }
-        state.timer = setTimeout(async () => {
-            try {
-                await fs.promises.writeFile(filePath, state.data, 'utf8');
-            } catch (e) {
-                console.warn('[ASYNC-WRITE] Failed to write', filePath, e && (e.message || e));
-            } finally {
-                state.timer = null;
-            }
-        }, FLUSH_DEBOUNCE_MS);
-        if (typeof state.timer.unref === 'function') {
-            state.timer.unref();
-        }
-    } catch (e) {
-        console.warn('[ASYNC-WRITE] scheduleJsonWrite error:', e && (e.message || e));
-    }
-}
-
 // Charger les liaisons existantes
 function loadWalletBindings() {
     try {
@@ -1244,7 +1096,8 @@ function loadWalletBindings() {
 // Sauvegarder les liaisons
 function saveWalletBindings(bindings) {
     try {
-        scheduleJsonWrite(WALLET_BINDINGS_FILE, Object.fromEntries(bindings));
+        const data = JSON.stringify(Object.fromEntries(bindings), null, 2);
+        fs.writeFileSync(WALLET_BINDINGS_FILE, data, 'utf8');
     } catch (error) {
         console.error('[ANTI-FARMING] Erreur sauvegarde fichier liaisons:', error.message);
     }
@@ -1271,7 +1124,7 @@ function loadRoomActorUsage() {
 }
 function saveRoomActorUsage(state) {
     try {
-        scheduleJsonWrite(ROOM_ACTOR_USAGE_FILE, state);
+        fs.writeFileSync(ROOM_ACTOR_USAGE_FILE, JSON.stringify(state, null, 2), 'utf8');
     } catch (e) {
         console.warn('[ROOM-ACTOR] save error:', e.message || e);
     }
@@ -1316,7 +1169,7 @@ function loadRoomActorPrivyUsage() {
 }
 function saveRoomActorPrivyUsage(state) {
     try {
-        scheduleJsonWrite(ROOM_ACTOR_PRIVY_USAGE_FILE, state);
+        fs.writeFileSync(ROOM_ACTOR_PRIVY_USAGE_FILE, JSON.stringify(state, null, 2), 'utf8');
     } catch (e) {
         console.warn('[ROOM-ACTOR-PRIVY] save error:', e.message || e);
     }
@@ -1361,7 +1214,7 @@ function loadProcessedEvents() {
 function saveProcessedEvents(set) {
     try {
         const arr = Array.from(set);
-        scheduleJsonWrite(PROCESSED_EVENTS_FILE, arr);
+        fs.writeFileSync(PROCESSED_EVENTS_FILE, JSON.stringify(arr, null, 2), 'utf8');
     } catch (e) {
         console.error('[IDEMPOTENCE] Erreur sauvegarde processed events:', e.message || e);
     }
@@ -1394,7 +1247,7 @@ function loadPointsDebitedEvents() {
 function savePointsDebitedEvents(set) {
     try {
         const arr = Array.from(set);
-        scheduleJsonWrite(POINTS_DEBIT_EVENTS_FILE, arr);
+        fs.writeFileSync(POINTS_DEBIT_EVENTS_FILE, JSON.stringify(arr, null, 2), 'utf8');
     } catch (e) {
         console.error('[POINTS-DEBIT] Erreur sauvegarde points debited events:', e.message || e);
     }
@@ -1422,7 +1275,7 @@ function loadPhotonSessions() {
 
 function savePhotonSessions(state) {
     try {
-        scheduleJsonWrite(PHOTON_SESSIONS_FILE, state);
+        fs.writeFileSync(PHOTON_SESSIONS_FILE, JSON.stringify(state, null, 2), 'utf8');
     } catch (e) {
         console.warn('[PHOTON] save error:', e.message || e);
     }
@@ -1430,32 +1283,6 @@ function savePhotonSessions(state) {
 
 // Structure: { [gameId]: { users: { [userId]: { lastSeen:number } }, wallets: { [actorOrUser]: address }, createdAt:number, closed:boolean, closedAt:number|null } }
 const photonSessions = loadPhotonSessions();
-let photonSessionsDirty = false;
-const PHOTON_FLUSH_MS = Number(process.env.PHOTON_FLUSH_MS || 1000);
-setInterval(() => {
-    if (!photonSessionsDirty) return;
-    photonSessionsDirty = false;
-    savePhotonSessions(photonSessions);
-}, PHOTON_FLUSH_MS).unref();
-
-// Throttle logging des webhooks pour éviter la saturation stdout
-let photonLogLastAt = 0;
-const PHOTON_LOG_EVERY_MS = Number(process.env.PHOTON_LOG_EVERY_MS || 500);
-let photonLogSkipped = 0;
-function logPhotonThrottled(message) {
-    const now = Date.now();
-    if (now - photonLogLastAt >= PHOTON_LOG_EVERY_MS) {
-        photonLogLastAt = now;
-        if (photonLogSkipped > 0) {
-            console.log(`[PHOTON][WEBHOOK][...${photonLogSkipped} skipped] ${message}`);
-            photonLogSkipped = 0;
-        } else {
-            console.log(`[PHOTON][WEBHOOK] ${message}`);
-        }
-    } else {
-        photonLogSkipped++;
-    }
-}
 
 // Helper: verify a fresh presence for a user in a Photon room
 function hasFreshPhotonPresence(gameId, userId) {
@@ -1523,7 +1350,7 @@ function findRecentRoomForActor(userId) {
 }
 
 // Webhook endpoint to receive Photon Realtime callbacks (Create/Join/Leave/Close/Event)
-app.post('/photon/webhook', jsonParserSmall, (req, res) => {
+app.post('/photon/webhook', (req, res) => {
     try {
         if (PHOTON_WEBHOOK_SECRET) {
             const q = req.query || {};
@@ -1539,36 +1366,30 @@ app.post('/photon/webhook', jsonParserSmall, (req, res) => {
                 return res.status(401).json({ error: 'Unauthorized' });
             }
         }
-        // Répondre très vite, traiter l'update en async pour réduire les 502 proxy
-        const body = req.body || {};
-        res.json({ ok: true });
 
-        setImmediate(() => {
-            try {
-                let type = String(body.Type || body.type || body.eventType || '').toLowerCase();
-                if (['propertieschanged', 'roomproperties', 'propertyupdate', 'customproperties'].includes(type)) {
-                    type = 'gameproperties';
-                }
-                
-                // Ignorer les événements "game" qui créent beaucoup de bruit sans valeur critique
-                if (type === 'game' || type === 'gameevent' || type === 'gameplay') {
-                    return; // Ignore silencieusement
-                }
-                
+        const body = req.body || {};
+        // Support Photon v1.2 and v2 field names + normalize property events
+        let type = String(body.Type || body.type || body.eventType || '').toLowerCase();
+        // Normaliser les alias d'événements de propriétés vers 'gameproperties'
+        if (['propertieschanged', 'roomproperties', 'propertyupdate', 'customproperties'].includes(type)) {
+            type = 'gameproperties';
+        }
         const gameId = String(body.GameId || body.gameId || body.roomName || body.room || '').trim();
-                if (!gameId) return;
         const userId = String(body.UserId || body.userId || '').trim();
         const actorKey = String(body.ActorNr || body.actorNr || body.ActorNumber || body.actorNumber || '').trim();
         const now = Date.now();
 
-                const sess = photonSessions[gameId] || { users: {}, wallets: {}, privyWallets: {}, createdAt: now, closed: false };
-                logPhotonThrottled(`type=${type} gameId=${gameId} userId=${userId} actor=${actorKey}`);
+        if (!gameId) return res.status(400).json({ error: 'Missing GameId' });
+
+        const sess = photonSessions[gameId] || { users: {}, wallets: {}, privyWallets: {}, createdAt: now, closed: false };
+        console.log(`[PHOTON][WEBHOOK] type=${type} gameId=${gameId} userId=${userId} actor=${actorKey}`);
         switch (type) {
             case 'create':
             case 'gamecreated':
             case 'roomcreated':
             case 'gamestarted':
                 sess.createdAt = now;
+                // Marquer présence immédiatement si des identifiants sont fournis
                 if (userId) { sess.users[userId] = { lastSeen: now }; }
                 if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
                 break;
@@ -1592,71 +1413,62 @@ app.post('/photon/webhook', jsonParserSmall, (req, res) => {
                 sess.closed = true;
                 sess.closedAt = now;
                 break;
-                    case 'event': {
-                        // Throttle par acteur pour lisser les rafales (par défaut 250ms)
-                        try {
-                            const THROTTLE_EVENT_MS = Number(process.env.PHOTON_EVENT_THROTTLE_MS || 250);
-                            const key = String(actorKey || userId || '').trim();
-                            if (key) {
-                                if (!photonSessions.__lastEventAt) photonSessions.__lastEventAt = {};
-                                const lastAt = photonSessions.__lastEventAt[key] || 0;
-                                if (Date.now() - lastAt < THROTTLE_EVENT_MS) {
-                                    break;
-                                }
-                                photonSessions.__lastEventAt[key] = Date.now();
-                            }
-                        } catch (_) {}
+            case 'event': {
                 const data = body.Data || body.data || {};
                 const uidFromData = String(data.userId || '').trim();
                 const effectiveUser = userId || uidFromData;
                 if (effectiveUser) { sess.users[effectiveUser] = { lastSeen: now }; }
                 if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
-                        try {
-                            const maybeAppKitWallet = String(data.wallet || data.appKitWallet || '').trim().toLowerCase();
-                            const maybePrivyWallet = String(data.privyWallet || '').trim().toLowerCase();
-                            const key = actorKey || effectiveUser;
-                            if (key) {
-                                if (/^0x[a-f0-9]{40}$/.test(maybeAppKitWallet)) {
-                                    sess.wallets[key] = maybeAppKitWallet;
-                                }
-                                if (/^0x[a-f0-9]{40}$/.test(maybePrivyWallet)) {
-                                    if (!sess.privyWallets) sess.privyWallets = {};
-                                    sess.privyWallets[key] = maybePrivyWallet;
-                                    console.log(`[PHOTON][WEBHOOK][EVENT] Stored Privy wallet for ${key}: ${maybePrivyWallet}`);
-                                }
-                            }
-                        } catch (_) {}
+                // Capture éventuelle des wallets (AppKit et Privy) envoyés dans l'event
+                try {
+                    const maybeAppKitWallet = String(data.wallet || data.appKitWallet || '').trim().toLowerCase();
+                    const maybePrivyWallet = String(data.privyWallet || '').trim().toLowerCase();
+                    const key = actorKey || effectiveUser;
+                    if (key) {
+                        // Stocker AppKit wallet si valide
+                        if (/^0x[a-f0-9]{40}$/.test(maybeAppKitWallet)) {
+                            sess.wallets[key] = maybeAppKitWallet;
+                        }
+                        // Stocker Privy wallet séparément si valide
+                        if (/^0x[a-f0-9]{40}$/.test(maybePrivyWallet)) {
+                            if (!sess.privyWallets) sess.privyWallets = {};
+                            sess.privyWallets[key] = maybePrivyWallet;
+                            console.log(`[PHOTON][WEBHOOK][EVENT] Stored Privy wallet for ${key}: ${maybePrivyWallet}`);
+                        }
+                    }
+                } catch (_) {}
                 break;
             }
             case 'gameproperties':
                 if (userId) { sess.users[userId] = { lastSeen: now }; }
                 if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
-                        try {
-                            const props = body.Properties || body.properties || body.Data || body.data || {};
-                            const maybePrivyWallet = String(props.privyWallet || '').trim().toLowerCase();
-                            if (/^0x[a-f0-9]{40}$/.test(maybePrivyWallet)) {
-                                if (!sess.privyWallets) sess.privyWallets = {};
-                                const key = actorKey || userId;
-                                if (key) {
-                                    sess.privyWallets[key] = maybePrivyWallet;
-                                    console.log(`[PHOTON][WEBHOOK][GAMEPROPS] Stored Privy wallet for ${key}: ${maybePrivyWallet}`);
-                                }
-                            }
-                        } catch (_) {}
+                try {
+                    // Lire Properties (room custom properties) ET Data (fallback)
+                    const props = body.Properties || body.properties || body.Data || body.data || {};
+                    const maybePrivyWallet = String(props.privyWallet || '').trim().toLowerCase();
+                    if (/^0x[a-f0-9]{40}$/.test(maybePrivyWallet)) {
+                        if (!sess.privyWallets) sess.privyWallets = {};
+                        const key = actorKey || userId;
+                        if (key) {
+                            sess.privyWallets[key] = maybePrivyWallet;
+                            console.log(`[PHOTON][WEBHOOK][GAMEPROPS] Stored Privy wallet for ${key}: ${maybePrivyWallet}`);
+                        }
+                    }
+                } catch (_) {}
                 break;
             default:
                 if (userId || actorKey) {
                     if (userId) { sess.users[userId] = { lastSeen: now }; }
                     if (actorKey) { sess.users[actorKey] = { lastSeen: now }; }
+                } else {
+                    console.log(`[PHOTON][WEBHOOK] Unknown event type: ${type}`);
                 }
                 break;
         }
+
         photonSessions[gameId] = sess;
-                photonSessionsDirty = true;
-            } catch (e) {
-                console.warn('[PHOTON][WEBHOOK][ASYNC] error:', e && (e.message || e));
-            }
-        });
+        savePhotonSessions(photonSessions);
+        return res.json({ ok: true });
     } catch (e) {
         console.error('[PHOTON][WEBHOOK] error:', e.message || e);
         return res.status(500).json({ error: 'Webhook error' });
@@ -1726,9 +1538,9 @@ async function flushBatchIfNeeded(force = false) {
                     .map(([addr, agg]) => ({ addr, agg }))
                     .filter(({ agg }) => Number(agg.score || 0) > 0)
                     .map(({ addr, agg }) => ({
-                    player: addr,
-                    score: ethers.BigNumber.from(agg.score),
-                    transactions: ethers.BigNumber.from(agg.tx)
+                        player: addr,
+                        score: ethers.BigNumber.from(agg.score),
+                        transactions: ethers.BigNumber.from(agg.tx)
                     }));
 
                 // Appel on-chain batch (tuple[])
@@ -1749,25 +1561,25 @@ async function flushBatchIfNeeded(force = false) {
                 // Preflight
                 try {
                     await contract.callStatic.batchUpdatePlayerData(dataTuples);
-                    } catch (e) {
+                } catch (e) {
                     console.warn('[Monad Games ID][BATCH] preflight failed:', e.message || e);
                     continue; // ne vide pas le chunk, on réessaiera plus tard
                 }
 
                 // Gas estimate (+20%)
-                    let gasLimit = ethers.BigNumber.from(600000);
-                        try {
+                let gasLimit = ethers.BigNumber.from(600000);
+                try {
                     const est = await contract.estimateGas.batchUpdatePlayerData(dataTuples);
-                            gasLimit = est.mul(120).div(100);
+                    gasLimit = est.mul(120).div(100);
                 } catch (_) {}
 
-                    const nonce = await getNextNonce(wallet);
+            const nonce = await getNextNonce(wallet);
                 const tx = await contract.batchUpdatePlayerData(dataTuples, {
-                        gasLimit,
-                        maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
-                        maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
-                        nonce
-                    });
+                    gasLimit,
+                maxPriorityFeePerGas: ethers.utils.parseUnits('2', 'gwei'),
+                maxFeePerGas: ethers.utils.parseUnits('100', 'gwei'),
+                nonce
+            });
             console.log(`[Monad Games ID][BATCH] Tx sent: ${tx.hash}`);
             // Backoff simple et attente confirmable
             const receipt = await tx.wait().catch(async (e) => {
@@ -1823,7 +1635,7 @@ async function getNextNonce(wallet) {
     }
 }
 
-app.post('/api/monad-games-id/update-player', jsonParserSmall, requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, appKitWallet, actionType, txHash } = req.body || {};
 
@@ -2025,13 +1837,13 @@ const chogIface = new ethers.utils.Interface([
                 // Preflight
                 try {
                     await contract.callStatic.updatePlayerData(dataTuple);
-                    } catch (e) {
+                } catch (e) {
                     return res.status(409).json({ error: 'Preflight failed', details: e.message || String(e) });
                 }
                 let gasLimit = ethers.BigNumber.from(150000);
-                    try {
+                try {
                     const est = await contract.estimateGas.updatePlayerData(dataTuple);
-                        gasLimit = est.mul(120).div(100);
+                    gasLimit = est.mul(120).div(100);
                 } catch (_) {}
                 const nonce = await getNextNonce(wallet);
                 const tx = await contract.updatePlayerData(dataTuple, {
@@ -2111,32 +1923,10 @@ const chogIface = new ethers.utils.Interface([
     }
 });
 
-const server = app.listen(port, () => {
+app.listen(port, () => {
     console.log(`Signature server running on port ${port}`);
     console.log(`Game Server Address: ${gameWallet ? gameWallet.address : 'N/A (no private key)'}`);
 });
-// Réglages de timeouts HTTP pour limiter les 502 côté proxy
-try {
-    // Garder les connexions en vie un peu plus longtemps que le proxy
-    server.keepAliveTimeout = Number(process.env.KEEP_ALIVE_TIMEOUT_MS || 62000);
-    server.headersTimeout = Number(process.env.HEADERS_TIMEOUT_MS || 65000);
-    // Timeout de requête global (évite de laisser des sockets pendantes)
-    server.requestTimeout = Number(process.env.REQUEST_TIMEOUT_MS || 60000);
-} catch (_) {}
-
-// Moniteur simple de lag event-loop: log si > 200ms
-try {
-    const LAG_THRESHOLD_MS = Number(process.env.EVENT_LOOP_LAG_MS || 200);
-    let last = process.hrtime.bigint();
-    setInterval(() => {
-        const now = process.hrtime.bigint();
-        const diffMs = Number(now - last) / 1e6 - 1000; // interval 1000ms attendu
-        last = now;
-        if (diffMs > LAG_THRESHOLD_MS) {
-            console.warn(`[MONITOR] Event loop lag detected: +${diffMs.toFixed(0)}ms`);
-        }
-    }, 1000).unref();
-} catch (_) {}
 
 // Garde-fous contre les crashs silencieux
 process.on('unhandledRejection', (reason) => {
