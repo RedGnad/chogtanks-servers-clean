@@ -245,18 +245,42 @@ app.get('/api/check-username', async (req, res) => {
         if (!wallet || !/^0x[a-fA-F0-9]{40}$/.test(wallet)) {
             return res.status(400).json({ error: 'Invalid wallet parameter' });
         }
+        
+        // Forcer lowercase pour éviter problèmes de casse upstream
+        const walletLower = wallet.toLowerCase();
         const fetch = require('node-fetch');
-        const url = `https://monadclip.fun/api/check-wallet?wallet=${wallet}`;
+        const url = `https://monadclip.fun/api/check-wallet?wallet=${walletLower}`;
+        
         const r = await fetch(url, { 
             method: 'GET', 
             headers: { 'accept': 'application/json' },
             timeout: 2000
         }).catch(() => null);
+        
         if (!r) {
             return res.status(200).json({ ok: false, error: 'Upstream timeout' });
         }
+        
         const data = await r.json().catch(() => ({}));
         const strict = process.env.CHECK_USERNAME_STRICT_502 === '1';
+        
+        // Headers anti-cache pour Safari WebView
+        res.set({
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0'
+        });
+        
+        // ETag basé sur le contenu pour revalidation
+        const etag = `"${Buffer.from(JSON.stringify(data)).toString('base64').slice(0, 16)}"`;
+        res.set('ETag', etag);
+        
+        // Si client envoie If-None-Match et ça matche, retourner 304
+        const ifNoneMatch = req.headers['if-none-match'];
+        if (ifNoneMatch === etag) {
+            return res.status(304).end();
+        }
+        
         return res.status(strict ? (r.ok ? 200 : 502) : 200).json(strict ? data : { ok: r.ok, ...data });
     } catch (e) {
         console.error('[PROXY][check-username] Error:', e.message || e);
