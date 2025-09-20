@@ -672,6 +672,18 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
             matchTokens.set(matchToken, rec);
             // Marquer le couple room|actor comme utilisé pour le canal Firebase (PAS Privy)
             if (room && userKey) markRoomActorSubmitted(room, userKey);
+        } else {
+            // Auth non exigée: si matchToken présent et valide, appliquer aussi le bonus de quêtes
+            if (matchToken && typeof matchToken === 'string') {
+                const rec = matchTokens.get(matchToken);
+                if (rec) {
+                    const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
+                    const questBonus = computeAndClaimDailyQuestBonus(normalized, baseScore, matchDurationMs, Date.now());
+                    if (questBonus > 0) {
+                        totalScore += Number(questBonus);
+                    }
+                }
+            }
         }
         
         console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
