@@ -486,12 +486,18 @@ app.post('/api/match/sign-score', jsonParserSmall, submitScoreLimiter, requireWa
         if (rec.uid && uid && rec.uid !== uid) {
             return res.status(401).json({ error: 'Match token does not belong to this user' });
         }
-        // Aligner la signature sur la logique de soumission: (score + bonus) plafonné
-        const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
+        // Bonus de quêtes quotidiennes (sécurisé par matchToken/durée)
+        const baseScore = (parseInt(score, 10) || 0);
+        const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
+        const playerKey = req.firebaseAuth?.uid || '';
+        const questBonus = computeAndClaimDailyQuestBonus(playerKey, baseScore, matchDurationMs, Date.now());
+
+        // Aligner la signature sur la logique de soumission: (score + bonus + questBonus) plafonné
+        const totalScore = baseScore + (parseInt(bonus, 10) || 0) + Number(questBonus || 0);
         const dynMaxSign = getDurationMaxScore(rec.createdAt);
         const cappedScore = Math.min(totalScore, dynMaxSign);
         const sig = computeScoreSig(matchToken, uid, Number(cappedScore));
-        return res.json({ scoreSig: sig, cappedScore, success: true });
+        return res.json({ scoreSig: sig, cappedScore, questBonus, success: true });
     } catch (e) {
         console.error('[MATCH][sign-score] error:', e.message || e);
         return res.status(500).json({ error: 'Failed to sign score' });
@@ -510,7 +516,8 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
         }
         
         const normalized = walletAddress.toLowerCase();
-        const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
+        const baseScore = (parseInt(score, 10) || 0);
+        let totalScore = baseScore + (parseInt(bonus, 10) || 0);
         if (totalScore <= 0) {
             return res.status(204).end();
         }
@@ -555,6 +562,13 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
             const uid = req.firebaseAuth?.uid || null;
             if (rec.uid && uid && rec.uid !== uid) {
                 return res.status(401).json({ error: 'Match token does not belong to this user' });
+            }
+
+            // Appliquer les quêtes quotidiennes (sécurisées par matchToken/durée)
+            const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
+            const questBonus = computeAndClaimDailyQuestBonus(uid || normalized, baseScore, matchDurationMs, Date.now());
+            if (questBonus > 0) {
+                totalScore += Number(questBonus);
             }
 
             // Vérification Photon: l'utilisateur doit être présent (trace fraîche) dans la room
@@ -833,7 +847,8 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
         }
 
         const player = String(privyAddress).toLowerCase();
-        const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
+        const baseScore = (parseInt(score, 10) || 0);
+        let totalScore = baseScore + (parseInt(bonus, 10) || 0);
         let cappedScore = Math.min(totalScore, Number(process.env.MAX_SCORE_PER_MATCH || 50));
         if (cappedScore <= 0) {
             return res.status(204).end();
@@ -847,6 +862,13 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
             const rec = matchTokens.get(matchToken);
             if (!rec) {
                 return res.status(401).json({ error: 'Invalid matchToken' });
+            }
+            // Appliquer les quêtes quotidiennes (sécurisées par matchToken/durée)
+            const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
+            const questBonus = computeAndClaimDailyQuestBonus(req.firebaseAuth?.uid || player, baseScore, matchDurationMs, Date.now());
+            if (questBonus > 0) {
+                totalScore += Number(questBonus);
+                cappedScore = Math.min(totalScore, Number(process.env.MAX_SCORE_PER_MATCH || 50));
             }
             // Anti-match trop court
             const MIN_MATCH_DURATION_MS = Number(process.env.MIN_MATCH_DURATION_MS || 0);
@@ -1260,6 +1282,87 @@ function saveWalletBindings(bindings) {
 
 const walletBindings = loadWalletBindings();
 console.log(`[ANTI-FARMING] ${walletBindings.size} liaisons chargées depuis ${WALLET_BINDINGS_FILE}`);
+
+// =====================
+// Quêtes quotidiennes (persistantes par joueur et par jour UTC)
+// =====================
+const QUEST_STATE_FILE = path.join(DATA_DIR, 'quest-state.json');
+function loadQuestState() {
+    try {
+        if (fs.existsSync(QUEST_STATE_FILE)) {
+            const raw = fs.readFileSync(QUEST_STATE_FILE, 'utf8');
+            const obj = JSON.parse(raw);
+            if (obj && typeof obj === 'object') return obj;
+        }
+    } catch (e) {
+        console.warn('[QUEST] load error:', e.message || e);
+    }
+    return {};
+}
+function saveQuestState(state) {
+    try {
+        fs.writeFileSync(QUEST_STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
+    } catch (e) {
+        console.warn('[QUEST] save error:', e.message || e);
+    }
+}
+const questState = loadQuestState(); // { [playerKey]: { day: 'YYYY-MM-DD', longMatches:number, claimed:{ score15:boolean, three90:boolean } } }
+
+function getUTCDateKey(ms) {
+    try { return new Date(ms || Date.now()).toISOString().slice(0, 10); } catch (_) { return new Date().toISOString().slice(0,10); }
+}
+
+const QUEST_BONUS_SCORE_GT_15 = Number(process.env.QUEST_BONUS_SCORE_GT_15 || 5);
+const QUEST_BONUS_3_MATCHES_90S = Number(process.env.QUEST_BONUS_3_MATCHES_90S || 15);
+
+function getOrResetQuestRecord(playerKey, nowMs) {
+    if (!playerKey) return null;
+    const today = getUTCDateKey(nowMs);
+    const cur = questState[playerKey] || {};
+    if (!cur.day || cur.day !== today) {
+        questState[playerKey] = {
+            day: today,
+            longMatches: 0,
+            claimed: { score15: false, three90: false }
+        };
+        saveQuestState(questState);
+    }
+    return questState[playerKey];
+}
+
+// Calcule et marque les récompenses de quêtes quotidiennes (sécurisées) pour ce match
+function computeAndClaimDailyQuestBonus(playerKey, baseScore, matchDurationMs, nowMs) {
+    try {
+        if (!playerKey) return 0;
+        const rec = getOrResetQuestRecord(playerKey, nowMs);
+        if (!rec) return 0;
+        let bonus = 0;
+        let changed = false;
+
+        // Incrémenter le compteur de longs matchs si applicable
+        if (Number(matchDurationMs || 0) >= 90 * 1000) {
+            rec.longMatches = Number(rec.longMatches || 0) + 1;
+            changed = true;
+        }
+        // Quête: faire un score > 15 (base score uniquement)
+        if (Number(baseScore || 0) > 15 && !rec.claimed.score15) {
+            bonus += QUEST_BONUS_SCORE_GT_15;
+            rec.claimed.score15 = true;
+            changed = true;
+        }
+        // Quête: jouer 3 matchs >= 90s dans la journée
+        if (Number(rec.longMatches || 0) >= 3 && !rec.claimed.three90) {
+            bonus += QUEST_BONUS_3_MATCHES_90S;
+            rec.claimed.three90 = true;
+            changed = true;
+        }
+        if (changed) saveQuestState(questState);
+        return Number(bonus || 0);
+    } catch (e) {
+        console.warn('[QUEST] compute failed:', e.message || e);
+        return 0;
+    }
+}
 
 // =====================
 // Verrou 1 soumission par room|actor (persistant) – canal Firebase
