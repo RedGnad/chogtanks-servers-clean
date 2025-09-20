@@ -650,6 +650,12 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
                 room = altRoom;
             }
 
+            // Marquer la room comme longue (>=90s) pour la quête quotidienne (idempotent) – même si le match n'est pas fini
+            try {
+                const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
+                markLongMatchReached(userKey || req.firebaseAuth?.uid || '', room, matchDurationMs, Date.now());
+            } catch (_) {}
+
             // Re-vérifier le verrou après fallback éventuel (canal Firebase)
             if (room && userKey && hasRoomActorSubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Score already submitted for this match' });
@@ -918,6 +924,11 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
             if (!room) {
                 return res.status(400).json({ error: 'Missing gameId (Photon room)' });
             }
+            // Marquer longue durée (>=90s) pour la quête quotidienne – même si le match n'est pas fini
+            try {
+                const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
+                markLongMatchReached(userKey || req.firebaseAuth?.uid || '', room, matchDurationMs, Date.now());
+            } catch (_) {}
             // Idempotence (canal Privy): refuser uniquement si Privy déjà soumis
             if (room && userKey && hasRoomActorPrivySubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Privy score already submitted for this match' });
@@ -1306,14 +1317,15 @@ function saveQuestState(state) {
         console.warn('[QUEST] save error:', e.message || e);
     }
 }
-const questState = loadQuestState(); // { [playerKey]: { day: 'YYYY-MM-DD', longMatches:number, claimed:{ score15:boolean, three90:boolean } } }
+const questState = loadQuestState(); // { [playerKey]: { day: 'YYYY-MM-DD', rooms:{[gameId]:true}, claimed:{ score15:boolean, three90:boolean } } }
 
 function getUTCDateKey(ms) {
     try { return new Date(ms || Date.now()).toISOString().slice(0, 10); } catch (_) { return new Date().toISOString().slice(0,10); }
 }
 
-const QUEST_BONUS_SCORE_GT_15 = Number(process.env.QUEST_BONUS_SCORE_GT_15 || 5);
-const QUEST_BONUS_3_MATCHES_90S = Number(process.env.QUEST_BONUS_3_MATCHES_90S || 15);
+const QUEST_MIN_SCORE_THRESHOLD = Number(process.env.QUEST_MIN_SCORE_THRESHOLD || 20);
+const QUEST_BONUS_SCORE_MIN = Number(process.env.QUEST_BONUS_SCORE_MIN || process.env.QUEST_BONUS_SCORE_GT_15 || 5);
+const QUEST_BONUS_3_MATCHES_90S = Number(process.env.QUEST_BONUS_3_MATCHES_90S || 20);
 
 function getOrResetQuestRecord(playerKey, nowMs) {
     if (!playerKey) return null;
@@ -1322,12 +1334,30 @@ function getOrResetQuestRecord(playerKey, nowMs) {
     if (!cur.day || cur.day !== today) {
         questState[playerKey] = {
             day: today,
-            longMatches: 0,
+            rooms: {},
             claimed: { score15: false, three90: false }
         };
         saveQuestState(questState);
     }
     return questState[playerKey];
+}
+
+// Marquer une room comme validée pour le palier 90s (idempotent par room)
+function markLongMatchReached(playerKey, gameId, matchDurationMs, nowMs) {
+    try {
+        if (!playerKey || !gameId) return false;
+        if (Number(matchDurationMs || 0) < 90 * 1000) return false;
+        const rec = getOrResetQuestRecord(playerKey, nowMs);
+        if (!rec) return false;
+        if (!rec.rooms) rec.rooms = {};
+        if (rec.rooms[gameId]) return false; // déjà compté
+        rec.rooms[gameId] = true;
+        saveQuestState(questState);
+        return true;
+    } catch (e) {
+        console.warn('[QUEST] markLongMatchReached failed:', e.message || e);
+        return false;
+    }
 }
 
 // Calcule et marque les récompenses de quêtes quotidiennes (sécurisées) pour ce match
@@ -1339,19 +1369,15 @@ function computeAndClaimDailyQuestBonus(playerKey, baseScore, matchDurationMs, n
         let bonus = 0;
         let changed = false;
 
-        // Incrémenter le compteur de longs matchs si applicable
-        if (Number(matchDurationMs || 0) >= 90 * 1000) {
-            rec.longMatches = Number(rec.longMatches || 0) + 1;
-            changed = true;
-        }
-        // Quête: faire un score > 15 (base score uniquement)
-        if (Number(baseScore || 0) > 15 && !rec.claimed.score15) {
-            bonus += QUEST_BONUS_SCORE_GT_15;
+        // Quest 1: reach minimal score threshold (base score only)
+        if (Number(baseScore || 0) >= QUEST_MIN_SCORE_THRESHOLD && !rec.claimed.score15) {
+            bonus += QUEST_BONUS_SCORE_MIN;
             rec.claimed.score15 = true;
             changed = true;
         }
-        // Quête: jouer 3 matchs >= 90s dans la journée
-        if (Number(rec.longMatches || 0) >= 3 && !rec.claimed.three90) {
+        // Quête: jouer 3 matchs >= 90s dans la journée (basé sur rooms marquées)
+        const longMatchesCount = rec.rooms ? Object.keys(rec.rooms).length : 0;
+        if (longMatchesCount >= 3 && !rec.claimed.three90) {
             bonus += QUEST_BONUS_3_MATCHES_90S;
             rec.claimed.three90 = true;
             changed = true;
