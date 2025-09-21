@@ -589,11 +589,15 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
                 return res.status(401).json({ error: 'Match token does not belong to this user' });
             }
 
-            // Appliquer les quêtes quotidiennes (sécurisées par matchToken/durée)
-            const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
-            const questBonus = computeAndClaimDailyQuestBonus(uid || normalized, baseScore, matchDurationMs, Date.now());
-            if (questBonus > 0) {
-                totalScore += Number(questBonus);
+            // Appliquer le bonus de quête: préférer la valeur signée stockée dans rec.questBonus (évite double-claim)
+            {
+                let questBonus = (typeof rec.questBonus === 'number') ? rec.questBonus : undefined;
+                if (typeof questBonus === 'undefined') {
+                    const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
+                    questBonus = computeAndClaimDailyQuestBonus(uid || normalized, baseScore, matchDurationMs, Date.now());
+                    try { rec.questBonus = Number(questBonus || 0); matchTokens.set(matchToken, rec); } catch (_) {}
+                }
+                if (questBonus > 0) totalScore += Number(questBonus);
             }
 
             // Vérification Photon: l'utilisateur doit être présent (trace fraîche) dans la room
@@ -919,12 +923,18 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
             if (!rec) {
                 return res.status(401).json({ error: 'Invalid matchToken' });
             }
-            // Appliquer les quêtes quotidiennes (sécurisées par matchToken/durée)
-            const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
-            const questBonus = computeAndClaimDailyQuestBonus(req.firebaseAuth?.uid || player, baseScore, matchDurationMs, Date.now());
-            if (questBonus > 0) {
-                totalScore += Number(questBonus);
-                cappedScore = Math.min(totalScore, Number(process.env.MAX_SCORE_PER_MATCH || 50));
+            // Appliquer le bonus de quête: préférer rec.questBonus défini lors de sign-score
+            {
+                let questBonus = (typeof rec.questBonus === 'number') ? rec.questBonus : undefined;
+                if (typeof questBonus === 'undefined') {
+                    const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
+                    questBonus = computeAndClaimDailyQuestBonus(req.firebaseAuth?.uid || player, baseScore, matchDurationMs, Date.now());
+                    try { rec.questBonus = Number(questBonus || 0); matchTokens.set(matchToken, rec); } catch (_) {}
+                }
+                if (questBonus > 0) {
+                    totalScore += Number(questBonus);
+                    cappedScore = Math.min(totalScore, Number(process.env.MAX_SCORE_PER_MATCH || 50));
+                }
             }
             // Anti-match trop court
             const MIN_MATCH_DURATION_MS = Number(process.env.MIN_MATCH_DURATION_MS || 0);
