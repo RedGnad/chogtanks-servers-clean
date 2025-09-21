@@ -904,6 +904,9 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
             return res.status(204).end();
         }
 
+        // AJOUT : Log au début pour tracer la route
+        console.log(`[QUEST-MONAD-START] Route appelée, baseScore: ${baseScore}, totalScore: ${totalScore}, cappedScore: ${cappedScore}`);
+
         // Enforce match token usage si auth active
         if (process.env.FIREBASE_REQUIRE_AUTH === '1') {
             if (!matchToken || typeof matchToken !== 'string') {
