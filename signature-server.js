@@ -22,25 +22,6 @@ app.use((req, res, next) => {
     }
     next();
 });
-// Mode CORS permissif d'urgence
-if (process.env.CORS_PERMISSIVE === '1' || process.env.CORS_WILDCARD === '1') {
-    app.use((req, res, next) => {
-        const origin = req.headers.origin || '*';
-        if (process.env.CORS_WILDCARD === '1') {
-            // Wildcard: pas de credentials
-            res.set('Access-Control-Allow-Origin', '*');
-        } else {
-            res.set('Access-Control-Allow-Origin', origin);
-            res.set('Vary', 'Origin');
-            res.set('Access-Control-Allow-Credentials', 'true');
-        }
-        res.set('Access-Control-Allow-Methods', 'GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS');
-        res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Match-Sig, X-Score-Sig');
-        res.set('Access-Control-Max-Age', '600');
-        if (req.method === 'OPTIONS') return res.status(204).end();
-        return next();
-    });
-}
 // Si on veut neutraliser totalement le webhook Photon, on déclare une route ultra-légère AVANT tout parser
 if (process.env.PHOTON_WEBHOOK_DISABLE === '1') {
     app.post('/photon/webhook', (req, res) => res.sendStatus(204));
@@ -505,18 +486,12 @@ app.post('/api/match/sign-score', jsonParserSmall, submitScoreLimiter, requireWa
         if (rec.uid && uid && rec.uid !== uid) {
             return res.status(401).json({ error: 'Match token does not belong to this user' });
         }
-        // Bonus de quêtes quotidiennes (sécurisé par matchToken/durée)
-        const baseScore = (parseInt(score, 10) || 0);
-        const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
-        const playerKey = req.firebaseAuth?.uid || '';
-        const questBonus = computeAndClaimDailyQuestBonus(playerKey, baseScore, matchDurationMs, Date.now());
-
-        // Aligner la signature sur la logique de soumission: (score + bonus + questBonus) plafonné
-        const totalScore = baseScore + (parseInt(bonus, 10) || 0) + Number(questBonus || 0);
+        // Aligner la signature sur la logique de soumission: (score + bonus) plafonné
+        const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
         const dynMaxSign = getDurationMaxScore(rec.createdAt);
         const cappedScore = Math.min(totalScore, dynMaxSign);
         const sig = computeScoreSig(matchToken, uid, Number(cappedScore));
-        return res.json({ scoreSig: sig, cappedScore, questBonus, success: true });
+        return res.json({ scoreSig: sig, cappedScore, success: true });
     } catch (e) {
         console.error('[MATCH][sign-score] error:', e.message || e);
         return res.status(500).json({ error: 'Failed to sign score' });
@@ -535,8 +510,7 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
         }
         
         const normalized = walletAddress.toLowerCase();
-        const baseScore = (parseInt(score, 10) || 0);
-        let totalScore = baseScore + (parseInt(bonus, 10) || 0);
+        const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
         if (totalScore <= 0) {
             return res.status(204).end();
         }
@@ -581,13 +555,6 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
             const uid = req.firebaseAuth?.uid || null;
             if (rec.uid && uid && rec.uid !== uid) {
                 return res.status(401).json({ error: 'Match token does not belong to this user' });
-            }
-
-            // Appliquer les quêtes quotidiennes (sécurisées par matchToken/durée)
-            const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
-            const questBonus = computeAndClaimDailyQuestBonus(uid || normalized, baseScore, matchDurationMs, Date.now());
-            if (questBonus > 0) {
-                totalScore += Number(questBonus);
             }
 
             // Vérification Photon: l'utilisateur doit être présent (trace fraîche) dans la room
@@ -669,12 +636,6 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
                 room = altRoom;
             }
 
-            // Marquer la room comme longue (>=90s) pour la quête quotidienne (idempotent) – même si le match n'est pas fini
-            try {
-                const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
-                markLongMatchReached(userKey || req.firebaseAuth?.uid || '', room, matchDurationMs, Date.now());
-            } catch (_) {}
-
             // Re-vérifier le verrou après fallback éventuel (canal Firebase)
             if (room && userKey && hasRoomActorSubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Score already submitted for this match' });
@@ -691,18 +652,6 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
             matchTokens.set(matchToken, rec);
             // Marquer le couple room|actor comme utilisé pour le canal Firebase (PAS Privy)
             if (room && userKey) markRoomActorSubmitted(room, userKey);
-        } else {
-            // Auth non exigée: si matchToken présent et valide, appliquer aussi le bonus de quêtes
-            if (matchToken && typeof matchToken === 'string') {
-                const rec = matchTokens.get(matchToken);
-                if (rec) {
-                    const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
-                    const questBonus = computeAndClaimDailyQuestBonus(normalized, baseScore, matchDurationMs, Date.now());
-                    if (questBonus > 0) {
-                        totalScore += Number(questBonus);
-                    }
-                }
-            }
         }
         
         console.log(`[SUBMIT-SCORE] Score submitted for ${normalized}: ${totalScore} (base: ${score}, bonus: ${bonus})`);
@@ -884,8 +833,7 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
         }
 
         const player = String(privyAddress).toLowerCase();
-        const baseScore = (parseInt(score, 10) || 0);
-        let totalScore = baseScore + (parseInt(bonus, 10) || 0);
+        const totalScore = (parseInt(score, 10) || 0) + (parseInt(bonus, 10) || 0);
         let cappedScore = Math.min(totalScore, Number(process.env.MAX_SCORE_PER_MATCH || 50));
         if (cappedScore <= 0) {
             return res.status(204).end();
@@ -899,13 +847,6 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
             const rec = matchTokens.get(matchToken);
             if (!rec) {
                 return res.status(401).json({ error: 'Invalid matchToken' });
-            }
-            // Appliquer les quêtes quotidiennes (sécurisées par matchToken/durée)
-            const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
-            const questBonus = computeAndClaimDailyQuestBonus(req.firebaseAuth?.uid || player, baseScore, matchDurationMs, Date.now());
-            if (questBonus > 0) {
-                totalScore += Number(questBonus);
-                cappedScore = Math.min(totalScore, Number(process.env.MAX_SCORE_PER_MATCH || 50));
             }
             // Anti-match trop court
             const MIN_MATCH_DURATION_MS = Number(process.env.MIN_MATCH_DURATION_MS || 0);
@@ -955,11 +896,6 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
             if (!room) {
                 return res.status(400).json({ error: 'Missing gameId (Photon room)' });
             }
-            // Marquer longue durée (>=90s) pour la quête quotidienne – même si le match n'est pas fini
-            try {
-                const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
-                markLongMatchReached(userKey || req.firebaseAuth?.uid || '', room, matchDurationMs, Date.now());
-            } catch (_) {}
             // Idempotence (canal Privy): refuser uniquement si Privy déjà soumis
             if (room && userKey && hasRoomActorPrivySubmitted(room, userKey)) {
                 return res.status(409).json({ error: 'Privy score already submitted for this match' });
@@ -1324,103 +1260,6 @@ function saveWalletBindings(bindings) {
 
 const walletBindings = loadWalletBindings();
 console.log(`[ANTI-FARMING] ${walletBindings.size} liaisons chargées depuis ${WALLET_BINDINGS_FILE}`);
-
-// =====================
-// Quêtes quotidiennes (persistantes par joueur et par jour UTC)
-// =====================
-const QUEST_STATE_FILE = path.join(DATA_DIR, 'quest-state.json');
-function loadQuestState() {
-    try {
-        if (fs.existsSync(QUEST_STATE_FILE)) {
-            const raw = fs.readFileSync(QUEST_STATE_FILE, 'utf8');
-            const obj = JSON.parse(raw);
-            if (obj && typeof obj === 'object') return obj;
-        }
-    } catch (e) {
-        console.warn('[QUEST] load error:', e.message || e);
-    }
-    return {};
-}
-function saveQuestState(state) {
-    try {
-        if (process.env.QUEST_PERSIST === '0') return; // no-op if disabled
-        fs.writeFileSync(QUEST_STATE_FILE, JSON.stringify(state, null, 2), 'utf8');
-    } catch (e) {
-        console.warn('[QUEST] save error:', e.message || e);
-    }
-}
-const questState = loadQuestState(); // { [playerKey]: { day: 'YYYY-MM-DD', rooms:{[gameId]:true}, claimed:{ score15:boolean, three90:boolean } } }
-
-function getUTCDateKey(ms) {
-    try { return new Date(ms || Date.now()).toISOString().slice(0, 10); } catch (_) { return new Date().toISOString().slice(0,10); }
-}
-
-const QUEST_MIN_SCORE_THRESHOLD = Number(process.env.QUEST_MIN_SCORE_THRESHOLD || 20);
-const QUEST_BONUS_SCORE_MIN = Number(process.env.QUEST_BONUS_SCORE_MIN || process.env.QUEST_BONUS_SCORE_GT_15 || 5);
-const QUEST_BONUS_3_MATCHES_90S = Number(process.env.QUEST_BONUS_3_MATCHES_90S || 20);
-
-function getOrResetQuestRecord(playerKey, nowMs) {
-    if (!playerKey) return null;
-    const today = getUTCDateKey(nowMs);
-    const cur = questState[playerKey] || {};
-    if (!cur.day || cur.day !== today) {
-        questState[playerKey] = {
-            day: today,
-            rooms: {},
-            claimed: { score15: false, three90: false }
-        };
-        saveQuestState(questState);
-    }
-    return questState[playerKey];
-}
-
-// Marquer une room comme validée pour le palier 90s (idempotent par room)
-function markLongMatchReached(playerKey, gameId, matchDurationMs, nowMs) {
-    try {
-        if (!playerKey || !gameId) return false;
-        if (Number(matchDurationMs || 0) < 90 * 1000) return false;
-        const rec = getOrResetQuestRecord(playerKey, nowMs);
-        if (!rec) return false;
-        if (!rec.rooms) rec.rooms = {};
-        if (rec.rooms[gameId]) return false; // déjà compté
-        rec.rooms[gameId] = true;
-        saveQuestState(questState);
-        return true;
-    } catch (e) {
-        console.warn('[QUEST] markLongMatchReached failed:', e.message || e);
-        return false;
-    }
-}
-
-// Calcule et marque les récompenses de quêtes quotidiennes (sécurisées) pour ce match
-function computeAndClaimDailyQuestBonus(playerKey, baseScore, matchDurationMs, nowMs) {
-    try {
-        if (!playerKey) return 0;
-        const rec = getOrResetQuestRecord(playerKey, nowMs);
-        if (!rec) return 0;
-        let bonus = 0;
-        let changed = false;
-
-        // Quest 1: reach minimal score threshold (base score only)
-        if (Number(baseScore || 0) >= QUEST_MIN_SCORE_THRESHOLD && !rec.claimed.score15) {
-            bonus += QUEST_BONUS_SCORE_MIN;
-            rec.claimed.score15 = true;
-            changed = true;
-        }
-        // Quête: jouer 3 matchs >= 90s dans la journée (basé sur rooms marquées)
-        const longMatchesCount = rec.rooms ? Object.keys(rec.rooms).length : 0;
-        if (longMatchesCount >= 3 && !rec.claimed.three90) {
-            bonus += QUEST_BONUS_3_MATCHES_90S;
-            rec.claimed.three90 = true;
-            changed = true;
-        }
-        if (changed) saveQuestState(questState);
-        return Number(bonus || 0);
-    } catch (e) {
-        console.warn('[QUEST] compute failed:', e.message || e);
-        return 0;
-    }
-}
 
 // =====================
 // Verrou 1 soumission par room|actor (persistant) – canal Firebase
