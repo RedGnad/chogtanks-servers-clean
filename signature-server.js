@@ -510,12 +510,6 @@ app.post('/api/match/sign-score', jsonParserSmall, submitScoreLimiter, requireWa
         const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
         const playerKey = req.firebaseAuth?.uid || '';
         const questBonus = computeAndClaimDailyQuestBonus(playerKey, baseScore, matchDurationMs, Date.now());
-        // Mémoriser le bonus pour ce match afin que Firebase et Monad l'appliquent toutes deux
-        try {
-            const prev = matchTokens.get(matchToken) || {};
-            prev.questBonus = Number(questBonus || 0);
-            matchTokens.set(matchToken, prev);
-        } catch (_) {}
 
         // Aligner la signature sur la logique de soumission: (score + bonus + questBonus) plafonné
         const totalScore = baseScore + (parseInt(bonus, 10) || 0) + Number(questBonus || 0);
@@ -589,15 +583,11 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
                 return res.status(401).json({ error: 'Match token does not belong to this user' });
             }
 
-            // Appliquer le bonus de quête: préférer la valeur signée stockée dans rec.questBonus (évite double-claim)
-            {
-                let questBonus = (typeof rec.questBonus === 'number') ? rec.questBonus : undefined;
-                if (typeof questBonus === 'undefined') {
-                    const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
-                    questBonus = computeAndClaimDailyQuestBonus(uid || normalized, baseScore, matchDurationMs, Date.now());
-                    try { rec.questBonus = Number(questBonus || 0); matchTokens.set(matchToken, rec); } catch (_) {}
-                }
-                if (questBonus > 0) totalScore += Number(questBonus);
+            // Appliquer les quêtes quotidiennes (sécurisées par matchToken/durée)
+            const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
+            const questBonus = computeAndClaimDailyQuestBonus(uid || normalized, baseScore, matchDurationMs, Date.now());
+            if (questBonus > 0) {
+                totalScore += Number(questBonus);
             }
 
             // Vérification Photon: l'utilisateur doit être présent (trace fraîche) dans la room
@@ -923,18 +913,12 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
             if (!rec) {
                 return res.status(401).json({ error: 'Invalid matchToken' });
             }
-            // Appliquer le bonus de quête: préférer rec.questBonus défini lors de sign-score
-            {
-                let questBonus = (typeof rec.questBonus === 'number') ? rec.questBonus : undefined;
-                if (typeof questBonus === 'undefined') {
-                    const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
-                    questBonus = computeAndClaimDailyQuestBonus(req.firebaseAuth?.uid || player, baseScore, matchDurationMs, Date.now());
-                    try { rec.questBonus = Number(questBonus || 0); matchTokens.set(matchToken, rec); } catch (_) {}
-                }
-                if (questBonus > 0) {
-                    totalScore += Number(questBonus);
-                    cappedScore = Math.min(totalScore, Number(process.env.MAX_SCORE_PER_MATCH || 50));
-                }
+            // Appliquer les quêtes quotidiennes (sécurisées par matchToken/durée)
+            const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
+            const questBonus = computeAndClaimDailyQuestBonus(req.firebaseAuth?.uid || player, baseScore, matchDurationMs, Date.now());
+            if (questBonus > 0) {
+                totalScore += Number(questBonus);
+                cappedScore = Math.min(totalScore, Number(process.env.MAX_SCORE_PER_MATCH || 50));
             }
             // Anti-match trop court
             const MIN_MATCH_DURATION_MS = Number(process.env.MIN_MATCH_DURATION_MS || 0);
@@ -1061,21 +1045,6 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
                 }
             }
         }
-
-        // Forcer l’ajout du bonus de quête stocké par sign-score, quelle que soit la branche au-dessus
-        try {
-            if (matchToken && typeof matchToken === 'string') {
-                const r = matchTokens.get(matchToken);
-                if (r) {
-                    const qb = Number(r.questBonus || 0);
-                    if (qb > 0) {
-                        totalScore = Number(totalScore) + qb;
-                        const dynMax = getDurationMaxScore(r.createdAt);
-                        cappedScore = Math.min(totalScore, dynMax);
-                    }
-                }
-            }
-        } catch (_) {}
 
         // Si exigence stricte du delta: vérifier la cohérence avec Firebase
         const MANDATE_MATCH_DELTA = process.env.MANDATE_MATCH_DELTA === '1';
@@ -1445,11 +1414,22 @@ function computeAndClaimDailyQuestBonus(playerKey, baseScore, matchDurationMs, n
         let bonus = 0;
         let changed = false;
 
+        // TEMP FIX: Reset claimed si QUEST_DEBUG_RESET=1 (pour tester)
+        const RESET_CLAIMED = process.env.QUEST_DEBUG_RESET === '1';
+        if (RESET_CLAIMED) {
+            rec.claimed = { score15: false, three90: false };
+            console.log(`[QUEST-DEBUG] Reset claimed for ${playerKey}`);
+        }
+
+        // DEBUG: Log pour voir l'état
+        console.log(`[QUEST-DEBUG] Player: ${playerKey}, baseScore: ${baseScore}, claimed:`, rec.claimed);
+
         // Quest 1: reach minimal score threshold (base score only)
         if (Number(baseScore || 0) >= QUEST_MIN_SCORE_THRESHOLD && !rec.claimed.score15) {
             bonus += QUEST_BONUS_SCORE_MIN;
             rec.claimed.score15 = true;
             changed = true;
+            console.log(`[QUEST-DEBUG] Score quest claimed, bonus += ${QUEST_BONUS_SCORE_MIN}`);
         }
         // Quête: jouer 3 matchs >= 90s dans la journée (basé sur rooms marquées)
         const longMatchesCount = rec.rooms ? Object.keys(rec.rooms).length : 0;
@@ -1457,8 +1437,10 @@ function computeAndClaimDailyQuestBonus(playerKey, baseScore, matchDurationMs, n
             bonus += QUEST_BONUS_3_MATCHES_90S;
             rec.claimed.three90 = true;
             changed = true;
+            console.log(`[QUEST-DEBUG] 3x90s quest claimed, bonus += ${QUEST_BONUS_3_MATCHES_90S}`);
         }
         if (changed) saveQuestState(questState);
+        console.log(`[QUEST-DEBUG] Final bonus: ${bonus}`);
         return Number(bonus || 0);
     } catch (e) {
         console.warn('[QUEST] compute failed:', e.message || e);
