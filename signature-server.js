@@ -22,6 +22,20 @@ app.use((req, res, next) => {
     }
     next();
 });
+// Mode CORS permissif d'urgence
+if (process.env.CORS_PERMISSIVE === '1') {
+    app.use((req, res, next) => {
+        const origin = req.headers.origin || '*';
+        res.set('Access-Control-Allow-Origin', origin);
+        res.set('Vary', 'Origin');
+        res.set('Access-Control-Allow-Credentials', 'true');
+        res.set('Access-Control-Allow-Methods', 'GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS');
+        res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Match-Sig, X-Score-Sig');
+        res.set('Access-Control-Max-Age', '600');
+        if (req.method === 'OPTIONS') return res.status(204).end();
+        return next();
+    });
+}
 // Si on veut neutraliser totalement le webhook Photon, on déclare une route ultra-légère AVANT tout parser
 if (process.env.PHOTON_WEBHOOK_DISABLE === '1') {
     app.post('/photon/webhook', (req, res) => res.sendStatus(204));
