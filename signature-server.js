@@ -1414,22 +1414,11 @@ function computeAndClaimDailyQuestBonus(playerKey, baseScore, matchDurationMs, n
         let bonus = 0;
         let changed = false;
 
-        // TEMP FIX: Reset claimed si QUEST_DEBUG_RESET=1 (pour tester)
-        const RESET_CLAIMED = process.env.QUEST_DEBUG_RESET === '1';
-        if (RESET_CLAIMED) {
-            rec.claimed = { score15: false, three90: false };
-            console.log(`[QUEST-DEBUG] Reset claimed for ${playerKey}`);
-        }
-
-        // DEBUG: Log pour voir l'état
-        console.log(`[QUEST-DEBUG] Player: ${playerKey}, baseScore: ${baseScore}, claimed:`, rec.claimed);
-
         // Quest 1: reach minimal score threshold (base score only)
         if (Number(baseScore || 0) >= QUEST_MIN_SCORE_THRESHOLD && !rec.claimed.score15) {
             bonus += QUEST_BONUS_SCORE_MIN;
             rec.claimed.score15 = true;
             changed = true;
-            console.log(`[QUEST-DEBUG] Score quest claimed, bonus += ${QUEST_BONUS_SCORE_MIN}`);
         }
         // Quête: jouer 3 matchs >= 90s dans la journée (basé sur rooms marquées)
         const longMatchesCount = rec.rooms ? Object.keys(rec.rooms).length : 0;
@@ -1437,10 +1426,8 @@ function computeAndClaimDailyQuestBonus(playerKey, baseScore, matchDurationMs, n
             bonus += QUEST_BONUS_3_MATCHES_90S;
             rec.claimed.three90 = true;
             changed = true;
-            console.log(`[QUEST-DEBUG] 3x90s quest claimed, bonus += ${QUEST_BONUS_3_MATCHES_90S}`);
         }
         if (changed) saveQuestState(questState);
-        console.log(`[QUEST-DEBUG] Final bonus: ${bonus}`);
         return Number(bonus || 0);
     } catch (e) {
         console.warn('[QUEST] compute failed:', e.message || e);
@@ -2092,6 +2079,12 @@ const chogIface = new ethers.utils.Interface([
 
         if (derivedScore <= 0 && derivedTx <= 0) {
             return res.status(422).json({ error: 'No matching on-chain event for provided actionType' });
+        }
+
+        // AJOUT : Appliquer le bonus de quête à derivedScore pour Monad ID (comme pour Firebase)
+        if (typeof rec.questBonus === 'number' && rec.questBonus > 0) {
+            derivedScore += Number(rec.questBonus);
+            console.log(`[QUEST-MONAD] Bonus applied to derivedScore: +${rec.questBonus}, new derivedScore: ${derivedScore}`);
         }
 
         // Consommation de points côté serveur APRÈS confirmation on-chain (indépendant du binding)
