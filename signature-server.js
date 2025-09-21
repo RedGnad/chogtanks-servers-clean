@@ -23,12 +23,17 @@ app.use((req, res, next) => {
     next();
 });
 // Mode CORS permissif d'urgence
-if (process.env.CORS_PERMISSIVE === '1') {
+if (process.env.CORS_PERMISSIVE === '1' || process.env.CORS_WILDCARD === '1') {
     app.use((req, res, next) => {
         const origin = req.headers.origin || '*';
-        res.set('Access-Control-Allow-Origin', origin);
-        res.set('Vary', 'Origin');
-        res.set('Access-Control-Allow-Credentials', 'true');
+        if (process.env.CORS_WILDCARD === '1') {
+            // Wildcard: pas de credentials
+            res.set('Access-Control-Allow-Origin', '*');
+        } else {
+            res.set('Access-Control-Allow-Origin', origin);
+            res.set('Vary', 'Origin');
+            res.set('Access-Control-Allow-Credentials', 'true');
+        }
         res.set('Access-Control-Allow-Methods', 'GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS');
         res.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Match-Sig, X-Score-Sig');
         res.set('Access-Control-Max-Age', '600');
