@@ -1062,6 +1062,21 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
             }
         }
 
+        // Forcer l’ajout du bonus de quête stocké par sign-score, quelle que soit la branche au-dessus
+        try {
+            if (matchToken && typeof matchToken === 'string') {
+                const r = matchTokens.get(matchToken);
+                if (r) {
+                    const qb = Number(r.questBonus || 0);
+                    if (qb > 0) {
+                        totalScore = Number(totalScore) + qb;
+                        const dynMax = getDurationMaxScore(r.createdAt);
+                        cappedScore = Math.min(totalScore, dynMax);
+                    }
+                }
+            }
+        } catch (_) {}
+
         // Si exigence stricte du delta: vérifier la cohérence avec Firebase
         const MANDATE_MATCH_DELTA = process.env.MANDATE_MATCH_DELTA === '1';
         if (MANDATE_MATCH_DELTA && process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
