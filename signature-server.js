@@ -510,6 +510,12 @@ app.post('/api/match/sign-score', jsonParserSmall, submitScoreLimiter, requireWa
         const matchDurationMs = Date.now() - Number(rec.createdAt || 0);
         const playerKey = req.firebaseAuth?.uid || '';
         const questBonus = computeAndClaimDailyQuestBonus(playerKey, baseScore, matchDurationMs, Date.now());
+        // Mémoriser le bonus pour ce match afin que Firebase et Monad l'appliquent toutes deux
+        try {
+            const prev = matchTokens.get(matchToken) || {};
+            prev.questBonus = Number(questBonus || 0);
+            matchTokens.set(matchToken, prev);
+        } catch (_) {}
 
         // Aligner la signature sur la logique de soumission: (score + bonus + questBonus) plafonné
         const totalScore = baseScore + (parseInt(bonus, 10) || 0) + Number(questBonus || 0);
