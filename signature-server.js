@@ -58,7 +58,12 @@ const allowedFromEnv = (process.env.ALLOWED_ORIGINS || '')
 const allowedOrigins = new Set(allowedFromEnv.length ? allowedFromEnv : defaultAllowed);
 app.use((req, res, next) => {
     const origin = req.headers.origin;
-    if (origin && allowedOrigins.has(origin)) {
+    // Support CORS_WILDCARD pour debug
+    if (process.env.CORS_WILDCARD === '1') {
+        res.set('Access-Control-Allow-Origin', '*');
+        res.set('Access-Control-Allow-Headers', '*');
+        res.set('Access-Control-Allow-Methods', '*');
+    } else if (origin && allowedOrigins.has(origin)) {
         res.set('Access-Control-Allow-Origin', origin);
         res.set('Vary', 'Origin');
         res.set('Access-Control-Allow-Credentials', 'true');
@@ -69,7 +74,12 @@ app.use((req, res, next) => {
 app.use((req, res, next) => {
     if (req.method !== 'OPTIONS') return next();
     const origin = req.headers.origin;
-    if (origin && allowedOrigins.has(origin)) {
+    // Support CORS_WILDCARD pour préflights
+    if (process.env.CORS_WILDCARD === '1') {
+        res.set('Access-Control-Allow-Origin', '*');
+        res.set('Access-Control-Allow-Headers', '*');
+        res.set('Access-Control-Allow-Methods', '*');
+    } else if (origin && allowedOrigins.has(origin)) {
         res.set('Access-Control-Allow-Origin', origin);
         res.set('Access-Control-Allow-Credentials', 'true');
     }
@@ -160,6 +170,7 @@ const submitScoreLimiter = buildRouteLimiter({
 app.use(cors({
     origin: (origin, cb) => {
         if (!origin) return cb(null, true); // allow non-browser tools
+        if (process.env.CORS_WILDCARD === '1') return cb(null, true); // wildcard mode
         if (allowedOrigins.has(origin)) return cb(null, true);
         return cb(new Error('Not allowed by CORS'));
     },
@@ -170,6 +181,7 @@ app.use(cors({
 app.options('*', cors({
     origin: (origin, cb) => {
         if (!origin) return cb(null, true);
+        if (process.env.CORS_WILDCARD === '1') return cb(null, true); // wildcard mode
         if (allowedOrigins.has(origin)) return cb(null, true);
         return cb(new Error('Not allowed by CORS'));
     },
@@ -835,10 +847,14 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
 
 app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
+        // Log minimal pour debug (seulement si problème)
+        console.log(`[MINT] Requête reçue - Origin: ${req.headers.origin}, Body keys: ${Object.keys(req.body || {}).join(',')}`);
+        
         const { playerAddress, mintCost, playerPoints } = req.body || {};
         const pAddr = playerAddress || req.body?.walletAddress; // alias compat
 
         if (!pAddr) {
+            console.log(`[MINT] ❌ Adresse manquante - playerAddress: "${playerAddress}", walletAddress: "${req.body?.walletAddress}"`);
             return res.status(400).json({ error: "Adresse du joueur requise" });
         }
 
