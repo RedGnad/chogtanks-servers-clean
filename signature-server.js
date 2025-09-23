@@ -845,7 +845,7 @@ app.post('/api/firebase/submit-score', jsonParserMedium, submitScoreLimiter, req
     }
 });
 
-app.post('/api/mint-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/mint-authorization', jsonParserSmall, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         // Log minimal pour debug (seulement si problème)
         console.log(`[MINT] Requête reçue - Origin: ${req.headers.origin}, Body keys: ${Object.keys(req.body || {}).join(',')}`);
@@ -1177,7 +1177,7 @@ app.post('/api/monad-games-id/submit-score', jsonParserSmall, submitScoreLimiter
     }
 });
 
-app.post('/api/evolve-authorization', requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/evolve-authorization', jsonParserSmall, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, tokenId, targetLevel, playerPoints } = req.body || {};
 
