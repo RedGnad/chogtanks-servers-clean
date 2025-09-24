@@ -1987,7 +1987,7 @@ async function getNextNonce(wallet) {
     }
 }
 
-app.post('/api/monad-games-id/update-player', requireWallet, requireFirebaseAuth, async (req, res) => {
+app.post('/api/monad-games-id/update-player', jsonParserSmall, requireWallet, requireFirebaseAuth, async (req, res) => {
     try {
         const { playerAddress, appKitWallet, actionType, txHash } = req.body || {};
 
