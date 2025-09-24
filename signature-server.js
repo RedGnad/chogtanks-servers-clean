@@ -2127,14 +2127,16 @@ const chogIface = new ethers.utils.Interface([
                     });
                 }
                 const db = admin.firestore();
-                const docRef = db.collection('WalletScores').doc(pa);
+                // CORRECTION: Débiter sur l'AppKit wallet (ak) au lieu du Privy wallet (pa)
+                // pour que l'affichage côté client soit cohérent
+                const docRef = db.collection('WalletScores').doc(ak);
                 await db.runTransaction(async (t) => {
                     const snap = await t.get(docRef);
                     const current = snap.exists ? Number(snap.data().score || 0) : 0;
                     const next = Math.max(0, current - derivedScore);
-                    t.set(docRef, { score: next, walletAddress: pa, lastUpdated: admin.firestore.FieldValue.serverTimestamp(), lastEvolutionTimestamp: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+                    t.set(docRef, { score: next, walletAddress: ak, lastUpdated: admin.firestore.FieldValue.serverTimestamp(), lastEvolutionTimestamp: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
                 });
-                console.log(`[POINTS] ✅ Décrément appliqué après evolve: -${derivedScore} pour ${pa}`);
+                console.log(`[POINTS] ✅ Décrément appliqué après evolve: -${derivedScore} pour ${ak} (AppKit wallet)`);
             } catch (debitErr) {
                 console.error('[POINTS] ❌ Échec décrément points:', debitErr.message || debitErr);
             }
