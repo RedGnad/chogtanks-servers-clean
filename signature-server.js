@@ -2100,11 +2100,9 @@ const chogIface = new ethers.utils.Interface([
             return res.status(422).json({ error: 'No matching on-chain event for provided actionType' });
         }
 
-        // AJOUT : Appliquer le bonus de quête à derivedScore pour Monad ID (comme pour Firebase)
-        if (typeof rec.questBonus === 'number' && rec.questBonus > 0) {
-            derivedScore += Number(rec.questBonus);
-            console.log(`[QUEST-MONAD] Bonus applied to derivedScore: +${rec.questBonus}, new derivedScore: ${derivedScore}`);
-        }
+        // NOTE: Quest bonus is handled via match tokens in submit-score routes, not in update-player
+        // update-player handles direct on-chain events without quest bonuses
+        // Quest bonuses are applied during score submission via match tokens
 
         // Consommation de points côté serveur APRÈS confirmation on-chain (indépendant du binding)
         if (actionType === 'evolve' && derivedScore > 0 && process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_CLIENT_EMAIL && process.env.FIREBASE_PRIVATE_KEY) {
